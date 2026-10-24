@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────────────
+# esc hub — 公网服务器端的反向隧道入口
+#
+# 部署到有公网 IP 的机器。它做两件事：
+#   1. 在 4433 端口接受 spoke 的 mTLS 连接（内网机器主动连出来）
+#   2. 为每个 [[service]] 开一个公网监听端口，把连接转发到对应的 spoke
+# ──────────────────────────────���──────────────────────────────────────
+
+[hub]
+# spoke 连接进来的地址。放在 NAT 后面就写 0.0.0.0。
+listen = "0.0.0.0:4433"
+
+# spoke 控制流静默多久算掉线（秒）。
+heartbeat_secs = 30
+
+# 某个服务当前没有 spoke 提供时：
+#   true  — 立刻关闭公网连接（默认，语义清晰）
+#   false — 先等最多 5 秒，给正在重连的 spoke 一点机会
+reject_when_absent = true
+
+[tls]
+# 三者都必须是绝对路径。
+ca_cert = "/etc/esc/ca.pem"
+cert    = "/etc/esc/hub.pem"
+key     = "/etc/esc/hub.key"
+
+# ── 对外暴露的服务 ────────────────────────────────────────────────────
+#
+# name   必须与 spoke 配置里的 name 完全一致。
+# listen 是公网侧监听的 host:port。
+# spoke  可选。填了就只允许这个 id 的 spoke 提供服务（多 spoke 时用于固定）。
+
+[[service]]
+name   = "grafana"
+listen = "0.0.0.0:8080"
+
+[[service]]
+name   = "nas-ssh"
+listen = "0.0.0.0:2222"
+
+# 示例：把某个服务锁定到特定 spoke
+# [[service]]
+# name   = "pi-admin"
+# listen = "0.0.0.0:8081"
+# spoke  = "raspberry-pi"

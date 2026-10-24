@@ -1,0 +1,44 @@
+[Unit]
+Description=esc spoke (echo-server-core intranet agent)
+Documentation=https://github.com/EchoLab-Auto/echo-server-core
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 专用低权限用户。它需要连接本机服务（如 127.0.0.1:22），
+# 但与"能否被公网访问"无关——那由 hub 决定。
+User=esc
+Group=esc
+ExecStart=/usr/local/bin/esc spoke --config /etc/esc/spoke.toml
+Restart=always
+RestartSec=2s
+
+# ── 沙箱加固 ─────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/etc/esc
+
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=esc-spoke
+
+[Install]
+WantedBy=multi-user.target
