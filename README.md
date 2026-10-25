@@ -58,11 +58,34 @@ hub.pem    hub.key     ← 拷到 Hub
 home-nas.pem  home-nas.key   ← 拷到对应 Spoke
 ```
 
-后续再加一台机器：
+后续再加一台机器（`pki init` 在同一台机器上生成全部材料时用）：
 
 ```bash
 esc pki spoke --ca-dir /etc/esc --id new-machine --out ./new-machine-cert
 ```
+
+### 2b. 多机部署：CSR 流程（推荐）
+
+`pki init` 会把所有私钥生成在同一台机器上，适合"单机组装后分发"。
+**当各机器之间无法直接拷贝文件时（比如只能通过人工/跳板转文本），用 CSR 流程：
+私钥在各自机器上生成，永不离开本机，只有公开的 CSR 与证书在传输。**
+
+```bash
+# --- 在每一台「需要证书的机器」上（hub 和每台 spoke 各一次）---
+esc pki keygen --out /etc/esc/req --id hub      # 产出 hub.key(0600) + hub.csr
+esc pki keygen --out /etc/esc/req --id home-nas
+
+# --- 把 <id>.csr 拷到持 CA 的机器，在那里签名 ---
+esc pki sign --ca-dir /root/esc-ca --csr hub.csr      --id hub \
+             --kind server --host esc.example.com --host 203.0.113.10
+esc pki sign --ca-dir /root/esc-ca --csr home-nas.csr --id home-nas --kind client
+
+# --- 把签好的 <id>.pem 拷回原机器，与本地私钥放在一起 ---
+```
+
+**签名方决定一切**：CSR 里声明的 keyUsage / EKU / SAN 全部被忽略，
+证书的用途、SAN、有效期由 `esc pki sign` 的参数决定。这样即使某台机器
+自己生成了"看起来像 hub"的 CSR，也拿不到 serverAuth 证书。
 
 ### 3. Hub
 

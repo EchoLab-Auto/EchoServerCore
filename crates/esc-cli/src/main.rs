@@ -61,6 +61,21 @@ enum Role {
     Spoke,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum CertKindArg {
+    Server,
+    Client,
+}
+
+impl From<CertKindArg> for esc_common::pki::CertKind {
+    fn from(v: CertKindArg) -> Self {
+        match v {
+            CertKindArg::Server => esc_common::pki::CertKind::Server,
+            CertKindArg::Client => esc_common::pki::CertKind::Client,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum PkiCmd {
     /// Create a CA and issue a hub certificate plus one spoke certificate.
@@ -86,6 +101,44 @@ enum PkiCmd {
         /// Overwrite existing files.
         #[arg(long)]
         force: bool,
+    },
+    /// Generate a keypair here and emit a CSR (multi-machine flow).
+    ///
+    /// The private key never leaves this host. Carry `<id>.csr` to whichever
+    /// machine holds the CA and run `esc pki sign` there.
+    Keygen {
+        /// Where to write `<id>.key` (0600) and `<id>.csr`.
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+        /// Identifier; becomes the file stem.
+        #[arg(short, long)]
+        id: String,
+    },
+    /// Sign a CSR with the CA in --ca-dir, producing `<id>.pem`.
+    ///
+    /// Extensions in the CSR are ignored: key usage, EKU, SANs and validity are
+    /// decided here by the CA operator.
+    Sign {
+        #[arg(long, default_value = "/etc/esc")]
+        ca_dir: PathBuf,
+        /// Path to the CSR produced by `esc pki keygen`.
+        #[arg(long)]
+        csr: PathBuf,
+        /// Identifier; becomes the output file stem and the certificate CN.
+        #[arg(short, long)]
+        id: String,
+        /// Server (hub) or client (spoke) certificate.
+        #[arg(long, value_enum, default_value = "client")]
+        kind: CertKindArg,
+        /// DNS name or IP the certificate must be valid for. Required for
+        /// `--kind server`, ignored for `--kind client`.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// Where to write `<id>.pem`. Defaults to --ca-dir.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 3650)]
+        days: u32,
     },
     /// Issue one more spoke certificate from an existing CA.
     Spoke {
@@ -200,6 +253,44 @@ fn check(path: &Path, role: Role) -> Result<()> {
 
 fn pki(cmd: PkiCmd) -> Result<()> {
     match cmd {
+        PkiCmd::Keygen { out, id } => {
+            let (k, c) = esc_common::pki::keygen(&out, &id)?;
+            println!("key      {}  (0600, must stay on this host)", k.display());
+            println!("csr      {}  (public; carry it to the CA machine)", c.display());
+            println!();
+            println!("Next, on the machine holding ca.key:");
+            println!("  esc pki sign --csr {} --id {id} --kind client", c.display());
+        }
+        PkiCmd::Sign {
+            ca_dir,
+            csr,
+            id,
+            kind,
+            hosts,
+            out,
+            days,
+        } => {
+            let out = out.unwrap_or_else(|| ca_dir.clone());
+            guard(&out, &[&format!("{id}.pem")], true)?;
+            let ca_cert_pem = std::fs::read_to_string(ca_dir.join("ca.pem"))
+                .with_context(|| format!("cannot read {}", ca_dir.join("ca.pem").display()))?;
+            let ca_key_pem = std::fs::read_to_string(ca_dir.join("ca.key"))
+                .with_context(|| format!("cannot read {}", ca_dir.join("ca.key").display()))?;
+            let ca = Ca::from_pem(&ca_cert_pem, &ca_key_pem)?;
+
+            let csr_pem = std::fs::read_to_string(&csr)
+                .with_context(|| format!("cannot read {}", csr.display()))?;
+            let cn = match kind {
+                CertKindArg::Server => "esc-hub".to_string(),
+                CertKindArg::Client => format!("spoke-{id}"),
+            };
+            let cert_pem = ca.sign_csr(&csr_pem, kind.into(), &cn, &hosts, days)?;
+            let path = esc_common::pki::write_cert(&out, &id, &cert_pem)?;
+            println!("cert     {}  (CN {cn}, {} days)", path.display(), days);
+            if matches!(kind, CertKindArg::Server) {
+                println!("         SANs: {}", hosts.join(", "));
+            }
+        }
         PkiCmd::Init {
             out,
             ca_name,

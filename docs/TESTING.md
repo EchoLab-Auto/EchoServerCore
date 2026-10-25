@@ -78,6 +78,29 @@ hub 证书  SAN: IP Address:127.0.0.1, DNS:localhost
 spoke 证书 EKU: TLS Web Client Authentication
 ```
 
+## CSR 流程（多机部署）
+
+模拟两台机器，验证"私钥不出本机"的路径：
+
+```
+$ esc pki keygen --out machine-a --id hubA
+key      machine-a/hubA.key  (0600, must stay on this host)
+csr      machine-a/hubA.csr  (public; carry it to the CA machine)
+
+$ esc pki sign --ca-dir ca --csr machine-a/hubA.csr --id hubA \
+               --kind server --host 127.0.0.1 --host localhost --out machine-a
+cert     machine-a/hubA.pem  (CN esc-hub, 3650 days)
+         SANs: 127.0.0.1, localhost
+
+$ openssl verify -CAfile ca/ca.pem machine-a/hubA.pem
+machine-a/hubA.pem: OK
+EKU: TLS Web Server Authentication
+SAN: IP Address:127.0.0.1, DNS:localhost
+```
+
+关键点已验证：CSR 里**不带** SAN/EKU，证书里的 SAN 与 EKU 完全来自
+`esc pki sign` 的参数 —— 请求方无法给自己要到 serverAuth 或额外 SAN。
+
 ## 未验证 / 已知缺口
 
 以下 **没有** 被测试过，使用前请自行评估：
