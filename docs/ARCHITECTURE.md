@@ -111,6 +111,37 @@ esc-plugin-panel
 > 框架的 `HostService::call` 是**同步**的，而引擎 API 是异步的。宿主里唯一
 > 一处 `block_in_place` + `block_on` 就是为此存在的（要求 multi-thread 运行时）。
 
+### 4. 为什么 release 刻意不用 `panic = "abort"`
+
+改造前 `[profile.release]` 里是 `panic = "abort"`，理由是体积。做控制面之后
+这个取舍反过来了——隧道是**数据面**：
+
+| 场景 | `abort` | `unwind`（现在） |
+|---|---|---|
+| 某条连接的转发任务里有个 bug/越界 | 整个 hub **进程退出**，所有映射端口消失、所有连接断掉 | tokio 隔离该任务，其余连接继续转发 |
+| 面板插件里 panic | 只死面板进程（子进程），supervisor 按退避重启 | 同 |
+| 宿主某处 panic | 隧道与面板一起没了 | 主任务退出（同样会停），但转发任务不受牵连 |
+
+实测（同样的代码，只改 profile）：
+
+```
+=== debug（默认 unwind）===
+坏任务的 JoinHandle 结果: Err（已被隔离）
+健康任务仍在运行: 0 … 4
+进程存活到结束 ✅                      exit=0
+
+=== release + panic=abort ===
+（没有任何输出）                        exit=134  Aborted (core dumped)
+```
+
+`abort` 下连健康任务的输出都没来得及打印——这就是「一个坏连接带走全部隧道」。
+代价是三个二进制各大约 +13~15%（`esc` 3.10 MB → 3.51 MB，`esc-host` 3.08 MB →
+3.55 MB，`esc-plugin-panel` 1.52 MB → 1.74 MB），对一台服务器上的常驻进程来说
+可以忽略。
+
+配套地，数据面上的 `expect()` 也都改成了优雅降级（状态查询路径宁可返回一条
+`error` 视图，也不要 panic 掉进程；锁中毒时放弃记录句柄而不是 panic）。
+
 ## 运行时能做什么
 
 改造后在**不重启**的前提下可以：

@@ -190,7 +190,11 @@ impl Plugin for TunnelPlugin {
             match Engine::start(cfg).await {
                 Ok(engine) => {
                     info!(role = %role, "tunnel engine ready");
-                    *slot.lock().expect("engine slot poisoned") = Some(Arc::clone(&engine));
+                    // 锁中毒（上一个持有者 panic 过）时放弃记录句柄：引擎本身
+                    // 已经起来了，服务也已注册，只是 unmount 时少一次 shutdown。
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(Arc::clone(&engine));
+                    }
                     let _ = tx.send(EngineState { engine: Some(engine), error: None });
                 }
                 Err(e) => {
@@ -205,7 +209,11 @@ impl Plugin for TunnelPlugin {
     }
 
     fn unmount(&self) -> Result<(), PluginMountError> {
-        let engine = self.engine.lock().expect("engine slot poisoned").take();
+        let engine = self
+            .engine
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
         if let Some(engine) = engine {
             // `unmount` 是同步的，而收尾要 await：交给运行时后台做完。
             if let Ok(rt) = tokio::runtime::Handle::try_current() {

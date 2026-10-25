@@ -41,8 +41,8 @@ enum Closed {
     Shutdown,
     /// 配置变了，正在重连。
     Reconfigured,
-    /// hub 主动断开（重启 / 踢人）。
-    HubClosed,
+    /// 对端（hub）主动断开：重启 / 踢人 / 控制流 EOF。
+    PeerGone,
 }
 
 struct SpokeInner {
@@ -188,7 +188,7 @@ impl SpokeInner {
                     // 配置变了：立刻用新配置重连，重置退避。
                     backoff_ms = self.spoke.backoff_min_ms.max(1);
                 }
-                Ok(Closed::HubClosed) => {
+                Ok(Closed::PeerGone) => {
                     info!("connection closed by hub, reconnecting");
                     backoff_ms = self.spoke.backoff_min_ms.max(1);
                 }
@@ -304,7 +304,7 @@ impl SpokeInner {
                 maybe = inbound.recv() => {
                     let Some(stream) = maybe else {
                         debug!("mux closed");
-                        return Ok(Closed::HubClosed);
+                        return Ok(Closed::PeerGone);
                     };
                     let me = self.clone();
                     tokio::spawn(async move {
@@ -316,19 +316,19 @@ impl SpokeInner {
                 r = ctrl_r.read(&mut sink) => match r {
                     Ok(0) => {
                         debug!("control stream closed by hub");
-                        return Ok(Closed::HubClosed);
+                        return Ok(Closed::PeerGone);
                     }
                     Ok(_) => {}
                     Err(e) => {
                         debug!(error = %e, "control stream read error");
-                        return Ok(Closed::HubClosed);
+                        return Ok(Closed::PeerGone);
                     }
                 },
                 _ = ping.tick() => {
                     // 任何一次写都会刷新 yamux 的保活；空对象是最小帧。
                     if let Err(e) = protocol::write_msg(&mut ctrl_w, &serde_json::json!({})).await {
                         warn!(error = %e, "control ping failed");
-                        return Ok(Closed::HubClosed);
+                        return Ok(Closed::PeerGone);
                     }
                 }
             }

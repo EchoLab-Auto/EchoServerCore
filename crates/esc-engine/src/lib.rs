@@ -233,7 +233,18 @@ impl Engine {
 
         match self.role {
             Role::Hub => {
-                let hub = self.hub.as_ref().expect("hub role without hub engine");
+                // 结构上不会发生（角色与引擎同时构造），但这里是状态查询路径，
+                // 宁可返回一条 error 视图也不要 panic 掉整个进程。
+                let Some(hub) = self.hub.as_ref() else {
+                    return MappingView {
+                        mapping: m.clone(),
+                        state: MappingState::Error,
+                        error: Some("引擎内部状态异常：hub 角色缺少 hub 引擎".into()),
+                        bound: None,
+                        providers: Vec::new(),
+                        stats: Default::default(),
+                    };
+                };
                 let live = hub.service_info(&m.name).await;
                 let providers = hub.providers_of(&m.name).await;
                 let state = if !m.enabled {
@@ -255,7 +266,16 @@ impl Engine {
                 }
             }
             Role::Spoke => {
-                let spoke = self.spoke.as_ref().expect("spoke role without spoke engine");
+                let Some(spoke) = self.spoke.as_ref() else {
+                    return MappingView {
+                        mapping: m.clone(),
+                        state: MappingState::Error,
+                        error: Some("引擎内部状态异常：spoke 角色缺少 spoke 引擎".into()),
+                        bound: None,
+                        providers: Vec::new(),
+                        stats: Default::default(),
+                    };
+                };
                 let published = spoke.services().await.contains_key(&m.name);
                 let state = if !m.enabled {
                     MappingState::Disabled

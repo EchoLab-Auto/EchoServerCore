@@ -128,6 +128,14 @@ curl -s "https://check-host.net/check-tcp?host=<公网IP>:4433&max_nodes=4" -H "
 curl -sv http://<公网IP>:<服务端口>/ 2>&1 | head
 ```
 
+### 7. 一个必须知道的取舍：`panic = "abort"` 已移除
+
+改造前 release 用 `panic = "abort"` 压体积。做控制面之后必须改成 `unwind`，
+否则任意一条连接的转发任务 panic 会让**整个 hub 退出、所有隧道一起断**。
+实测与体积代价见 [`ARCHITECTURE.md`](./ARCHITECTURE.md#4-为什么-release-刻意不用-panic--abort)。
+
+如果你的部署脚本里显式加了 `-C panic=abort`（或用了自己的 profile），请去掉。
+
 ## 升级流程
 
 ```bash

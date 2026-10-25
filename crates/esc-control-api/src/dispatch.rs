@@ -156,7 +156,10 @@ pub async fn dispatch(ctl: &dyn TunnelControl, req: ControlRequest) -> ControlRe
                 Ok(v) => v,
                 Err(e) => return ControlResponse::err(e),
             };
-            ControlResponse::ok(run!(ctl.delete_mapping(&p.id)))
+            match ctl.delete_mapping(&p.id).await {
+                Ok(()) => ControlResponse { ok: true, data: Value::Null, error: None },
+                Err(e) => ControlResponse::err(e),
+            }
         }
         MAPPING_SET_ENABLED => {
             #[derive(Deserialize)]

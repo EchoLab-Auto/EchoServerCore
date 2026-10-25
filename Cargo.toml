@@ -73,4 +73,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# 刻意**不用** `panic = "abort"`：隧道是数据面，任意一个转发任务里的 bug
+# 不应该让整个进程退出、把所有已建立的连接一起断掉。用 unwind 时 tokio 会
+# 隔离掉出 panic 的那个任务，其余连接继续转发（实测见 docs/ARCHITECTURE.md
+# 「为什么 release 用 unwind」）。代价是二进制大一点——这个交易很划算。
+panic = "unwind"

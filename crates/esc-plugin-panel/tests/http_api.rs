@@ -220,9 +220,11 @@ async fn backend_errors_are_surfaced_with_sensible_status() {
 
 #[tokio::test]
 async fn non_loopback_without_auth_is_rejected_by_config() {
-    let mut cfg = PanelConfig::default();
-    cfg.listen = "0.0.0.0:8787".into();
-    cfg.auth = None;
+    let mut cfg = PanelConfig {
+        listen: "0.0.0.0:8787".into(),
+        auth: None,
+        ..Default::default()
+    };
     let err = cfg.validate().unwrap_err();
     assert!(err.contains("拒绝把无认证的管理面板暴露"), "{err}");
 
