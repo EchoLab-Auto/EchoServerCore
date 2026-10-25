@@ -249,6 +249,10 @@ fn docker_error(e: DockerError, context: &str) -> Response {
         DockerError::Failed { status, .. } => match status {
             404 => StatusCode::NOT_FOUND,
             304 => StatusCode::OK,
+            // 我们自己合成的 504（请求 daemon 超时）原样透出：
+            // 502 的意思是"上游返回了错误"，504 才是"上游没在期限内回答"，
+            // 这两种情况运维的处置不一样。
+            504 => StatusCode::GATEWAY_TIMEOUT,
             400..=499 => StatusCode::BAD_REQUEST,
             _ => StatusCode::BAD_GATEWAY,
         },

@@ -28,9 +28,26 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-/// 单次请求的超时。Docker 在拉镜像时可能很慢，但面板只读状态和启停，
-/// 5 秒足够；超时说明 daemon 卡住了，早点告诉使用者比挂着强。
+/// 普通请求（读状态、日志、资源）的超时。
+///
+/// 5 秒对这些操作足够；超时说明 daemon 卡住了，早点告诉使用者比挂着强。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 启停类请求的超时。
+///
+/// **必须显著大于 `STOP_GRACE_SECS`**，否则会出现最难排查的一类错误：
+/// `docker stop?t=10` 在 daemon 侧要等容器最多 10 秒才 SIGKILL，而客户端
+/// 5 秒就断了 —— 于是面板报「超时失败」，而容器实际上正在被停掉。
+/// 使用者看到失败会重试或改用 CLI，两个操作叠在一起，状态就乱了。
+///
+/// 这不是理论：第一次真实部署时 stop 就是这样报的 504。
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `docker stop` / `restart` 的 `t=` 秒数：给容器多久优雅退出，之后 SIGKILL。
+///
+/// 10 秒是 docker CLI 的默认值。之所以不缩短：有些数据库把 SIGTERM 当
+/// 「保存并退出」，给太少时间等于让它丢数据。
+const STOP_GRACE_SECS: u32 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Docker {
@@ -102,10 +119,14 @@ impl Docker {
             });
         }
         let path = match action {
-            "stop" | "restart" => format!("/containers/{}/{action}?t=10", enc(id)),
+            "stop" | "restart" => {
+                format!("/containers/{}/{action}?t={STOP_GRACE_SECS}", enc(id))
+            }
             _ => format!("/containers/{}/{action}", enc(id)),
         };
-        let (status, body) = self.request("POST", &path, None).await?;
+        let (status, body) = self
+            .request_with_timeout("POST", &path, None, ACTION_TIMEOUT)
+            .await?;
         // 204 = 成功且无内容；304 = 已经处于目标状态（Docker 用这个表示幂等）
         if status == 204 || status == 304 || (200..300).contains(&status) {
             Ok(())
@@ -171,12 +192,27 @@ impl Docker {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), DockerError> {
+        self.request_with_timeout(method, path, body, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        limit: Duration,
+    ) -> Result<(u16, Vec<u8>), DockerError> {
         let fut = self.request_inner(method, path, body);
-        match tokio::time::timeout(REQUEST_TIMEOUT, fut).await {
+        match tokio::time::timeout(limit, fut).await {
             Ok(r) => r,
             Err(_) => Err(DockerError::Failed {
                 status: 504,
-                message: format!("请求 {method} {path} 超过 {}s 未返回", REQUEST_TIMEOUT.as_secs()),
+                message: format!(
+                    "请求 {method} {path} 超过 {}s 未返回（daemon 可能卡住了；\
+                     注意操作可能仍在服务端进行中）",
+                    limit.as_secs()
+                ),
             }),
         }
     }
@@ -720,6 +756,24 @@ mod tests {
             DockerError::Failed { status, .. } => assert_eq!(status, 400),
             other => panic!("应当被允许清单挡下，实际 {other}"),
         }
+    }
+
+    #[test]
+    fn action_timeout_exceeds_the_stop_grace_period() {
+        // 这条是护栏。真实事故：REQUEST_TIMEOUT=5s 而 stop 带 t=10，
+        // 于是 daemon 还在优雅等容器退出，我们 5 秒就报"超时失败"——
+        // 而容器实际上正在被停掉。使用者看到失败会重试，两个操作叠在一起。
+        assert!(
+            ACTION_TIMEOUT > Duration::from_secs(STOP_GRACE_SECS as u64),
+            "启停超时（{}s）必须大于 stop 的优雅期（{}s），否则必然误报超时",
+            ACTION_TIMEOUT.as_secs(),
+            STOP_GRACE_SECS
+        );
+        // 留出可观的余量而不只是"大 1 秒"：daemon 在负载下还需要额外时间
+        assert!(
+            ACTION_TIMEOUT >= Duration::from_secs(STOP_GRACE_SECS as u64 + 10),
+            "余量太小，daemon 稍慢就会误报"
+        );
     }
 
     #[test]

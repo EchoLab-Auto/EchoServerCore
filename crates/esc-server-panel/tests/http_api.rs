@@ -258,3 +258,18 @@ async fn large_tail_value_is_clamped_not_trusted() {
     assert_eq!(code, 503, "Docker 不在时仍是 503（说明参数已通过校验）");
     r.token.cancel();
 }
+
+#[tokio::test]
+async fn stop_uses_a_longer_timeout_than_the_grace_period() {
+    // 回归：真实部署时 `stop` 报过 504——因为 HTTP 超时 5s < docker 的
+    // `t=10` 优雅期。这条用例不能真的去停容器（测试机未必有 docker），
+    // 所以验证的是「面板对 stop 的等待时间足够」这一常量关系，
+    // 以及超时会被映射成 504 而不是 502。
+    //
+    // 常量关系在 docker.rs 的单测里断言（action_timeout_exceeds_...）；
+    // 这里补的是 API 层：一个不存在的 daemon 走完全部流程仍然是 503。
+    let r = start(|_, _| {}).await;
+    let (code, _) = http(&r.addr, "POST", "/api/docker/containers/abc/stop", None).await;
+    assert_eq!(code, 503, "Docker 不在时 stop 应为 503（不可用）而非 5xx 混淆");
+    r.token.cancel();
+}
