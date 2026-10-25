@@ -57,6 +57,7 @@ crates/
   esc-plugin-tunnel-panel/
                      ★ 新增：子进程插件，端口映射面板（HTTP + 单页前端，:2223）
   esc-server-panel/  ★ 新增：独立进程，主机指标 + Docker 管理面板（:2224）
+  esc-gateway/       ★ 新增：独立进程，认证反向代理（面板前面，:2223/:2224）
   esc-host/          ★ 新增：组合根（宿主二进制 + 可复用 lib）
   esc-hub/           保留：`esc hub` 的薄封装（行为不变）
   esc-spoke/         保留：`esc spoke` 的薄封装（行为不变）
@@ -76,6 +77,7 @@ esc-plugin-tunnel-panel ──▶ esc-control-api      ← 没有 esc-engine（�
                         └──▶ esc-panel-auth
 
 esc-server-panel ──▶ esc-panel-auth              ← 只依赖这一个
+esc-gateway      ──▶ esc-panel-auth              ← 同样只依赖这一个
 ```
 
 最后两行是架构约束，不是「暂时没用到」：面板物理上无法调用引擎内部函数，
@@ -202,6 +204,7 @@ spoke 只读 `local`。
 | `esc-plugin-tunnel` | `esc.tunnel` | （无，进程内） | `esc-host` 的进程内插件 |
 | `esc-plugin-tunnel-panel` | `esc.tunnel-panel` | `esc-plugin-tunnel-panel` | `esc-host` 的子进程插件 |
 | —（不是插件） | — | `esc-server-panel` | 独立 systemd 服务 |
+| —（不是插件） | — | `esc-gateway` | 独立服务（也可跑在 Docker 里） |
 
 为什么两套分隔符：Rust crate 名惯例用连字符（`use` 时自动变下划线），框架的
 plugin id 用点做命名空间，像反向域名——将来生态里若有别的项目写插件，

@@ -231,7 +231,7 @@ curl http://127.0.0.1:PORT/          # → 后端内容
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --workspace` | 107 passed / 0 failed |
+| `cargo test --workspace` | 181 passed / 0 failed |
 | `cargo clippy --workspace --all-targets` | 0 warning |
 | release 二进制体积 | `esc` 3.5 MB / `esc-host` 3.6 MB / `esc-plugin-tunnel-panel` 1.7 MB（含 unwind 表，见下） |
 | 运行时加映射 → 数据可达 | ✅ 200，`providers` 立即出现现有 spoke |

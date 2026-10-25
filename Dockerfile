@@ -77,24 +77,36 @@ RUN cargo build --release --locked --bin esc-gateway \
 # ─────────────────────────────────────────────────────────────────────────────
 # 阶段 2：运行
 # ─────────────────────────────────────────────────────────────────────────────
-# distroless：没有 shell、没有包管理器，攻击面最小。
-# 换 base 镜像时要注意：它必须带 CA 证书目录（本程序目前不主动出网，但留着无害）。
-FROM gcr.io/distroless/cc-debian12:nonroot
+# 用 debian-slim 而不是 distroless cc-debian12。
+#
+# 原因是实测：gcr.io 在国内直连不通（i/o timeout），daocloud 的 gcr 代理返回
+# 403，ghcr 也 denied。而 docker.io 的 debian 走 registry-mirrors 能拉。
+# 「镜像更小」不值得换来一个拉不下来的 Dockerfile。
+#
+# 代价：镜像大了约 20 MB，且多了 /bin/sh。为此做两件事补偿：
+#   - 非 root 运行（uid 65532，与 distroless 的 nonroot 同号）
+#   - compose 里 read_only + cap_drop ALL + no-new-privileges
+# 想要 distroless 的可以自己把下面一行换掉（前提是那台机器拉得到）。
+FROM debian:bookworm-slim
 
 COPY --from=builder /src/target/release/esc-gateway /usr/local/bin/esc-gateway
 
 # 默认读这个路径；用 volume 挂进来
 ENV ESC_GATEWAY_CONFIG=/etc/esc/gateway.toml
 
-# 非 root 运行。distroless 的 nonroot 是 uid 65532。
-USER nonroot:nonroot
+# 非 root 运行。65532 是 distroless 的 nonroot uid，保持一致便于迁移。
+# 用数字而不是用户名：这个镜像里没有对应条目，写名字会起不来。
+USER 65532:65532
 
 # 注意：**不 EXPOSE**。用 host 网络时端口由配置决定，
 # EXPOSE 只会误导人以为要 -p 映射。
 #
-# 健康检查：**不能用 CMD-SHELL**（distroless 里没有 /bin/sh），也不能用
-# `--version`（只证明进程活着，不证明它还在接受连接）。所以用网关自己的
-# `health` 子命令：它会真的向第一个 route 的端口发 /__auth/healthz 并检查 200。
+# 健康检查：用网关自己的 `health` 子命令，它会真的向第一个 route 的端口发
+# /__auth/healthz 并检查 200。
+#
+# 不用 `curl`/`CMD-SHELL` 写管道：健康检查在**目标镜像**里执行，而镜像里
+# 不该为了探活多装一个 curl（那会连带拉进 10+ MB 依赖）。用一个自己写的
+# 子命令，无论目标是 distroless 还是 slim 都能跑。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD ["/usr/local/bin/esc-gateway", "health", "-c", "/etc/esc/gateway.toml"]
 
