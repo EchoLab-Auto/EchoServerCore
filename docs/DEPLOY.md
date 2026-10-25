@@ -574,3 +574,31 @@ node --check /tmp/sp-check.js && echo "✅ 语法正确"
 `node --check` 只验语法（不执行），但能抓住模板字符串里漏引号、括号不配对
 这类会在浏览器里变成「整页白屏」的错误。**每次改前端都该跑一次**——
 它的成本是两秒，而白屏的排查成本是半小时。
+
+## 改名插件时三处必须同步
+
+`esc-plugin-panel` → `esc-plugin-tunnel-panel` 这次改名在部署时验证到一个有用的
+安全网：**宿主会校验子进程 `Hello` 里的 plugin id 与自己的配置是否一致**。
+
+三处必须一起改，漏一处不会静默降级，而是直接起不来：
+
+| 位置 | 内容 |
+|---|---|
+| 磁盘上的二进制 | `/usr/local/libexec/esc/esc-plugin-tunnel-panel` |
+| `/etc/esc/host.toml` | `[panel] command = ".../esc-plugin-tunnel-panel"` |
+| 代码里的 plugin id | 宿主 `TUNNEL_PANEL_PLUGIN_ID` 与插件 `PANEL_KEY` 两侧 |
+
+只改了前两处、没改第三处时，日志会明确说出来：
+
+```
+ERROR echo_plugin_host::supervisor: plugin handshake failed
+      plugin=esc.tunnel-panel
+      error=protocol error: plugin id mismatch: expected "esc.tunnel-panel", got "esc.panel"
+```
+
+**这是好事**：如果框架不校验，宿主会以为插件起来了，然后所有 `HostCall` 打空。
+现在的行为是「立刻失败并说清原因」，比静默错配好得多。
+
+顺带一个 sed 的坑：改 `host.toml` 时我用
+`s|.../esc-plugin-panel$|...|` 没匹配上——因为行尾还有一对双引号。
+`$` 锚定的是行尾而非字符串结尾，**用 `cat -A` 看行尾**比猜快。
