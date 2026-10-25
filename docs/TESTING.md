@@ -168,3 +168,31 @@ SAN: IP Address:127.0.0.1, DNS:localhost
    Caddy/nginx 反代 + Basic Auth + 自动 HTTPS，不要让 esc 直接对公网暴露 HTTP。
 3. 无论如何都应把 Panel 的 `bind_address` 改成 `127.0.0.1:8080`，
    这样它只能经隧道访问，无法被 overlay 内的其它机器直连。
+
+## 吞吐上限定位：瓶颈是云主机带宽，不是 esc
+
+第一次测 262 KB 资源时耗时在 0.19 ~ 3.35 s 之间抖动，单连接复用 10 次
+2.5 MiB 用 5.50 s ≈ **466 KiB/s**。为判断是 esc 还是网络，做了分段测量：
+
+| 测量点 | 结果 |
+|---|---|
+| 4090 → Cloudflare 上行 | 19.8 MB/s（158 Mbps） |
+| 4090 ← Cloudflare 下行 | 23.2 MB/s |
+| cloud-server-2 ← Cloudflare 下行 | 1.77 MB/s（14 Mbps） |
+| **cloud-server-2 → Cloudflare 上行** | **0.45 MB/s（3.6 Mbps）** |
+| esc 隧道端到端 | 0.47 MB/s（466 KiB/s） |
+
+数据流向是 `4090 → cloud-server-2 → 客户端`，出 Hub 走的是 cloud-server-2
+的**上行**，而它的上行被腾讯云限速在约 3.6 Mbps —— 与隧道实测的 466 KiB/s
+（≈ 477 KB/s）几乎完全吻合。
+
+**结论：esc 没有成为瓶颈，它把可用的 3.6 Mbps 跑满了。** 实例型号
+`S5.MEDIUM2`，这类按带宽计费的国内云主机通常是 1~5 Mbps 档。
+
+想提高公网访问速度只能换路径：
+1. 加钱升 cloud-server-2 的带宽（国内云贵）；
+2. 或用 EasyTier overlay 直连 4090（p2p 不经 Hub），但要求客户端也装 EasyTier；
+3. 或把 Hub 放在带宽更好的机器上（境外 VPS 通常 100 Mbps 起）。
+
+临时偶发的 3.35 s 单次尖峰出现在与压力测试并行时，串行复测延迟稳定在
+0.026–0.036 s，判断为带宽争用而非缺陷。
