@@ -1,0 +1,33 @@
+# 用户级单元示例：Spoke 只做出站连接，不需要 root。
+#
+# 安装：
+#   install -m755 esc ~/.local/bin/esc
+#   install -d ~/.config/systemd/user
+#   cp esc-spoke.user.service ~/.config/systemd/user/esc-spoke.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now esc-spoke
+#   loginctl enable-linger "$USER"     # 无登录会话时也保持运行
+#
+# 配置文件默认读 ~/.config/esc/spoke.toml（见 examples/spoke.toml）。
+
+[Unit]
+Description=esc spoke (echo-server-core intranet agent, user instance)
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/esc spoke --config %h/.config/esc/spoke.toml
+Restart=always
+RestartSec=2s
+
+# 用户单元能用的加固项有限，但仍有意义
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/.config/esc %h/esc
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target
