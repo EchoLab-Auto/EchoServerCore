@@ -209,6 +209,7 @@ SAN: IP Address:127.0.0.1, DNS:localhost
 | 插件 | `crates/esc-plugin-tunnel/src/lib.rs` | mount 后 `Ctx` 里出现 `esc.tunnel.control`；配置非法时挂载 fail-closed；引擎启动失败时调用方拿到明确错误而不是挂住 |
 | 面板 HTTP | `crates/esc-plugin-panel/tests/http_api.rs` | 每个 REST 端点对应正确的契约方法；URL 里的 `id` 覆盖 body；Basic 认证缺失即 401 且**不会**触达后端；非回环 + 无口令被配置校验拒绝 |
 | 端到端 | `crates/esc-plugin-panel/tests/e2e_host.rs` | 真子进程面板 + 真宿主 + 真引擎 + 真 spoke：HTTP 建映射 → 端口绑定 → 字节往返；宿主退出后面板进程消失 |
+| 隔离性 | `crates/esc-host/tests/isolation.rs` | 面板二进制指向不存在的路径时，宿主**不退出**、隧道引擎仍就绪、进程持续运行（「面板挂了不影响隧道」这条承诺的回归测试） |
 
 手工冒烟（release 二进制）：
 
@@ -229,9 +230,28 @@ curl http://127.0.0.1:PORT/          # → 后端内容
 
 | 项 | 结果 |
 |---|---|
-| `cargo test --workspace` | 38 passed / 0 failed |
-| release 二进制体积 | `esc` 3.0 MB / `esc-host` 3.0 MB / `esc-plugin-panel` 1.5 MB |
+| `cargo test --workspace` | 39 passed / 0 failed |
+| `cargo clippy --workspace --all-targets` | 0 warning |
+| release 二进制体积 | `esc` 3.5 MB / `esc-host` 3.6 MB / `esc-plugin-panel` 1.7 MB（含 unwind 表，见下） |
 | 运行时加映射 → 数据可达 | ✅ 200，`providers` 立即出现现有 spoke |
 | 流量计数 | ✅ 单次请求记到 78 B 上行 / 207 B 下行 |
 | 停用映射 → 端口释放 | ✅ 后续 connect 被拒 |
 | 映射表落盘 | ✅ 0600，`[[mapping]]` 结构，重载可用 |
+
+### panic 策略的实测
+
+`[profile.release]` 从 `panic = "abort"` 改成 `unwind` 后，用同一段代码
+（一个任务 panic、一个任务正常干活）在两种 profile 下各跑一次：
+
+```
+=== unwind（现在）===
+坏任务的 JoinHandle 结果: Err（已被隔离）
+健康任务仍在运行: 0 1 2 3 4
+进程存活到结束 ✅                    exit=0
+
+=== abort（改造前）===
+（没有任何输出）                     exit=134  Aborted (core dumped)
+```
+
+`abort` 下连健康任务的输出都没打印出来 —— 一个连接的 bug 会带走整个 hub。
+理由与体积代价见 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
