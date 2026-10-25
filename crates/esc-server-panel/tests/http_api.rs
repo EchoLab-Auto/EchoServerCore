@@ -72,6 +72,9 @@ async fn start(tweak: impl FnOnce(&mut AuthConfig, &mut bool)) -> Running {
         title: "服务器面板测试".into(),
         access: Arc::new(AccessControl::new(&auth)),
         allow_actions,
+        allow_create: allow_actions,
+        allow_delete: allow_actions,
+        jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -16,17 +16,28 @@ html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
   font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
 a{color:var(--info);text-decoration:none}
 button{font:inherit;color:inherit;background:var(--bg3);border:1px solid var(--line);
-  border-radius:6px;padding:4px 10px;cursor:pointer;transition:.15s}
+  border-radius:6px;padding:4px 10px;cursor:pointer;transition:.15s;white-space:nowrap}
 button:hover:not(:disabled){background:#232c3b;border-color:#33405a}
 button:disabled{opacity:.4;cursor:not-allowed}
 button.primary{background:#1f6feb22;border-color:#1f6feb66;color:#79b8ff}
 button.danger{background:#f8514922;border-color:#f8514966;color:#ff9d97}
 button.ok{background:#3fb95022;border-color:#3fb95066;color:#7ee787}
+input,textarea,select{font:inherit;background:#0a0d12;color:var(--fg);
+  border:1px solid var(--line);border-radius:6px;padding:6px 9px;width:100%}
+input:focus,textarea:focus,select:focus{outline:none;border-color:#3d6fd4}
+textarea{font-family:var(--mono);font-size:12.5px;line-height:1.6;resize:vertical;min-height:62px}
+label{display:block;font-size:12px;color:var(--fg2);margin:0 0 4px}
+.hint{font-size:11.5px;color:var(--fg3);margin-top:3px}
 
-header{display:flex;align-items:center;gap:16px;padding:14px 22px;
+header{display:flex;align-items:center;gap:14px;padding:12px 22px;
   border-bottom:1px solid var(--line);background:var(--bg2);position:sticky;top:0;z-index:10;
   flex-wrap:wrap}
-header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
+header h1{font-size:15.5px;margin:0;font-weight:600;letter-spacing:.2px}
+nav{display:flex;gap:2px;margin-left:8px}
+nav button{background:transparent;border:none;border-bottom:2px solid transparent;
+  border-radius:0;padding:6px 14px;color:var(--fg2);font-size:13.5px}
+nav button:hover{background:#ffffff08;color:var(--fg)}
+nav button.on{color:var(--fg);border-bottom-color:var(--info)}
 .pill{font-size:12px;padding:2px 9px;border-radius:999px;background:var(--bg3);
   border:1px solid var(--line);color:var(--fg2);white-space:nowrap}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:1px}
@@ -37,6 +48,8 @@ header h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.2px}
 #stamp{margin-left:auto;font-size:12px;color:var(--fg3);font-family:var(--mono)}
 
 main{padding:18px 22px 60px;max-width:1500px;margin:0 auto}
+.tab{display:none}
+.tab.on{display:block}
 .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
 .card h2{font-size:12px;margin:0 0 12px;color:var(--fg2);font-weight:600;
@@ -47,26 +60,24 @@ main{padding:18px 22px 60px;max-width:1500px;margin:0 auto}
 .big{font-size:30px;font-weight:600;font-family:var(--mono);line-height:1.1}
 .big small{font-size:14px;color:var(--fg2);font-weight:400}
 .sub{font-size:12px;color:var(--fg2);margin-top:3px}
-
 .bar{height:7px;border-radius:4px;background:#0a0d12;overflow:hidden;margin:10px 0 6px;
   border:1px solid #1e2634}
 .bar > i{display:block;height:100%;background:var(--ok);transition:width .35s ease,background .35s}
 .bar > i.warn{background:var(--warn)}
 .bar > i.err{background:var(--err)}
-
 .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12.5px;margin-top:10px}
 .kv dt{color:var(--fg2)}
 .kv dd{margin:0;font-family:var(--mono);text-align:right;overflow:hidden;text-overflow:ellipsis}
-
 .cores{display:flex;gap:3px;flex-wrap:wrap;margin-top:8px}
 .cores span{flex:1;min-width:14px;height:20px;border-radius:3px;background:#0a0d12;
   border:1px solid #1e2634;position:relative;overflow:hidden}
 .cores span > i{position:absolute;bottom:0;left:0;right:0;background:var(--info);opacity:.75}
 
 section.block{margin-top:20px}
-section.block > h2{font-size:13px;color:var(--fg2);font-weight:600;margin:0 0 10px;
-  letter-spacing:.5px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-section.block > h2 .n{color:var(--fg3);font-weight:400}
+.toolbar{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+.toolbar h2{font-size:13px;color:var(--fg2);font-weight:600;margin:0;letter-spacing:.5px}
+.toolbar .n{color:var(--fg3);font-weight:400}
+.toolbar .sp{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
 
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;font-size:11px;color:var(--fg3);font-weight:600;text-transform:uppercase;
@@ -90,19 +101,24 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
   border:1px solid #1e2634;color:#9db4d0}
 .ctr .acts{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .ctr.stopped{opacity:.72}
+.grouphead{padding:5px 14px;font-size:11px;letter-spacing:.8px;text-transform:uppercase;
+  color:var(--fg3);background:#0f131a;border-bottom:1px solid #1a212c;
+  display:flex;align-items:center;gap:8px}
 
 .empty{padding:22px;text-align:center;color:var(--fg3);font-size:13px}
 .banner{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:12px;
   border:1px solid #d2992244;background:#d2992214;color:#e5c07b;display:flex;gap:10px;align-items:flex-start}
 .banner.err{border-color:#f8514944;background:#f8514914;color:#ff9d97}
+.banner code{font-family:var(--mono);background:#00000044;padding:1px 5px;border-radius:4px}
 
-/* 日志弹窗 */
+/* 弹窗 */
 #modal{position:fixed;inset:0;background:#000000cc;display:none;z-index:100;
   padding:40px 20px;overflow:auto;backdrop-filter:blur(2px)}
 #modal.on{display:block}
 #modal .box{max-width:1100px;margin:0 auto;background:var(--bg2);
   border:1px solid var(--line);border-radius:12px;overflow:hidden;
   box-shadow:0 20px 60px #000000aa}
+#modal .box.narrow{max-width:600px}
 #modal .head{display:flex;align-items:center;gap:12px;padding:12px 16px;
   border-bottom:1px solid var(--line);background:var(--bg3)}
 #modal .head b{font-family:var(--mono);font-size:13px;font-weight:500}
@@ -113,12 +129,44 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .stats div{background:#0a0d12;border:1px solid #1e2634;border-radius:8px;padding:9px 11px}
 .stats b{display:block;font-family:var(--mono);font-size:16px;font-weight:600}
 .stats span{font-size:11px;color:var(--fg3);text-transform:uppercase;letter-spacing:.5px}
+.body{padding:16px}
+.form section{margin-bottom:16px}
+.form h3{font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--fg3);
+  margin:0 0 8px;font-weight:600}
+.form .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.checks{display:flex;gap:18px;flex-wrap:wrap;align-items:center;font-size:13px}
+.checks label{display:flex;align-items:center;gap:7px;margin:0;color:var(--fg);cursor:pointer}
+.checks input{width:auto}
+.dl{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.8px}
+.dl dt{color:var(--fg2);white-space:nowrap}
+.dl dd{margin:0;font-family:var(--mono);word-break:break-all}
+.dl dd.plain{font-family:inherit}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-family:var(--mono);font-size:11.5px;background:#0a0d12;border:1px solid #1e2634;
+  border-radius:5px;padding:2px 7px;color:#9db4d0;max-width:100%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+  padding:10px 18px;border-radius:8px;font-size:13px;z-index:200;
+  box-shadow:0 8px 24px #000000aa;max-width:80vw;display:none}
+#toast.ok{background:#238636;color:#fff}
+#toast.err{background:#da3633;color:#fff}
+#toast.info{background:#1f6feb;color:#fff}
+.job{display:flex;align-items:center;gap:10px;padding:8px 12px;font-size:12.5px;
+  border-bottom:1px solid #1a212c}
+.job:last-child{border-bottom:none}
+.job .sp{margin-left:auto;font-family:var(--mono);color:var(--fg3);font-size:11.5px}
+.spinner{display:inline-block;width:11px;height:11px;border:2px solid #ffffff33;
+  border-top-color:var(--info);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-@media(max-width:640px){
+@media(max-width:720px){
   main{padding:12px 12px 40px}
+  header{padding:10px 12px;gap:8px}
+  nav{order:3;width:100%;margin:0}
   .trunc{max-width:160px}
   .ctr{grid-template-columns:1fr}
   .ctr .acts{justify-content:flex-start}
+  .form .row{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -126,234 +174,314 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 
 <header>
   <h1>__TITLE__</h1>
+  <nav>
+    <button data-tab="overview" class="on">概览</button>
+    <button data-tab="containers">容器</button>
+    <button data-tab="images">镜像</button>
+  </nav>
   <span class="pill" id="p-host">…</span>
   <span class="pill" id="p-docker"><span class="dot off"></span>Docker</span>
-  <span class="pill" id="p-readonly" style="display:none">只读模式</span>
+  <span class="pill" id="p-mode" style="display:none">只读</span>
   <span id="stamp">—</span>
 </header>
 
 <main>
   <div id="banners"></div>
 
-  <div class="grid">
-    <!-- CPU -->
-    <div class="card">
-      <h2>CPU <span class="tag" id="cpu-tag">—</span></h2>
-      <div class="big" id="cpu-pct">—<small>%</small></div>
-      <div class="bar"><i id="cpu-bar" style="width:0"></i></div>
-      <div class="cores" id="cores"></div>
-      <dl class="kv">
-        <dt>负载 (1/5/15)</dt><dd id="load">—</dd>
-        <dt>核心数</dt><dd id="ncpu">—</dd>
-      </dl>
+  <!-- ══════════ 概览 ══════════ -->
+  <div class="tab on" id="tab-overview">
+    <div class="grid">
+      <div class="card">
+        <h2>CPU <span class="tag" id="cpu-tag">—</span></h2>
+        <div class="big" id="cpu-pct">—<small>%</small></div>
+        <div class="bar"><i id="cpu-bar" style="width:0"></i></div>
+        <div class="cores" id="cores"></div>
+        <dl class="kv">
+          <dt>负载 (1/5/15)</dt><dd id="load">—</dd>
+          <dt>核心数</dt><dd id="ncpu">—</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>内存 <span class="tag" id="mem-tag">—</span></h2>
+        <div class="big" id="mem-pct">—<small>%</small></div>
+        <div class="bar"><i id="mem-bar" style="width:0"></i></div>
+        <dl class="kv">
+          <dt>已用 / 总量</dt><dd id="mem-used">—</dd>
+          <dt>可用</dt><dd id="mem-avail">—</dd>
+          <dt>缓存 / 缓冲</dt><dd id="mem-cache">—</dd>
+          <dt>Swap</dt><dd id="mem-swap">—</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>网络 <span class="tag" id="net-tag">—</span></h2>
+        <div class="big" id="net-rate">—</div>
+        <div class="sub">↓ <span id="net-rx-rate" class="mono">—</span> &nbsp;·&nbsp; ↑ <span id="net-tx-rate" class="mono">—</span></div>
+        <dl class="kv" id="ifaces"></dl>
+        <dl class="kv"><dt>累计 收 / 发</dt><dd id="net-total">—</dd></dl>
+      </div>
+
+      <div class="card">
+        <h2>系统 <span class="tag" id="sys-tag">—</span></h2>
+        <dl class="kv" style="margin-top:0">
+          <dt>主机名</dt><dd id="sys-host">—</dd>
+          <dt>操作系统</dt><dd id="sys-os">—</dd>
+          <dt>内核</dt><dd id="sys-kernel">—</dd>
+          <dt>架构</dt><dd id="sys-arch">—</dd>
+          <dt>运行时长</dt><dd id="sys-uptime">—</dd>
+          <dt>面板版本</dt><dd id="sys-ver">—</dd>
+        </dl>
+      </div>
     </div>
 
-    <!-- 内存 -->
-    <div class="card">
-      <h2>内存 <span class="tag" id="mem-tag">—</span></h2>
-      <div class="big" id="mem-pct">—<small>%</small></div>
-      <div class="bar"><i id="mem-bar" style="width:0"></i></div>
-      <dl class="kv">
-        <dt>已用 / 总量</dt><dd id="mem-used">—</dd>
-        <dt>可用</dt><dd id="mem-avail">—</dd>
-        <dt>缓存 / 缓冲</dt><dd id="mem-cache">—</dd>
-        <dt>Swap</dt><dd id="mem-swap">—</dd>
-      </dl>
-    </div>
+    <section class="block">
+      <div class="toolbar"><h2>磁盘 <span class="n" id="disk-n"></span></h2></div>
+      <div class="card" style="padding:8px 0">
+        <table>
+          <thead><tr>
+            <th>挂载点</th><th>设备</th><th>类型</th>
+            <th class="num">占用</th><th style="width:180px">使用率</th><th class="num">已用 / 总量</th>
+          </tr></thead>
+          <tbody id="disks"><tr><td colspan="6" class="empty">采样中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
 
-    <!-- 网络 -->
-    <div class="card">
-      <h2>网络 <span class="tag" id="net-tag">—</span></h2>
-      <div class="big" id="net-rate">—</div>
-      <div class="sub">↓ <span id="net-rx-rate" class="mono">—</span> &nbsp;·&nbsp; ↑ <span id="net-tx-rate" class="mono">—</span></div>
-      <dl class="kv" id="ifaces"></dl>
-      <dl class="kv">
-        <dt>累计 收 / 发</dt><dd id="net-total">—</dd>
-      </dl>
-    </div>
-
-    <!-- 系统 -->
-    <div class="card">
-      <h2>系统 <span class="tag" id="sys-tag">—</span></h2>
-      <dl class="kv" style="margin-top:0">
-        <dt>主机名</dt><dd id="sys-host">—</dd>
-        <dt>操作系统</dt><dd id="sys-os">—</dd>
-        <dt>内核</dt><dd id="sys-kernel">—</dd>
-        <dt>架构</dt><dd id="sys-arch">—</dd>
-        <dt>运行时长</dt><dd id="sys-uptime">—</dd>
-        <dt>面板版本</dt><dd id="sys-ver">—</dd>
-      </dl>
-    </div>
+    <section class="block">
+      <div class="toolbar"><h2>进程 Top 20 <span class="n">按 CPU 降序</span></h2></div>
+      <div class="card" style="padding:8px 0">
+        <table>
+          <thead><tr>
+            <th class="num">PID</th><th>名称</th><th class="num">CPU</th><th class="num">内存</th>
+            <th class="num">线程</th><th>用户</th><th>命令行</th>
+          </tr></thead>
+          <tbody id="procs"><tr><td colspan="7" class="empty">采样中…</td></tr></tbody>
+        </table>
+      </div>
+      <p class="hint">CPU% 是相对上次采样的增量（多核可超过 100%）；内存为常驻集（RSS）。</p>
+    </section>
   </div>
 
-  <!-- 磁盘 -->
-  <section class="block">
-    <h2>磁盘 <span class="n" id="disk-n"></span></h2>
-    <div class="card" style="padding:8px 0">
-      <table>
-        <thead><tr>
-          <th>挂载点</th><th>设备</th><th>类型</th>
-          <th class="num">占用</th><th style="width:180px">使用率</th>
-          <th class="num">已用 / 总量</th>
-        </tr></thead>
-        <tbody id="disks"><tr><td colspan="6" class="empty">采样中…</td></tr></tbody>
-      </table>
+  <!-- ══════════ 容器 ══════════ -->
+  <div class="tab" id="tab-containers">
+    <div class="toolbar">
+      <h2>容器 <span class="n" id="ctr-n"></span></h2>
+      <span class="sp">
+        <input id="ctr-filter" placeholder="过滤名称 / 镜像 / 项目" style="width:220px" autocomplete="off">
+        <button id="btn-create">+ 创建</button>
+        <button id="btn-refresh-ctr">刷新</button>
+      </span>
     </div>
-  </section>
-
-  <!-- Docker -->
-  <section class="block">
-    <h2>Docker 容器 <span class="n" id="ctr-n"></span>
-      <button id="btn-refresh-ctr" style="margin-left:auto">刷新</button>
-    </h2>
     <div id="docker-banner"></div>
     <div class="card" style="padding:0" id="containers">
       <div class="empty">加载中…</div>
     </div>
-  </section>
+  </div>
 
-  <!-- 进程 -->
-  <section class="block">
-    <h2>进程 Top 20 <span class="n">按 CPU 降序</span></h2>
+  <!-- ══════════ 镜像 ══════════ -->
+  <div class="tab" id="tab-images">
+    <div class="toolbar">
+      <h2>镜像 <span class="n" id="img-n"></span></h2>
+      <span class="sp">
+        <button id="btn-pull">+ 拉取镜像</button>
+        <button id="btn-refresh-img">刷新</button>
+      </span>
+    </div>
+    <div id="mirror-hint"></div>
+    <div id="jobs-box"></div>
     <div class="card" style="padding:8px 0">
       <table>
         <thead><tr>
-          <th class="num">PID</th><th>名称</th><th class="num">CPU</th>
-          <th class="num">内存</th><th class="num">线程</th><th>用户</th><th>命令行</th>
+          <th>标签</th><th>ID</th><th class="num">大小</th><th>创建时间</th>
+          <th class="num">操作</th>
         </tr></thead>
-        <tbody id="procs"><tr><td colspan="7" class="empty">采样中…</td></tr></tbody>
+        <tbody id="images"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
       </table>
     </div>
-    <p class="sub" style="color:var(--fg3)">
-      CPU% 是相对上次采样的增量（多核可超过 100%）；内存为常驻集（RSS）。
-    </p>
-  </section>
+    <p class="hint">删除镜像是不可撤销的（会连同依赖它的容器一起受影响）。</p>
+  </div>
 </main>
 
 <div id="modal">
-  <div class="box">
+  <div class="box" id="modal-box">
     <div class="head">
       <b id="m-title">—</b>
-      <span class="sp">
-        <button id="m-refresh">刷新</button>
+      <span class="sp" id="m-actions">
         <button id="m-close">关闭</button>
       </span>
     </div>
-    <div id="m-stats"></div>
-    <pre id="m-body">加载中…</pre>
+    <div id="m-content"></div>
   </div>
 </div>
 
 <script>
 "use strict";
 
-/* ── 小工具 ────────────────────────────────────────────────────────────── */
+/* ══════════════════════ 工具 ══════════════════════ */
 const $ = (id) => document.getElementById(id);
+const h = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 function bytes(n, digits = 1) {
   if (n === null || n === undefined || isNaN(n)) return "—";
+  n = Number(n);
   if (n < 1024) return n + " B";
-  const units = ["KB", "MB", "GB", "TB", "PB"];
+  const u = ["KB", "MB", "GB", "TB", "PB"];
   let v = n / 1024, i = 0;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return v.toFixed(v >= 100 ? 0 : digits) + " " + units[i];
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : digits) + " " + u[i];
 }
-function rate(n) { return n > 0 ? bytes(n) + "/s" : "0 B/s"; }
-function pct(n) { return (n === null || n === undefined || isNaN(n)) ? "—" : n.toFixed(1) + "%"; }
+const rate = (n) => (n > 0 ? bytes(n) + "/s" : "0 B/s");
+const pct = (n) => (n === null || n === undefined || isNaN(n)) ? "—" : Number(n).toFixed(1) + "%";
 function dur(sec) {
   sec = Math.floor(sec || 0);
-  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600),
+  const d = Math.floor(sec / 86400), H = Math.floor(sec % 86400 / 3600),
         m = Math.floor(sec % 3600 / 60), s = sec % 60;
-  if (d) return `${d}天 ${h}小时`;
-  if (h) return `${h}小时 ${m}分`;
+  if (d) return `${d}天 ${H}小时`;
+  if (H) return `${H}小时 ${m}分`;
   if (m) return `${m}分 ${s}秒`;
   return `${s}秒`;
 }
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, c =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-/* 进度条颜色：<70 绿、<90 黄、其余红。运维扫一眼就知道该看哪儿。 */
-function barClass(p) { return p >= 90 ? "err" : p >= 70 ? "warn" : ""; }
+const barClass = (p) => (p >= 90 ? "err" : p >= 70 ? "warn" : "");
 function setBar(el, p) {
   el.style.width = Math.min(100, Math.max(0, p || 0)) + "%";
   el.className = barClass(p);
 }
 function ago(ts) {
   if (!ts) return "—";
-  const s = Math.max(0, Date.now() / 1000 - ts);
+  const s = Math.max(0, Date.now() / 1000 - Number(ts));
   if (s < 60) return Math.floor(s) + " 秒前";
   if (s < 3600) return Math.floor(s / 60) + " 分钟前";
   if (s < 86400) return Math.floor(s / 3600) + " 小时前";
   return Math.floor(s / 86400) + " 天前";
 }
-
-let ALLOW_ACTIONS = false;
-let LAST = null;
-
-/* ── 概览轮询 ───────────────────────────────────────────────────────────── */
-async function poll() {
-  let d;
-  try {
-    const r = await fetch("/api/overview", { cache: "no-store" });
-    if (r.status === 401) { $("stamp").textContent = "需要认证"; return; }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    d = await r.json();
-  } catch (e) {
-    $("stamp").textContent = "⚠ 连接失败：" + e.message;
-    $("stamp").style.color = "var(--err)";
-    return;
+function sinceDate(s) {
+  // docker 的 Created 是 UNIX 秒（image）或 RFC3339（container detail）
+  if (!s) return "—";
+  if (/^\d+$/.test(s)) return new Date(Number(s) * 1000).toLocaleString();
+  const d = new Date(s);
+  return isNaN(d) ? s : d.toLocaleString();
+}
+let toastTimer = null;
+function toast(msg, kind = "err") {
+  let el = $("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    document.body.appendChild(el);
   }
-  LAST = d;
-  ALLOW_ACTIONS = !!d.allow_actions;
-  render(d);
+  el.className = kind;
+  el.textContent = msg;
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, kind === "err" ? 6000 : 3200);
+}
+
+/** 统一 fetch：返回 {ok, status, data}，把 JSON 错误摊成 message。 */
+async function api(path, opts = {}) {
+  const r = await fetch(path, { cache: "no-store", ...opts });
+  let data = null;
+  const text = await r.text();
+  if (text) { try { data = JSON.parse(text); } catch (_) { data = { raw: text }; } }
+  return { ok: r.ok, status: r.status, data };
+}
+const postJSON = (path, body) => api(path, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify(body ?? {}),
+});
+function errText(r) {
+  if (!r.data) return "HTTP " + r.status;
+  return r.data.error || r.data.raw || "HTTP " + r.status;
+}
+
+/* ══════════════════════ 状态 ══════════════════════ */
+const S = {
+  allowActions: false,
+  allowCreate: false,
+  allowDelete: false,
+  dockerState: "unavailable",
+  mirrors: [],
+  containers: [],
+  filter: "",
+  tab: "overview",
+};
+
+/* ══════════════════════ 页签 ══════════════════════ */
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => switchTab(b.dataset.tab);
+});
+function switchTab(name) {
+  S.tab = name;
+  document.querySelectorAll("nav button").forEach((b) =>
+    b.classList.toggle("on", b.dataset.tab === name));
+  document.querySelectorAll(".tab").forEach((t) =>
+    t.classList.toggle("on", t.id === "tab-" + name));
+  if (name === "containers") loadContainers();
+  if (name === "images") { loadImages(); loadJobs(); }
+}
+
+/* ══════════════════════ 概览轮询 ══════════════════════ */
+async function poll() {
+  let r;
+  try { r = await api("/api/overview"); }
+  catch (e) { $("stamp").textContent = "⚠ 连接失败：" + e.message; $("stamp").style.color = "var(--err)"; return; }
+  if (r.status === 401) { $("stamp").textContent = "需要认证"; return; }
+  if (!r.ok) { $("stamp").textContent = "⚠ HTTP " + r.status; return; }
+
+  const d = r.data;
+  S.allowActions = !!d.allow_actions;
+  S.allowCreate = !!d.allow_create;
+  S.allowDelete = !!d.allow_delete;
+  S.dockerState = (d.docker || {}).state || "unavailable";
+  S.mirrors = (d.docker || {}).mirrors || [];
+  renderOverview(d);
+  renderModePill();
   $("stamp").textContent = "更新于 " + new Date().toLocaleTimeString();
   $("stamp").style.color = "var(--fg3)";
 }
 
-function render(d) {
-  const h = d.host, c = d.cpu, m = d.mem, n = d.net;
+function renderModePill() {
+  const el = $("p-mode");
+  const writes = [];
+  if (S.allowActions) writes.push("启停");
+  if (S.allowCreate) writes.push("创建");
+  if (S.allowDelete) writes.push("删除");
+  if (writes.length === 0) { el.style.display = ""; el.textContent = "只读"; el.title = "所有写操作已关闭"; }
+  else if (writes.length < 3) { el.style.display = ""; el.textContent = "允许：" + writes.join("/"); }
+  else { el.style.display = "none"; }
+}
 
-  /* 采样失败要说出来：全 0 的数据看起来像"机器很空闲"，那是最坏的误导 */
+function renderOverview(d) {
+  const ho = d.host, c = d.cpu, m = d.mem, n = d.net;
+
   if (d.sampling_error) {
-    $("banners").innerHTML = `<div class="banner err">
-      <span>⚠</span>
-      <div>主机指标采样失败，下面的数字是空占位而非真实值：<br>
-      <code>${esc(d.sampling_error)}</code><br>
-      <span class="dim">请查看服务日志（journalctl -u esc-server-panel）。</span></div>
-    </div>`;
+    $("banners").innerHTML = `<div class="banner err"><span>⚠</span><div>
+      主机指标采样失败，下面的数字是空占位而非真实值：<br>
+      <code>${h(d.sampling_error)}</code><br>
+      <span class="dim">请查看服务日志（journalctl -u esc-server-panel）。</span></div></div>`;
   } else {
     $("banners").innerHTML = "";
   }
 
-  /* 头部 */
-  $("p-host").textContent = h.hostname;
+  $("p-host").textContent = ho.hostname;
   const dk = d.docker || {};
   const dot = dk.state === "ok" ? "ok" : dk.state === "unavailable" ? "off" : "err";
-  $("p-docker").innerHTML =
-    `<span class="dot ${dot}"></span>Docker ` +
-    (dk.state === "ok" ? (dk.version || "") :
-     dk.state === "unavailable" ? "未安装" : "异常");
-  $("p-readonly").style.display = d.allow_actions ? "none" : "";
+  $("p-docker").innerHTML = `<span class="dot ${dot}"></span>Docker ` +
+    (dk.state === "ok" ? h(dk.version || "") : dk.state === "unavailable" ? "未安装" : "异常");
 
-  /* CPU */
+  // CPU
   $("cpu-pct").innerHTML = pct(c.usage_pct).replace("%", "") + "<small>%</small>";
   setBar($("cpu-bar"), c.usage_pct);
   $("cpu-tag").textContent = d.interval_ms ? `间隔 ${d.interval_ms} ms` : "首次采样（累计均值）";
   $("load").textContent = `${c.load1.toFixed(2)} / ${c.load5.toFixed(2)} / ${c.load15.toFixed(2)}`;
-  $("ncpu").textContent = h.cpu_count || "—";
-
-  /* 每核：核心多的时候只画柱状，不写数字（写不下也没人逐个看） */
+  $("ncpu").textContent = ho.cpu_count || "—";
   const cores = $("cores");
-  if (c.per_core && c.per_core.length) {
-    cores.innerHTML = c.per_core.map((p, i) =>
-      `<span title="cpu${i}: ${p.toFixed(1)}%"><i style="height:${Math.min(100, p)}%"></i></span>`
-    ).join("");
-  } else {
-    cores.innerHTML = "";
-  }
+  cores.innerHTML = (c.per_core || []).map((p, i) =>
+    `<span title="cpu${i}: ${p.toFixed(1)}%"><i style="height:${Math.min(100, p)}%"></i></span>`).join("");
 
-  /* 内存 */
+  // 内存
   $("mem-pct").innerHTML = pct(m.usage_pct).replace("%", "") + "<small>%</small>";
   setBar($("mem-bar"), m.usage_pct);
   $("mem-tag").textContent = `已用 ${bytes(m.used_bytes)}`;
@@ -361,238 +489,723 @@ function render(d) {
   $("mem-avail").textContent = bytes(m.available_bytes);
   $("mem-cache").textContent = `${bytes(m.cached_bytes)} / ${bytes(m.buffers_bytes)}`;
   $("mem-swap").textContent = m.swap_total_bytes
-    ? `${bytes(m.swap_used_bytes)} / ${bytes(m.swap_total_bytes)}`
-    : "未启用";
+    ? `${bytes(m.swap_used_bytes)} / ${bytes(m.swap_total_bytes)}` : "未启用";
 
-  /* 网络 */
+  // 网络
   $("net-tag").textContent = `${(n.interfaces || []).length} 个接口`;
   $("net-rate").textContent = rate(n.rx_per_sec + n.tx_per_sec);
   $("net-rx-rate").textContent = rate(n.rx_per_sec);
   $("net-tx-rate").textContent = rate(n.tx_per_sec);
   $("net-total").textContent = `${bytes(n.rx_total_bytes)} / ${bytes(n.tx_total_bytes)}`;
-  $("ifaces").innerHTML = (n.interfaces || []).slice(0, 4).map(i =>
-    `<dt>${esc(i.name)}</dt><dd>↓${rate(i.rx_per_sec)} ↑${rate(i.tx_per_sec)}</dd>`
-  ).join("");
+  $("ifaces").innerHTML = (n.interfaces || []).slice(0, 4).map((i) =>
+    `<dt>${h(i.name)}</dt><dd>↓${rate(i.rx_per_sec)} ↑${rate(i.tx_per_sec)}</dd>`).join("");
 
-  /* 系统 */
-  $("sys-host").textContent = h.hostname;
-  $("sys-os").textContent = h.os;
-  $("sys-kernel").textContent = h.kernel || "—";
-  $("sys-arch").textContent = h.arch;
-  $("sys-uptime").textContent = dur(h.uptime_secs);
+  // 系统
+  $("sys-host").textContent = ho.hostname;
+  $("sys-os").textContent = ho.os;
+  $("sys-kernel").textContent = ho.kernel || "—";
+  $("sys-arch").textContent = ho.arch;
+  $("sys-uptime").textContent = dur(ho.uptime_secs);
   $("sys-ver").textContent = "v" + d.version;
   $("sys-tag").textContent = d.in_container ? "容器内" : "物理/虚机";
 
-  /* 磁盘 */
+  // 磁盘
   const disks = d.disks || [];
   $("disk-n").textContent = disks.length ? `${disks.length} 个挂载` : "";
-  $("disks").innerHTML = disks.length ? disks.map(x => `
+  $("disks").innerHTML = disks.length ? disks.map((x) => `
     <tr>
-      <td class="mono">${esc(x.mount)}</td>
-      <td class="mono dim trunc">${esc(x.device)}</td>
-      <td class="dim">${esc(x.fs)}</td>
+      <td class="mono">${h(x.mount)}</td>
+      <td class="mono dim trunc">${h(x.device)}</td>
+      <td class="dim">${h(x.fs)}</td>
       <td class="num" style="color:${x.usage_pct >= 90 ? "var(--err)" : x.usage_pct >= 75 ? "var(--warn)" : "inherit"}">${x.usage_pct.toFixed(1)}%</td>
       <td><div class="bar" style="margin:0"><i class="${barClass(x.usage_pct)}" style="width:${Math.min(100, x.usage_pct)}%"></i></div></td>
       <td class="num">${bytes(x.used_bytes)} / ${bytes(x.total_bytes)}</td>
     </tr>`).join("") : `<tr><td colspan="6" class="empty">无数据</td></tr>`;
 
-  /* 进程 */
+  // 进程
   const procs = d.procs || [];
-  $("procs").innerHTML = procs.length ? procs.map(p => `
+  $("procs").innerHTML = procs.length ? procs.map((p) => `
     <tr>
       <td class="num dim">${p.pid}</td>
-      <td class="mono">${esc(p.name)}</td>
+      <td class="mono">${h(p.name)}</td>
       <td class="num" style="color:${p.cpu_pct >= 80 ? "var(--err)" : p.cpu_pct >= 30 ? "var(--warn)" : "inherit"}">${p.cpu_pct ? p.cpu_pct.toFixed(1) + "%" : "—"}</td>
       <td class="num">${bytes(p.rss_bytes)}</td>
       <td class="num dim">${p.threads}</td>
-      <td class="dim">${esc(p.user)}</td>
-      <td class="mono dim trunc" title="${esc(p.cmdline)}">${esc(p.cmdline || "[" + p.name + "]")}</td>
+      <td class="dim">${h(p.user)}</td>
+      <td class="mono dim trunc" title="${h(p.cmdline)}">${h(p.cmdline || "[" + p.name + "]")}</td>
     </tr>`).join("") : `<tr><td colspan="7" class="empty">无数据</td></tr>`;
 
   renderDockerBanner(dk);
+  if (S.tab === "containers") {
+    // 概览里已知容器数变了就顺手刷新列表（避免两个数字打架）
+    const total = dk.containers_total ?? -1;
+    if (total !== S.lastTotal) { S.lastTotal = total; loadContainers(); }
+  }
 }
 
-/* ── Docker ─────────────────────────────────────────────────────────────── */
 function renderDockerBanner(dk) {
   const el = $("docker-banner");
   if (dk.state === "ok") {
-    if (dk.list_error) {
-      el.innerHTML = `<div class="banner err">Docker 在运行，但容器列表拉取失败：${esc(dk.list_error)}</div>`;
-    } else { el.innerHTML = ""; }
+    el.innerHTML = dk.list_error
+      ? `<div class="banner err">Docker 在运行，但容器列表拉取失败：${h(dk.list_error)}</div>` : "";
     $("ctr-n").textContent =
-      `${dk.containers_running} 运行 / ${dk.containers_total} 共 · API ${esc(dk.api_version || "?")}`;
+      `${dk.containers_running} 运行 / ${dk.containers_total} 共 · API ${h(dk.api_version || "?")}`;
   } else if (dk.state === "unavailable") {
-    el.innerHTML = `<div class="banner">
-      <span>ℹ️</span>
-      <div>这台机器没有检测到 Docker（<code>${esc(dk.socket)}</code> 不存在）。
-      装好 Docker 后刷新本页即可自动出现容器管理，无需改配置。</div>
-    </div>`;
+    el.innerHTML = `<div class="banner"><span>ℹ️</span><div>
+      这台机器没有检测到 Docker（<code>${h(dk.socket)}</code> 不存在）。
+      装好 Docker 后刷新本页即可自动出现容器管理，无需改配置。</div></div>`;
     $("ctr-n").textContent = "未安装";
     $("containers").innerHTML = `<div class="empty">未安装 Docker</div>`;
   } else {
-    el.innerHTML = `<div class="banner err">
-      <span>⚠</span>
-      <div>Docker socket 存在但访问失败：${esc(dk.message || "")}<br>
-      <span class="dim">常见原因：用户不在 <code>docker</code> 组、daemon 未启动、socket 权限不足。</span></div>
-    </div>`;
+    el.innerHTML = `<div class="banner err"><span>⚠</span><div>
+      Docker socket 存在但访问失败：${h(dk.message || "")}<br>
+      <span class="dim">常见原因：用户不在 <code>docker</code> 组、daemon 未启动、socket 权限不足。</span></div></div>`;
     $("ctr-n").textContent = "不可用";
     $("containers").innerHTML = `<div class="empty">无法连接 Docker daemon</div>`;
   }
 }
 
+/* ══════════════════════ 容器 ══════════════════════ */
 async function loadContainers() {
   const box = $("containers");
-  let d;
-  try {
-    const r = await fetch("/api/docker/containers", { cache: "no-store" });
-    if (r.status === 503) { box.innerHTML = `<div class="empty">未安装 Docker</div>`; return; }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    d = await r.json();
-  } catch (e) {
-    box.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  let r;
+  try { r = await api("/api/docker/containers"); }
+  catch (e) { box.innerHTML = `<div class="empty">加载失败：${h(e.message)}</div>`; return; }
+  if (r.status === 503) { box.innerHTML = `<div class="empty">未安装 Docker</div>`; return; }
+  if (!r.ok) { box.innerHTML = `<div class="empty">加载失败：${h(errText(r))}</div>`; return; }
+
+  S.containers = (r.data.containers || []).slice();
+  renderContainers();
+}
+
+function renderContainers() {
+  const box = $("containers");
+  let list = S.containers.slice();
+  const f = S.filter.trim().toLowerCase();
+  if (f) {
+    list = list.filter((c) =>
+      [c.name, c.image, c.compose_project, c.compose_service]
+        .filter(Boolean).some((v) => String(v).toLowerCase().includes(f)));
+  }
+  if (!list.length) {
+    box.innerHTML = `<div class="empty">${S.containers.length ? "没有匹配的容器" : "没有容器"}</div>`;
+    $("ctr-n").textContent = S.containers.length ? `0 / ${S.containers.length}` : "0 个";
     return;
   }
-  const list = d.containers || [];
-  if (!list.length) { box.innerHTML = `<div class="empty">没有容器</div>`; return; }
 
-  /* Compose 项目分组：同一个 project 的容器排在一起，运维看的是「一栈服务」 */
+  // Compose 项目分组：同一个 project 的容器排在一起，运维看的是「一栈服务」
   list.sort((a, b) => {
     const pa = a.compose_project || "~", pb = b.compose_project || "~";
     if (pa !== pb) return pa < pb ? -1 : 1;
     return (a.compose_service || a.name) < (b.compose_service || b.name) ? -1 : 1;
   });
 
-  box.innerHTML = list.map(c => {
-    const running = c.state === "running";
-    const paused = c.state === "paused";
-    const ports = c.ports.filter(p => p.public)
-      .map(p => `:${p.public}→${p.private}`).join(" ");
-    const acts = [];
-    if (ALLOW_ACTIONS) {
-      if (running || paused) {
-        acts.push(`<button class="danger" onclick="act('${esc(c.id)}','stop')">停止</button>`);
-        acts.push(`<button onclick="act('${esc(c.id)}','restart')">重启</button>`);
-        if (paused) acts.push(`<button class="ok" onclick="act('${esc(c.id)}','unpause')">恢复</button>`);
-        else acts.push(`<button onclick="act('${esc(c.id)}','pause')">暂停</button>`);
-      } else {
-        acts.push(`<button class="ok" onclick="act('${esc(c.id)}','start')">启动</button>`);
-      }
-    }
-    acts.push(`<button onclick="showLogs('${esc(c.id)}','${esc(c.name)}')">日志</button>`);
-    acts.push(`<button onclick="showStats('${esc(c.id)}','${esc(c.name)}')">资源</button>`);
+  const running = S.containers.filter((c) => c.state === "running").length;
+  $("ctr-n").textContent = `${running} 运行 / ${S.containers.length} 共` +
+    (f ? `（显示 ${list.length}）` : "");
 
-    const stateDot = running ? "ok" : paused ? "warn" : "off";
-    return `<div class="ctr ${running ? "" : "stopped"}">
-      <div>
-        <div class="name">
-          <span class="dot ${stateDot}"></span>${esc(c.name)}
-          ${c.compose_project ? `<span class="pill">${esc(c.compose_project)}/${esc(c.compose_service || "")}</span>` : ""}
-          ${running ? "" : `<span class="pill">${esc(c.state)}</span>`}
-        </div>
-        <div class="meta">
-          <span><code>${esc(c.image)}</code></span>
-          <span>${esc(c.status)}</span>
-          ${ports ? `<span class="mono">${esc(ports)}</span>` : ""}
-          <span class="dim">${ago(c.created)}</span>
-        </div>
-      </div>
-      <div class="acts">${acts.join("")}</div>
-    </div>`;
-  }).join("");
+  let html = "";
+  let lastGroup = null;
+  for (const c of list) {
+    const g = c.compose_project || null;
+    if (g !== lastGroup && g) {
+      const members = list.filter((x) => x.compose_project === g);
+      const n = members.length;
+      const stoppable = members.filter((x) => x.state === "running" || x.state === "paused").length;
+      const startable = members.filter((x) => x.state !== "running" && x.state !== "paused").length;
+      // 整栈启停是最常见的批量需求（升级前停一整栈、机器重启后拉起来）
+      const bulk = S.allowActions
+        ? `<span style="margin-left:auto;display:flex;gap:6px">
+             ${startable ? `<button data-bulk-start="${h(g)}" style="padding:1px 8px;font-size:11px">全部启动 (${startable})</button>` : ""}
+             ${stoppable ? `<button data-bulk-stop="${h(g)}" class="danger" style="padding:1px 8px;font-size:11px">全部停止 (${stoppable})</button>` : ""}
+           </span>`
+        : "";
+      html += `<div class="grouphead">📦 ${h(g)} <span class="dim">${n} 个容器</span>${bulk}</div>`;
+    }
+    lastGroup = g;
+    html += containerRow(c);
+  }
+  box.innerHTML = html;
 }
 
-async function act(id, action) {
-  const r = await fetch(`/api/docker/containers/${encodeURIComponent(id)}/${action}`,
-    { method: "POST" });
-  if (!r.ok) {
-    let msg = "HTTP " + r.status;
-    try { msg = (await r.json()).error || msg; } catch (_) {}
-    toast("操作失败：" + msg);
+function containerRow(c) {
+  const running = c.state === "running";
+  const paused = c.state === "paused";
+  const ports = c.ports.filter((p) => p.public)
+    .map((p) => `:${p.public}→${p.private}`).join(" ");
+  const acts = [];
+  if (S.allowActions) {
+    if (running || paused) {
+      acts.push(btn(c.id, "stop", "停止", "danger"));
+      acts.push(btn(c.id, "restart", "重启", ""));
+      acts.push(paused ? btn(c.id, "unpause", "恢复", "ok") : btn(c.id, "pause", "暂停", ""));
+    } else {
+      acts.push(btn(c.id, "start", "启动", "ok"));
+    }
   }
+  acts.push(`<button data-logs="${h(c.id)}" data-name="${h(c.name)}">日志</button>`);
+  acts.push(`<button data-stats="${h(c.id)}" data-name="${h(c.name)}">资源</button>`);
+  acts.push(`<button data-detail="${h(c.id)}" data-name="${h(c.name)}">详情</button>`);
+  if (S.allowDelete) acts.push(`<button class="danger" data-del="${h(c.id)}" data-name="${h(c.name)}">删除</button>`);
+
+  const stateDot = running ? "ok" : paused ? "warn" : "off";
+  return `<div class="ctr ${running ? "" : "stopped"}">
+    <div>
+      <div class="name">
+        <span class="dot ${stateDot}"></span>${h(c.name)}
+        ${c.compose_project ? `<span class="pill">${h(c.compose_project)}/${h(c.compose_service || "")}</span>` : ""}
+        ${running ? "" : `<span class="pill">${h(c.state)}</span>`}
+      </div>
+      <div class="meta">
+        <span><code>${h(c.image)}</code></span>
+        <span>${h(c.status)}</span>
+        ${ports ? `<span class="mono">${h(ports)}</span>` : ""}
+        <span class="dim">${ago(c.created)}</span>
+      </div>
+    </div>
+    <div class="acts">${acts.join("")}</div>
+  </div>`;
+}
+const btn = (id, action, label, cls) =>
+  `<button class="${cls}" data-act="${action}" data-id="${h(id)}">${label}</button>`;
+
+// 事件委托：容器列表里的所有按钮
+$("containers").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.act) return act(b.dataset.id, b.dataset.act, b);
+  if (b.dataset.logs) return openLogs(b.dataset.logs, b.dataset.name);
+  if (b.dataset.stats) return openStats(b.dataset.stats, b.dataset.name);
+  if (b.dataset.detail) return openDetail(b.dataset.detail, b.dataset.name);
+  if (b.dataset.del) return confirmDeleteContainer(b.dataset.del, b.dataset.name);
+  if (b.dataset.bulkStart) return bulkAction(b.dataset.bulkStart, "start", b);
+  if (b.dataset.bulkStop) return bulkAction(b.dataset.bulkStop, "stop", b);
+});
+
+/** 按 compose 项目批量启停：串行执行，失败也继续（一个坏了不该拖住其余）。 */
+async function bulkAction(project, action, btnEl) {
+  const want = action === "start"
+    ? (c) => c.state !== "running" && c.state !== "paused"
+    : (c) => c.state === "running" || c.state === "paused";
+  const targets = S.containers.filter((c) => c.compose_project === project && want(c));
+  if (!targets.length) return;
+  if (action === "stop" && !confirm(`停止 ${project} 的 ${targets.length} 个容器？`)) return;
+  btnEl.disabled = true;
+  const label = btnEl.textContent;
+  let ok = 0, fail = 0, firstErr = "";
+  for (let i = 0; i < targets.length; i++) {
+    btnEl.textContent = `${action === "start" ? "启动" : "停止"}中 ${i + 1}/${targets.length}`;
+    const r = await postJSON(
+      `/api/docker/containers/${encodeURIComponent(targets[i].id)}/${action}`);
+    if (r.ok) ok++; else { fail++; if (!firstErr) firstErr = `${targets[i].name}: ${errText(r)}`; }
+  }
+  btnEl.disabled = false;
+  btnEl.textContent = label;
+  if (fail) toast(`${ok} 个成功，${fail} 个失败（${firstErr}）`, "err");
+  else toast(`${project}：${ok} 个容器已${action === "start" ? "启动" : "停止"}`, "ok");
   setTimeout(() => { loadContainers(); poll(); }, 400);
 }
 
-/* ── 弹窗：日志 / 资源 ──────────────────────────────────────────────────── */
-let MODAL = { id: null, kind: null };
-
-function openModal() { $("modal").classList.add("on"); }
-function closeModal() { $("modal").classList.remove("on"); MODAL = { id: null, kind: null }; }
-
-async function showLogs(id, name) {
-  MODAL = { id, kind: "logs" };
-  $("m-title").textContent = name + " · 日志";
-  $("m-stats").innerHTML = "";
-  $("m-body").textContent = "加载中…";
-  openModal();
-  await refreshModal();
+async function act(id, action, btnEl) {
+  if (btnEl) btnEl.disabled = true;
+  const r = await postJSON(`/api/docker/containers/${encodeURIComponent(id)}/${action}`);
+  if (btnEl) btnEl.disabled = false;
+  if (!r.ok) toast("操作失败：" + errText(r));
+  else toast(`${action} 成功`, "ok");
+  setTimeout(() => { loadContainers(); poll(); }, 350);
 }
 
-async function showStats(id, name) {
-  MODAL = { id, kind: "stats" };
-  $("m-title").textContent = name + " · 资源";
-  openModal();
-  await refreshModal();
+function confirmDeleteContainer(id, name) {
+  if (!S.allowDelete) return toast("面板不允许删除", "err");
+  openModal(`删除容器 ${name}`, `
+    <div class="body">
+      <div class="banner err" style="margin:0 0 14px"><span>⚠</span><div>
+        这会<b>强制停止并删除</b> <code>${h(name)}</code>。
+        容器内的临时数据会丢失（挂载的卷/目录不受影响）。<br>此操作不可撤销。</div></div>
+      <div class="checks"><button class="danger" id="do-del">确认删除</button></div>
+    </div>`, { narrow: true });
+  $("do-del").onclick = async () => {
+    const r = await api(`/api/docker/containers/${encodeURIComponent(id)}`, { method: "DELETE" });
+    closeModal();
+    if (!r.ok) toast("删除失败：" + errText(r));
+    else toast("已删除 " + name, "ok");
+    setTimeout(() => { loadContainers(); poll(); }, 350);
+  };
 }
 
-async function refreshModal() {
-  if (!MODAL.id) return;
-  const { id, kind } = MODAL;
-  try {
-    if (kind === "logs") {
-      const r = await fetch(`/api/docker/containers/${encodeURIComponent(id)}/logs?tail=300`, { cache: "no-store" });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
-      const d = await r.json();
-      $("m-body").textContent = d.text && d.text.length ? d.text : "（没有日志输出）";
-    } else {
-      const r = await fetch(`/api/docker/containers/${encodeURIComponent(id)}/stats`, { cache: "no-store" });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "HTTP " + r.status);
-      const s = await r.json();
-      $("m-stats").innerHTML = `<div class="stats">
-        <div><span>CPU</span><b>${s.cpu_pct.toFixed(1)}%</b></div>
-        <div><span>内存</span><b>${bytes(s.mem_used_bytes)}</b></div>
-        <div><span>内存上限</span><b>${s.mem_limit_bytes > 1e12 ? "不限" : bytes(s.mem_limit_bytes)}</b></div>
-        <div><span>网络 ↓</span><b>${bytes(s.net_rx_bytes)}</b></div>
-        <div><span>网络 ↑</span><b>${bytes(s.net_tx_bytes)}</b></div>
-        <div><span>块读</span><b>${bytes(s.block_read_bytes)}</b></div>
-        <div><span>块写</span><b>${bytes(s.block_write_bytes)}</b></div>
-        <div><span>进程数</span><b>${s.pids}</b></div>
-      </div>`;
-      $("m-body").textContent = "（资源为单次采样，点「刷新」可再取一次）";
+/* ══════════════════════ 创建容器 ══════════════════════ */
+$("btn-create").onclick = () => {
+  if (!S.allowCreate) return toast("面板不允许创建容器（allow_create = false）", "err");
+  openModal("创建容器", `
+  <div class="body form">
+    <section>
+      <h3>镜像与名称</h3>
+      <div class="row">
+        <div>
+          <label>镜像 *</label>
+          <input id="f-image" placeholder="nginx:alpine" autocomplete="off" spellcheck="false">
+          <div class="hint">不存在会自动拉取（可能需要等几十秒）</div>
+        </div>
+        <div>
+          <label>容器名</label>
+          <input id="f-name" placeholder="留空则自动生成" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h3>端口映射</h3>
+      <textarea id="f-ports" placeholder="每行一条，例如：&#10;8080:80&#10;127.0.0.1:8443:443&#10;53:53/udp"></textarea>
+      <div class="hint">格式 host:container[/udp]；只写一个数字则随机分配宿主端口</div>
+    </section>
+
+    <section>
+      <h3>环境变量</h3>
+      <textarea id="f-env" placeholder="每行一条 KEY=VALUE，例如：&#10;TZ=Asia/Shanghai&#10;NODE_ENV=production"></textarea>
+    </section>
+
+    <section>
+      <h3>目录挂载</h3>
+      <textarea id="f-binds" placeholder="每行一条 host:container[:ro]，例如：&#10;/srv/www:/usr/share/nginx/html:ro&#10;/srv/data:/data"></textarea>
+    </section>
+
+    <section>
+      <div class="row">
+        <div>
+          <label>启动命令（覆盖镜像 CMD）</label>
+          <input id="f-cmd" placeholder="留空用镜像默认，多参数用空格分隔" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label>重启策略</label>
+          <select id="f-restart">
+            <option value="unless-stopped" selected>unless-stopped（推荐）</option>
+            <option value="always">always</option>
+            <option value="on-failure:5">on-failure:5</option>
+            <option value="no">no（不自动重启）</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <label>网络</label>
+      <select id="f-network"><option value="">默认（bridge）</option></select>
+    </section>
+
+    <section class="checks">
+      <label><input type="checkbox" id="f-start" checked> 创建后立即启动</label>
+    </section>
+
+    <div class="checks" style="margin-top:6px">
+      <button class="primary" id="do-create">创建</button>
+      <span class="dim" id="create-hint" style="font-size:12px"></span>
+    </div>
+  </div>`);
+  $("f-image").focus();
+  loadNetworksInto($("f-network"));
+
+  $("do-create").onclick = async () => {
+    const image = $("f-image").value.trim();
+    if (!image) { $("f-image").focus(); return toast("镜像不能为空"); }
+    const lines = (id) => $(id).value.split("\n").map((s) => s.trim()).filter(Boolean);
+    const spec = {
+      image,
+      name: $("f-name").value.trim() || null,
+      cmd: $("f-cmd").value.trim() ? $("f-cmd").value.trim().split(/\s+/) : [],
+      env: lines("f-env"),
+      ports: lines("f-ports"),
+      binds: lines("f-binds"),
+      restart: $("f-restart").value,
+      network: $("f-network").value || null,
+      auto_start: $("f-start").checked,
+    };
+    const b = $("do-create");
+    b.disabled = true;
+    $("create-hint").textContent = spec.auto_start ? "创建并启动中，若需拉镜像可能要等一会儿…" : "创建中…";
+    const r = await postJSON("/api/docker/containers", spec);
+    b.disabled = false;
+    if (!r.ok) {
+      $("create-hint").textContent = "";
+      toast("创建失败：" + errText(r));
+      return;
     }
-  } catch (e) {
-    $("m-body").textContent = "加载失败：" + e.message;
+    closeModal();
+    toast("已创建 " + (spec.name || r.data.id.slice(0, 12)), "ok");
+    switchTab("containers");
+    setTimeout(() => { loadContainers(); poll(); }, 400);
+  };
+};
+
+async function loadNetworksInto(sel) {
+  const r = await api("/api/docker/networks");
+  if (!r.ok || !r.data.networks) return;
+  for (const n of r.data.networks) {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n;
+    sel.appendChild(o);
   }
 }
 
-/* ── 提示条 ─────────────────────────────────────────────────────────────── */
-let toastTimer = null;
-function toast(msg) {
-  let el = $("toast");
-  if (!el) {
-    el = document.createElement("div");
-    el.id = "toast";
-    el.style.cssText = "position:fixed;bottom:22px;left:50%;transform:translateX(-50%);" +
-      "background:#f85149;color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;" +
-      "z-index:200;box-shadow:0 8px 24px #000000aa;max-width:80vw";
-    document.body.appendChild(el);
+/* ══════════════════════ 详情 ══════════════════════ */
+async function openDetail(id, name) {
+  openModal(`${name} · 详情`, `<div class="body"><div class="empty">加载中…</div></div>`);
+  const r = await api(`/api/docker/containers/${encodeURIComponent(id)}/detail`);
+  if (!r.ok) { $("m-content").innerHTML = `<div class="body"><div class="empty">${h(errText(r))}</div></div>`; return; }
+  const d = r.data;
+
+  const kv = (k, v, plain) =>
+    `<dt>${h(k)}</dt><dd class="${plain ? "plain" : ""}">${v}</dd>`;
+  const chips = (arr, empty) => arr.length
+    ? `<div class="chips">${arr.map((x) => `<span class="chip" title="${h(x)}">${h(x)}</span>`).join("")}</div>`
+    : `<span class="dim">${empty}</span>`;
+
+  const ports = d.ports.length
+    ? d.ports.map((p) => p.public ? `${p.public} → ${p.private}/${p.kind}` : `${p.private}/${p.kind}（未发布）`).join("  ·  ")
+    : "—";
+  const mounts = d.mounts.length
+    ? d.mounts.map((m) => `${m.source} → ${m.target}${m.read_only ? " (ro)" : ""}`).join("<br>")
+    : "—";
+  const envs = d.env.map(([k, v]) => `${k}=${v}`);
+  const nets = d.networks.map(([n, ip]) => `${n}${ip ? " / " + ip : ""}`);
+
+  $("m-content").innerHTML = `<div class="body">
+    <section style="margin-bottom:16px">
+      <h3 style="font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--fg3);margin:0 0 8px">状态</h3>
+      <dl class="dl">
+        ${kv("容器 ID", h(d.id.slice(0, 16)))}
+        ${kv("镜像", h(d.image))}
+        ${kv("状态", h(d.state) + (d.restart_count ? `（已重启 ${d.restart_count} 次）` : ""), true)}
+        ${kv("退出码", d.state === "exited" ? d.exit_code : "—")}
+        ${kv("启动于", h(sinceDate(d.started_at)), true)}
+        ${kv("结束于", d.finished_at && !d.finished_at.startsWith("0001") ? h(sinceDate(d.finished_at)) : "—", true)}
+        ${kv("创建于", h(sinceDate(d.created)), true)}
+        ${kv("平台", h(d.platform || "—"))}
+      </dl>
+    </section>
+
+    <section style="margin-bottom:16px">
+      <h3 style="font-size:.8em;letter-spacing:.8px;text-transform:uppercase;color:var(--fg3);margin:0 0 8px">运行配置</h3>
+      <dl class="dl">
+        ${kv("重启策略", `<span style="color:${d.restart_policy === "no" ? "var(--warn)" : "var(--ok)"}">${h(d.restart_policy)}</span>${d.restart_policy === "no" ? ' <span class="dim">（机器重启后不会自启）</span>' : ""}`, true)}
+        ${kv("端口", h(ports), true)}
+        ${kv("网络", h(nets.join("  ·  ") || "—"), true)}
+        ${kv("工作目录", h(d.working_dir || "—"))}
+        ${kv("Entrypoint", h(d.entrypoint.join(" ") || "—"))}
+        ${kv("Cmd", h(d.cmd.join(" ") || "—"))}
+        ${kv("内存限制", d.memory_limit_bytes > 0 ? bytes(d.memory_limit_bytes) : "不限", d.memory_limit_bytes === 0)}
+        ${kv("CPU 配额", d.cpu_quota > 0 ? String(d.cpu_quota) : "不限", d.cpu_quota === 0)}
+        ${d.privileged ? kv("特权模式", '<span style="color:var(--err)">已开启（≈ 宿主机 root）</span>', true) : ""}
+      </dl>
+    </section>
+
+    <section style="margin-bottom:16px">
+      <h3 style="font-size:.8em;letter-spacing:.8px;text-transform:uppercase;color:var(--fg3);margin:0 0 8px">挂载</h3>
+      <div class="mono" style="font-size:12.3px;line-height:1.7;color:#c8d3e0">${mounts}</div>
+    </section>
+
+    <section style="margin-bottom:16px">
+      <h3 style="font-size:.8em;letter-spacing:.8px;text-transform:uppercase;color:var(--fg3);margin:0 0 8px">环境变量 <span class="dim" style="text-transform:none;letter-spacing:0">（${envs.length}）</span></h3>
+      <div style="max-height:220px;overflow:auto">${chips(envs, "无")}</div>
+    </section>
+
+    <section class="checks">
+      ${S.allowActions ? `<button id="d-restart-policy">改重启策略</button>` : ""}
+      ${S.allowActions ? `<button id="d-rename">改名</button>` : ""}
+    </section>
+  </div>`;
+
+  if (S.allowActions) {
+    $("d-restart-policy").onclick = () => openRestartPolicy(id, name, d.restart_policy);
+    $("d-rename").onclick = () => openRename(id, name);
   }
-  el.textContent = msg;
-  el.style.display = "block";
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.style.display = "none"; }, 4000);
 }
 
-/* ── 事件���定与启动 ─────────────────────────────────────────────────────── */
-$("m-close").onclick = closeModal;
-$("m-refresh").onclick = refreshModal;
+function openRestartPolicy(id, name, current) {
+  openModal(`${name} · 重启策略`, `<div class="body form">
+    <label>当前：<span class="mono">${h(current)}</span></label>
+    <div style="margin-top:12px">
+      <label>改为</label>
+      <select id="rp-sel">
+        <option value="unless-stopped">unless-stopped（推荐：机器重启后自启，手动停的不自启）</option>
+        <option value="always">always（总是自启）</option>
+        <option value="on-failure:5">on-failure:5（失败重试 5 次）</option>
+        <option value="no">no（不自动重启）</option>
+      </select>
+    </div>
+    <div class="hint">这台机器重启后，策略为 <code>no</code> 的容器不会自己起来。</div>
+    <div style="margin-top:14px"><button class="primary" id="rp-do">保存</button></div>
+  </div>`, { narrow: true });
+  $("rp-sel").value = ["unless-stopped", "always", "on-failure:5", "no"].includes(current)
+    ? current : "unless-stopped";
+  $("rp-do").onclick = async () => {
+    const r = await postJSON(`/api/docker/containers/${encodeURIComponent(id)}/restart-policy`,
+      { policy: $("rp-sel").value });
+    closeModal();
+    if (!r.ok) toast("修改失败：" + errText(r));
+    else toast("重启策略已更新", "ok");
+    loadContainers();
+  };
+}
+
+function openRename(id, name) {
+  openModal(`${name} · 改名`, `<div class="body form">
+    <label>新名称</label>
+    <input id="rn-input" value="${h(name)}" autocomplete="off" spellcheck="false">
+    <div class="hint">只允许字母数字与 . _ -；名称必须全局唯一。</div>
+    <div style="margin-top:14px"><button class="primary" id="rn-do">保存</button></div>
+  </div>`, { narrow: true });
+  $("rn-input").focus();
+  $("rn-input").select();
+  $("rn-do").onclick = async () => {
+    const r = await postJSON(`/api/docker/containers/${encodeURIComponent(id)}/rename`,
+      { name: $("rn-input").value.trim() });
+    closeModal();
+    if (!r.ok) toast("改名失败：" + errText(r));
+    else toast("已改名", "ok");
+    loadContainers();
+  };
+}
+
+/* ══════════════════════ 日志（增量刷新） ══════════════════════ */
+const LOG = { id: null, name: "", text: "", lastTs: "", lastSec: null, timer: null, follow: true, tail: 300 };
+
+async function openLogs(id, name) {
+  LOG.id = id; LOG.name = name; LOG.text = ""; LOG.lastTs = ""; LOG.lastSec = null; LOG.follow = true;
+  openModal(`${name} · 日志`, `
+    <div class="body" style="padding:0">
+      <div style="display:flex;gap:10px;align-items:center;padding:10px 16px;
+                  border-bottom:1px solid var(--line);flex-wrap:wrap">
+        <label class="checks" style="margin:0"><input type="checkbox" id="lg-follow" checked> 自动刷新</label>
+        <label class="checks" style="margin:0"><input type="checkbox" id="lg-auto" checked> 跟随底部</label>
+        <span class="sp" style="margin-left:auto;display:flex;gap:8px">
+          <button id="lg-clear">清屏</button>
+          <button id="lg-reload">重载</button>
+        </span>
+      </div>
+      <pre id="lg-body" style="max-height:62vh">加载中…</pre>
+    </div>`, { onClose: () => stopLogTimer() });
+  $("lg-body").parentElement.style.padding = "0";
+  $("lg-follow").onchange = (e) => { LOG.follow = e.target.checked; };
+  $("lg-clear").onclick = () => { LOG.text = ""; LOG.lastTs = ""; LOG.lastSec = null; $("lg-body").textContent = ""; };
+  $("lg-reload").onclick = () => { LOG.text = ""; LOG.lastTs = ""; LOG.lastSec = null; fetchLogs(true); };
+  await fetchLogs(true);
+  LOG.timer = setInterval(() => {
+    if (LOG.timer && $("lg-follow") && $("lg-follow").checked) fetchLogs(false);
+  }, 2000);
+}
+function stopLogTimer() {
+  if (LOG.timer) { clearInterval(LOG.timer); LOG.timer = null; }
+  LOG.id = null;
+}
+
+/** 从 Docker 的 RFC3339 纳秒时间戳里取出 unix 秒（去掉纳秒，JS 不认 9 位小数）。 */
+function tsToUnixSec(ts) {
+  // "2026-10-25T15:26:25.686842883Z" → "2026-10-25T15:26:25Z"
+  const sec = ts.slice(0, 19) + "Z";
+  const ms = Date.parse(sec);
+  return isNaN(ms) ? null : Math.floor(ms / 1000);
+}
+
+async function fetchLogs(initial) {
+  if (!LOG.id) return;
+  const q = new URLSearchParams({ tail: "300" });
+  // 后端只接受 unix 秒（Docker 对非法 since 会静默忽略 → 返回全量 → 日志重复累积）
+  if (!initial && LOG.lastSec !== null) q.set("since", String(LOG.lastSec));
+  const r = await api(`/api/docker/containers/${encodeURIComponent(LOG.id)}/logs?` + q);
+  const pre = $("lg-body");
+  if (!pre) return;
+  if (!r.ok) { if (initial) pre.textContent = "加载失败：" + errText(r); return; }
+
+  let chunk = r.data.text || "";
+  if (!chunk) {
+    if (initial && !LOG.text) pre.textContent = "（没有日志输出）";
+    return;
+  }
+  if (initial) {
+    LOG.text = chunk;
+  } else {
+    // 逐行去重：since 是「包含」语义，且同一秒内可能有多行，
+    // 所以只按时间戳字典序跳过「已经显示过的行」。RFC3339 在同一时区
+    // 同一精度下字典序等价于时间序。
+    const kept = chunk.split("\n").filter((line) => {
+      if (!line) return false;
+      const ts = line.slice(0, 30);
+      return !LOG.lastTs || ts > LOG.lastTs;
+    });
+    if (!kept.length) return;
+    chunk = (LOG.text.endsWith("\n") || !LOG.text ? "" : "\n") + kept.join("\n");
+    LOG.text += chunk;
+  }
+  const lines = LOG.text.split("\n").filter(Boolean);
+  if (lines.length) {
+    LOG.lastTs = lines[lines.length - 1].slice(0, 30);
+    LOG.lastSec = tsToUnixSec(LOG.lastTs);
+  }
+  pre.textContent = LOG.text;
+  if ($("lg-auto") && $("lg-auto").checked) pre.scrollTop = pre.scrollHeight;
+}
+
+/* ══════════════════════ 资源 ══════════════════════ */
+async function openStats(id, name) {
+  openModal(`${name} · 资源`, `<div class="body"><div class="empty">采样中…</div></div>`);
+  const r = await api(`/api/docker/containers/${encodeURIComponent(id)}/stats`);
+  if (!r.ok) { $("m-content").innerHTML = `<div class="body"><div class="empty">${h(errText(r))}</div></div>`; return; }
+  const s = r.data;
+  const cell = (label, val) => `<div><span>${label}</span><b>${val}</b></div>`;
+  $("m-content").innerHTML = `
+    <div class="stats">
+      ${cell("CPU", s.cpu_pct.toFixed(2) + "%")}
+      ${cell("内存", bytes(s.mem_used_bytes))}
+      ${cell("内存上限", s.mem_limit_bytes > 1e12 ? "不限" : bytes(s.mem_limit_bytes))}
+      ${cell("内存占比", s.mem_pct.toFixed(1) + "%")}
+      ${cell("网络 ↓", bytes(s.net_rx_bytes))}
+      ${cell("网络 ↑", bytes(s.net_tx_bytes))}
+      ${cell("块读", bytes(s.block_read_bytes))}
+      ${cell("块写", bytes(s.block_write_bytes))}
+      ${cell("进程数", s.pids)}
+    </div>
+    <div class="body" style="padding-top:0">
+      <p class="hint">单次采样。CPU 需要两次采样才能算出速率，刚启动的容器可能显示 0%。</p>
+      <button id="st-again">再采一次</button>
+    </div>`;
+  $("st-again").onclick = () => openStats(id, name);
+}
+
+/* ══════════════════════ 镜像 ══════════════════════ */
+/** 拉镜像慢/失败时，第一件要确认的是 daemon 有没有配加速器。 */
+function renderMirrorHint() {
+  const el = $("mirror-hint");
+  if (!el) return;
+  if (S.mirrors.length) {
+    el.innerHTML = `<div class="banner" style="border-color:#3fb95044;background:#3fb95012;color:#7ee787">
+      <span>⚡</span><div>镜像加速器：<code>${S.mirrors.map(h).join("</code> · <code>")}</code></div></div>`;
+  } else {
+    el.innerHTML = `<div class="banner"><span>ℹ️</span><div>
+      没有配置镜像加速器。如果拉镜像一直超时，多半是 <code>registry-1.docker.io</code> 连不上——
+      在 <code>/etc/docker/daemon.json</code> 里加 <code>registry-mirrors</code> 后
+      <code>systemctl restart docker</code>。</div></div>`;
+  }
+}
+
+async function loadImages() {
+  renderMirrorHint();
+  const tb = $("images");
+  const r = await api("/api/docker/images");
+  if (r.status === 503) { tb.innerHTML = `<tr><td colspan="5" class="empty">未安装 Docker</td></tr>`; return; }
+  if (!r.ok) { tb.innerHTML = `<tr><td colspan="5" class="empty">加载失败：${h(errText(r))}</td></tr>`; return; }
+  const list = r.data.images || [];
+  $("img-n").textContent = `${list.length} 个 · ${bytes(list.reduce((a, i) => a + i.size_bytes, 0))}`;
+  tb.innerHTML = list.length ? list.map((i) => `
+    <tr>
+      <td class="mono">${i.tags.length ? i.tags.map((t) => `<div>${h(t)}</div>`).join("") : '<span class="dim">&lt;none&gt;</span>'}</td>
+      <td class="mono dim">${h(i.id)}</td>
+      <td class="num">${bytes(i.size_bytes)}</td>
+      <td class="dim">${h(sinceDate(i.created))}</td>
+      <td class="num">${S.allowDelete && i.tags.length ? `<button class="danger" data-delimg="${h(i.tags[0])}">删除</button>` : ""}</td>
+    </tr>`).join("") : `<tr><td colspan="5" class="empty">没有镜像</td></tr>`;
+}
+
+$("images").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-delimg]");
+  if (!b) return;
+  const tag = b.dataset.delimg;
+  openModal(`删除镜像 ${tag}`, `<div class="body">
+    <div class="banner err" style="margin:0 0 14px"><span>⚠</span><div>
+      删除 <code>${h(tag)}</code>。如果还有容器在用这个镜像，它们会变成悬空状态
+      （已停止的容器将无法再次启动）。</div></div>
+    <button class="danger" id="do-delimg">确认删除</button>
+  </div>`, { narrow: true });
+  $("do-delimg").onclick = async () => {
+    const r = await api(`/api/docker/images/${encodeURIComponent(tag)}`, { method: "DELETE" });
+    closeModal();
+    if (!r.ok) toast("删除失败：" + errText(r));
+    else toast("已删除 " + tag, "ok");
+    loadImages();
+  };
+});
+
+$("btn-pull").onclick = () => {
+  if (!S.allowCreate) return toast("面板不允许拉取镜像（allow_create = false）", "err");
+  openModal("拉取镜像", `<div class="body form">
+    <label>镜像</label>
+    <input id="pull-input" placeholder="nginx:alpine" autocomplete="off" spellcheck="false">
+    <div class="hint">格式 <code>仓库/镜像:标签</code>，省略标签视为 latest。<br>
+      拉取会向 registry 请求最新版本，网络慢时可能要等一会儿（任务在后台跑，可以关掉这个窗口）。</div>
+    <div style="margin-top:14px"><button class="primary" id="pull-do">开始拉取</button></div>
+  </div>`, { narrow: true });
+  $("pull-input").focus();
+  $("pull-do").onclick = async () => {
+    const image = $("pull-input").value.trim();
+    if (!image) return toast("镜像不能为空");
+    const r = await postJSON("/api/docker/images/pull", { image });
+    if (!r.ok) return toast("拉取失败：" + errText(r));
+    closeModal();
+    toast("已开始拉取 " + image, "info");
+    loadJobs();
+    setTimeout(loadImages, 2000);
+  };
+  $("pull-input").onkeydown = (e) => { if (e.key === "Enter") $("pull-do").click(); };
+};
+
+/* ══════════════════════ 任务进度 ══════════════════════ */
+let jobsTimer = null;
+async function loadJobs() {
+  const r = await api("/api/docker/jobs");
+  const box = $("jobs-box");
+  if (!r.ok || !r.data.jobs) { box.innerHTML = ""; return; }
+  const jobs = r.data.jobs;
+  if (!jobs.length) { box.innerHTML = ""; if (jobsTimer) { clearTimeout(jobsTimer); jobsTimer = null; } return; }
+
+  box.innerHTML = `<div class="card" style="padding:0;margin-bottom:12px">` +
+    jobs.map((j) => {
+      const icon = j.state === "running" ? '<span class="spinner"></span>'
+        : j.state === "done" ? '<span style="color:var(--ok)">✓</span>'
+        : '<span style="color:var(--err)">✕</span>';
+      const label = j.kind === "pull" ? "拉取镜像" : j.kind;
+      return `<div class="job">${icon}<span>${h(label)}</span>
+        <span class="dim">${h(j.message || (j.state === "running" ? "进行中…" : ""))}</span>
+        <span class="sp">${(j.elapsed_ms / 1000).toFixed(1)}s</span></div>`;
+    }).join("") + `</div>`;
+
+  const running = jobs.some((j) => j.state === "running");
+  if (jobsTimer) { clearTimeout(jobsTimer); jobsTimer = null; }
+  if (running) {
+    jobsTimer = setTimeout(() => { loadJobs(); loadImages(); }, 1500);
+  } else {
+    loadImages();
+  }
+}
+
+/* ══════════════════════ 弹窗 ══════════════════════ */
+let onCloseHook = null;
+function openModal(title, contentHtml, opts = {}) {
+  closeModal(true);
+  $("m-title").textContent = title;
+  $("m-content").innerHTML = contentHtml;
+  $("modal-box").classList.toggle("narrow", !!opts.narrow);
+  $("modal").classList.add("on");
+  onCloseHook = opts.onClose || null;
+}
+function closeModal(silent) {
+  if (onCloseHook && !silent) { try { onCloseHook(); } catch (_) {} }
+  onCloseHook = null;
+  $("modal").classList.remove("on");
+  $("m-content").innerHTML = "";
+  stopLogTimer();
+}
+$("m-close").onclick = () => closeModal();
 $("modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
-$("btn-refresh-ctr").onclick = loadContainers;
+
+/* ══════════════════════ 事件绑定与启动 ══════════════════════ */
+$("btn-refresh-ctr").onclick = () => { loadContainers(); poll(); };
+$("btn-refresh-img").onclick = loadImages;
+$("ctr-filter").oninput = (e) => { S.filter = e.target.value; renderContainers(); };
 
 poll();
 loadContainers();
-setInterval(poll, 3000);          // 主机指标 3s —— 够灵敏又不至于压垮 /proc
-setInterval(loadContainers, 6000); // 容器状态 6s
+setInterval(poll, 3000);
+setInterval(() => { if (S.tab === "containers") loadContainers(); }, 6000);
 </script>
 </body>
 </html>

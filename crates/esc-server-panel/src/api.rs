@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use esc_panel_auth::{AccessControl, Denied};
 
-use crate::docker::{Docker, DockerError};
+use crate::docker::{CreateSpec, Docker, DockerError, Jobs};
 use crate::sys::{self, Sampler};
 use crate::web;
 
@@ -29,6 +29,12 @@ pub struct AppState {
     pub access: Arc<AccessControl>,
     /// 是否允许启停容器。关掉就是纯只读监控。
     pub allow_actions: bool,
+    /// 是否允许创建容器 / 拉镜像。
+    pub allow_create: bool,
+    /// 是否允许删除容器 / 镜像。这是不可撤销的操作，单独一道闸。
+    pub allow_delete: bool,
+    /// 后台任务（拉镜像等）。
+    pub jobs: Arc<Jobs>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -37,10 +43,10 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/overview", get(api_overview))
         .route("/api/host", get(api_host))
-        .route("/api/docker/containers", get(api_containers))
+        .route("/api/docker/containers", get(api_containers).post(api_create_container))
         .route(
             "/api/docker/containers/{id}",
-            get(api_container_detail),
+            get(api_container_detail).delete(api_remove_container),
         )
         .route(
             "/api/docker/containers/{id}/logs",
@@ -55,6 +61,23 @@ pub fn router(state: AppState) -> Router {
             post(api_container_action),
         )
         .route("/api/docker/images", get(api_images))
+        .route("/api/docker/images/pull", post(api_pull_image))
+        .route("/api/docker/images/{name}", axum::routing::delete(api_remove_image))
+        .route("/api/docker/networks", get(api_networks))
+        .route("/api/docker/jobs", get(api_jobs))
+        .route("/api/docker/jobs/{id}", get(api_job))
+        .route(
+            "/api/docker/containers/{id}/detail",
+            get(api_container_detail_full),
+        )
+        .route(
+            "/api/docker/containers/{id}/rename",
+            post(api_rename),
+        )
+        .route(
+            "/api/docker/containers/{id}/restart-policy",
+            post(api_set_restart),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -109,6 +132,8 @@ async fn api_overview(State(st): State<AppState>) -> Json<Value> {
         "interval_ms": snap.interval_ms,
         "docker": docker,
         "allow_actions": st.allow_actions,
+        "allow_create": st.allow_create,
+        "allow_delete": st.allow_delete,
         "in_container": sys::is_containerised(),
         "version": env!("CARGO_PKG_VERSION"),
         "sampling_error": sampling_error,
@@ -140,8 +165,11 @@ async fn api_container_detail(State(st): State<AppState>, Path(id): Path<String>
 #[derive(Debug, Deserialize)]
 struct LogQuery {
     tail: Option<u32>,
-    #[serde(default)]
-    timestamps: Option<bool>,
+    /// 只要这个时间点之后的行。**unix 秒**（可带小数）。
+    ///
+    /// 不用 RFC3339：Docker 29.8.x 对非法格式会静默忽略、退回「返回全部」，
+    /// 于是前端的增量刷新会越滚越长。这里强制数字格式，传错就 400。
+    since: Option<String>,
 }
 
 async fn api_container_logs(
@@ -151,7 +179,7 @@ async fn api_container_logs(
 ) -> Response {
     match st
         .docker
-        .logs(&id, q.tail.unwrap_or(200), q.timestamps.unwrap_or(true))
+        .logs_since(&id, q.tail.unwrap_or(200), q.since.as_deref())
         .await
     {
         Ok(text) => Json(json!({ "text": text })).into_response(),
@@ -194,6 +222,195 @@ async fn api_container_action(
     }
 }
 
+/// 创建容器。`?pull=1` 时先拉镜像（镜像不存在会自动拉）。
+///
+/// 创建是唯一会「留下东西」的操作，所以它有两段式风险：
+/// ① 镜像不存在 → 先拉；② 创建成功但启动失败 → 容器已经存在。
+/// 后者把 id 带进错误信息里，否则使用者会以为什么都没发生。
+async fn api_create_container(
+    State(st): State<AppState>,
+    Json(spec): Json<CreateSpec>,
+) -> Response {
+    if !st.allow_create {
+        return forbidden("面板配置为只读（allow_create = false）");
+    }
+    if let Err(m) = spec.validate() {
+        return bad_request(&m);
+    }
+    tracing::info!(image = %spec.image, name = ?spec.name, "面板请求创建容器");
+
+    let docker = st.docker.clone();
+    // 镜像不存在时先拉。放在同一个请求里是有意的：使用者点一次「创建」，
+    // 期望的就是「能用」——让他先手动拉镜像属于把内部细节泄漏给使用者。
+    let image = spec.image.clone();
+    if !docker.image_exists(&image).await {
+        tracing::info!(%image, "镜像不存在，先拉取");
+        if let Err(e) = docker.pull_image(&image).await {
+            return docker_error(e, "pull-before-create");
+        }
+    }
+    match docker.create_container(&spec).await {
+        Ok(id) => Json(json!({ "ok": true, "id": id })).into_response(),
+        Err(e) => docker_error(e, "create"),
+    }
+}
+
+async fn api_remove_container(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    if !st.allow_delete {
+        return forbidden("面板配置不允许删除（allow_delete = false）");
+    }
+    tracing::warn!(%id, "面板请求删除容器");
+    match st.docker.remove_container(&id, true).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "remove"),
+    }
+}
+
+async fn api_container_detail_full(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    match st.docker.detail(&id).await {
+        Ok(d) => Json(json!(d)).into_response(),
+        Err(e) => docker_error(e, "detail"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameBody {
+    name: String,
+}
+
+async fn api_rename(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Response {
+    if !st.allow_actions {
+        return forbidden("面板配置为只读（allow_actions = false）");
+    }
+    let name = body.name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return bad_request("容器名只允许字母数字与 . _ -");
+    }
+    tracing::info!(%id, %name, "面板请求改容器名");
+    match st.docker.rename(&id, name).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "rename"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RestartBody {
+    policy: String,
+}
+
+async fn api_set_restart(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RestartBody>,
+) -> Response {
+    if !st.allow_actions {
+        return forbidden("面板配置为只读（allow_actions = false）");
+    }
+    tracing::info!(%id, policy = %body.policy, "面板请求改重启策略");
+    match st.docker.set_restart_policy(&id, &body.policy).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "restart-policy"),
+    }
+}
+
+async fn api_networks(State(st): State<AppState>) -> Response {
+    match st.docker.networks().await {
+        Ok(list) => Json(json!({ "networks": list })).into_response(),
+        Err(e) => docker_error(e, "networks"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PullBody {
+    image: String,
+}
+
+/// 拉镜像：**立刻返回 job id**，真正的等待在后台。
+///
+/// 为什么不同步等：大镜像可能拉十分钟，浏览器/代理早就超时了，而使用者
+/// 看到的是「失败」——然后重试，于是两个拉取并行。给一个 job id 让前端
+/// 轮询进度，就不会有这种误解。
+async fn api_pull_image(State(st): State<AppState>, Json(body): Json<PullBody>) -> Response {
+    if !st.allow_create {
+        return forbidden("面板配置不允许拉取镜像（allow_create = false）");
+    }
+    let image = body.image.trim().to_string();
+    if image.is_empty() {
+        return bad_request("image 不能为空");
+    }
+    if !image
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | ':' | '-' | '_' | '@'))
+    {
+        return bad_request("image 含非法字符");
+    }
+
+    let id = st.jobs.start("pull");
+    let jobs = st.jobs.clone();
+    let docker = st.docker.clone();
+    let job_id = id.clone();
+    let for_task = image.clone();
+    tokio::spawn(async move {
+        let result = match docker.pull_image(&for_task).await {
+            Ok(m) => Ok(m),
+            Err(e) => Err(e.to_string()),
+        };
+        jobs.finish(&job_id, result);
+    });
+    tracing::info!(%image, job = %id, "开始拉取镜像");
+    Json(json!({ "ok": true, "job": id, "image": image })).into_response()
+}
+
+async fn api_remove_image(State(st): State<AppState>, Path(name): Path<String>) -> Response {
+    if !st.allow_delete {
+        return forbidden("面板配置不允许删除（allow_delete = false）");
+    }
+    tracing::warn!(%name, "面板请求删除镜像");
+    match st.docker.remove_image(&name, true).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "image-remove"),
+    }
+}
+
+async fn api_jobs(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({ "jobs": st.jobs.list() }))
+}
+
+async fn api_job(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    match st.jobs.get(&id) {
+        Some(j) => Json(json!(j)).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": "任务不存在或已过期" })),
+        )
+            .into_response(),
+    }
+}
+
+fn forbidden(msg: &str) -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
+}
+
+fn bad_request(msg: &str) -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Docker 状态摘要
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,6 +437,20 @@ async fn docker_summary(docker: &Docker) -> Value {
                 }
                 Err(_) => (0, 0, 0),
             };
+            // 加速器列表：拉镜像慢/失败时，第一件要确认的就是这个。
+            // 空列表 + 国内网络 = 基本拉不动，而 docker 的报错只会说
+            // "failed to do request ... i/o timeout"，完全指不到这里。
+            let mirrors: Vec<String> = v
+                .get("RegistryConfig")
+                .and_then(|r| r.get("Mirrors"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             json!({
                 "state": "ok",
                 "socket": docker.socket_path().display().to_string(),
@@ -230,6 +461,7 @@ async fn docker_summary(docker: &Docker) -> Value {
                 "containers_total": total,
                 "containers_running": running,
                 "containers_stopped": stopped,
+                "mirrors": mirrors,
                 "list_error": containers.err().map(|e| e.to_string()),
             })
         }
@@ -319,6 +551,9 @@ mod tests {
             title: "测试".into(),
             access: Arc::new(AccessControl::new(&AuthConfig::default())),
             allow_actions: readonly,
+            allow_create: !readonly,
+            allow_delete: !readonly,
+            jobs: Arc::new(Jobs::new()),
         }
     }
 
