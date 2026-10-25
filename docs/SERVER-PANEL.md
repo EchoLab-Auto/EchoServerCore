@@ -254,3 +254,83 @@ curl --unix-socket /var/run/docker.sock http://d/containers/json?all=1 | head -c
 | 权限 | 无特权（`User=esc`） | docker 组（能管容器） |
 | 挂了会怎样 | 隧道照常转发 | 与隧道无关 |
 | 共享 | 访问控制（`esc-panel-auth`）、前端风格 | 同左 |
+
+## 部署时踩到的两个坑（2026-10-25 实操）
+
+这两个都只有真部署才会遇到：本地测试是普通用户跑的，既没有 systemd 沙箱，
+也不涉及多个服务用户的目录权限。
+
+### 坑 A：`SupplementaryGroups=` 指向不存在的组 = 硬失败
+
+没装 Docker 的机器上没有 `docker` 组，而 unit 里写着
+`SupplementaryGroups=docker`。systemd 的反应是：
+
+```
+esc-server-panel.service: Failed to determine supplementary groups: No such process
+esc-server-panel.service: Failed at step GROUP spawning ...: No such process
+esc-server-panel.service: Main process exited, code=exited, status=216/GROUP
+```
+
+错误信息里**完全没有"组不存在"这个词**，`No such process` 看起来像进程问题。
+而且它会被 `Restart=on-failure` 变成无限重启（很快撞上
+`Start request repeated too quickly`）。
+
+`SupplementaryGroups=` 不支持 `-` 前缀（不能"忽略失败"），所以用 drop-in 清空：
+
+```ini
+# /etc/systemd/system/esc-server-panel.service.d/no-docker.conf
+[Service]
+SupplementaryGroups=
+```
+
+装了 Docker 之后删掉这个文件即可。**注意清空后要 `systemctl reset-failed`**，
+否则之前的失败状态和重启限流会挡住新的启动。
+
+### 坑 B：目录权限 `drwxr-x---` 会让服务用户读不了自己的配置
+
+`/etc/esc` 是 `drwxr-x--- root:esc`（隧道用户的地盘）。服务器面板以
+`esc-monitor` 运行，**不在 `esc` 组里**，于是连目录都进不去：
+
+```
+Error: 读取配置文件 /etc/esc/server-panel.toml 失败
+Caused by: Permission denied (os error 13)
+```
+
+配置文件本身是 `640 root:esc-monitor`（该用户可读），但目录没有 `x` 权限，
+路径解析就失败了。
+
+两种解法，权衡后选后者：
+
+| 方案 | 问题 |
+|---|---|
+| 把 `esc-monitor` 加入 `esc` 组 | 它会连 `hub.key`（隧道私钥）一起读到 |
+| 目录改 `751`（other 有 `x` 无 `r`） | 能按已知路径穿越，但列不出目录内容 |
+
+```bash
+chmod 751 /etc/esc
+```
+
+验证（用 `setpriv` 模拟目标用户，比 `sudo -u` 在受限环境里可靠）：
+
+```bash
+setpriv --reuid=esc-monitor --regid=esc-monitor --clear-groups \
+        cat /etc/esc/server-panel.toml >/dev/null && echo 可读
+setpriv --reuid=esc-monitor --regid=esc-monitor --clear-groups \
+        ls /etc/esc 2>/dev/null || echo "不能列目录（预期的）"
+setpriv --reuid=esc-monitor --regid=esc-monitor --clear-groups \
+        cat /etc/esc/hub.key 2>/dev/null || echo "读不到私钥（预期的）"
+setpriv --reuid=esc --regid=esc --clear-groups \
+        cat /etc/esc/engine.toml >/dev/null && echo "隧道用户不受影响"
+```
+
+### cloud2 上 `chmod 751 /etc/esc` 记一笔
+
+这是对既有配置目录权限的**放宽**（`other` 从 `---` 到 `--x`）。评估如下：
+
+- 能穿越目录，但不能列出内容 —— 需要**知道确切文件名**才能访问；
+- 各文件自己还有权限位：`hub.key` 是 `640 root:esc`，`esc-monitor` 读不到；
+- 公钥证书（`ca.pem` / `hub.pem`）是 `644`，本来全世界可读，不敏感；
+- 隧道用户 `esc` 属于 `esc` 组，权限不变（`drwxr-x--x` 中组仍是 `r-x`）。
+
+如果将来不想保留这个放宽，替代方案是把服务器面板的配置放到独立目录
+（如 `/etc/esc-monitor/`），并在 unit 里用 `--config` 指过去。
