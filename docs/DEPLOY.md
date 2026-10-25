@@ -227,7 +227,7 @@ listen = "127.0.0.1:8787"
 auth   = "admin:<口令>"
 ```
 
-### 3. 权限（这一步不做会 repeat 坑 #2）
+### 3. 权限（这一步不做会 repeat 坑 #2 与坑 #8）
 
 映射表要能写，而单元里 `ProtectSystem=strict`：
 
@@ -242,6 +242,31 @@ systemctl enable --now esc-host
 
 首次启动会把 `engine.toml` 里的 `[[service]]` 播种进 `mappings.toml`，
 日志里能看到 `seeded mapping store from static config`。
+
+#### 坑 #8：不要用 root「试跑一下」esc-host
+
+映射表用「临时文件 + `rename`」原子写，而 `rename` 会把文件属主重置成
+**写它的那个进程**。所以：
+
+```
+# 以 root 手动跑一次（哪怕只是想看看 --help 修好没）
+root# esc-host -c /etc/esc/host.toml
+root# ls -l /etc/esc/mappings.toml
+-rw------- 1 root root 268 ...        ← 属主变 root 了
+root# systemctl start esc-host
+     ↳ 无法读取映射表 ...: Permission denied (os error 13)   ← 服务起不来
+```
+
+2026-10-25 部署时就是这样踩了一次（那次靠自动回滚脚本救回了生产）。
+
+- **`--help` / `--version` 不会写文件**（0.1.1 起参数解析严格，未知参数直接报错，
+  不会再"用默认配置启动服务"）；
+- 真要用 root 验证配置，用 `esc check -c ...`（只读，不写映射表）；
+- 万一属主已经错了：`chown esc:esc /etc/esc/mappings.toml && chmod 600`，然后
+  `systemctl restart esc-host`。
+
+引擎现在对这类错误会附带属主/权限与修复命令，不再只给一句
+`Permission denied (os error 13)`。
 
 ### 4. 验证
 
@@ -277,4 +302,79 @@ ssh -L 8787:127.0.0.1:8787 root@114.132.241.46
 ```bash
 systemctl disable --now esc-host
 systemctl enable --now esc-hub      # 旧的静态配置仍在，逐字节兼容
+```
+
+## 2026-10-25 在 cloud-server-2 的实际部署记录
+
+按上文流程实做了一遍，记下真实过程与数据。
+
+### 构建（在 cloud2 上从源码构建，不传二进制）
+
+cloud2 无外网 SSH 入口，二进制没法 `scp`；而它自己有 cargo + GitHub 可达，
+所以直接在上面构建：
+
+```bash
+cd /opt/src/EchoServerCore
+git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main   # 见下方坑 #9
+git merge --ff-only FETCH_HEAD
+cargo build --release -j 2 --bin esc --bin esc-host --bin esc-plugin-panel
+```
+
+| 项 | 实测 |
+|---|---|
+| 冷构建（含拉 60+ 新依赖） | 2m36s（2 vCPU / 2 GB，`-j 2`） |
+| 增量构建（只改 esc-host） | 30s |
+| 峰值内存 | ~400 MB（LTO 链接期），2 GB 机器安全 |
+
+#### 坑 #9：gh-proxy 的 url 重写会给出**过期**的 main
+
+cloud2 的 `/root/.gitconfig` 里有：
+
+```
+url.https://gh-proxy.com/https://github.com/.insteadof https://github.com/
+```
+
+它让 `git fetch https://github.com/...` 走国内镜像，但镜像的 main **滞后**——
+`git fetch` 报 `Already up to date`，实际远端已有新提交。绕过办法是让
+`insteadof` 匹配不上（加显式端口即可）：
+
+```bash
+git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main
+```
+
+（`https://github.com:443/` 不匹配 `https://github.com/` 前缀，于是直连 GitHub。
+cloud2 到 github.com 本身是通的，只是慢一点。）
+
+### 切换（带自动回滚）
+
+停 `esc-hub`、起 `esc-host`，若 20s 内 `esc-host` 没 active 或 4433 没监听就
+自动回滚：
+
+```bash
+systemctl disable --now esc-hub
+systemctl enable  --now esc-host
+# 失败则：systemctl disable --now esc-host && systemctl enable --now esc-hub
+```
+
+第一次切换**真的触发了回滚**（映射表被 root 写坏，见坑 #8），生产在约 20s 内
+自动恢复。修好属主后第二次切换成功。
+
+### 结果
+
+| 检查项 | 结果 |
+|---|---|
+| `esc check -c /etc/esc/engine.toml --role hub` | ✅ 旧 hub.toml 兼容（`role`/`store` 被忽略） |
+| `systemctl is-active esc-host` | ✅ active，`enabled` |
+| 监听 | `0.0.0.0:4433`（控制）、`0.0.0.0:2222`（映射）、`127.0.0.1:8787`（面板） |
+| 常驻内存 | esc-host ~10 MB + esc-plugin-panel ~9 MB |
+| 面板认证 | 无口令 401，带口令 200 |
+| 映射表播种 | ✅ 从 `[[service]]` 播成 `[[mapping]]`，属主已修正为 `esc:esc 600` |
+| 运行时增删映射 | ✅ 通过面板 API 增、停、删，端口即时绑定/释放 |
+| 端到端 | ✅ 公网 2222 → spoke → 本机 8080（EchoAgent Panel）保持可用 |
+
+回滚方式（随时可用）：
+
+```bash
+systemctl disable --now esc-host
+systemctl enable  --now esc-hub      # 旧 unit 与 /etc/esc/hub.toml 都还在
 ```

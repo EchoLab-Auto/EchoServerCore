@@ -33,8 +33,7 @@ impl MappingStore {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, ControlError> {
         let path = path.into();
         let mappings = if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .map_err(|e| ControlError::other(format!("无法读取映射表 {}: {e}", path.display())))?;
+            let raw = read_store(&path)?;
             let file: StoreFile = toml::from_str(&raw)
                 .map_err(|e| ControlError::invalid(format!("无法解析映射表 {}: {e}", path.display())))?;
             file.mapping
@@ -139,7 +138,7 @@ impl MappingStore {
         };
 
         self.persist_locked(&guard)
-            .map_err(|e| ControlError::other(format!("保存映射表失败: {e}")))?;
+            .map_err(|e| save_error(&e))?;
         Ok(updated)
     }
 
@@ -151,7 +150,7 @@ impl MappingStore {
             .ok_or_else(|| ControlError::not_found(format!("映射 id={id} 不存在")))?;
         let removed = guard.remove(idx);
         self.persist_locked(&guard)
-            .map_err(|e| ControlError::other(format!("保存映射表失败: {e}")))?;
+            .map_err(|e| save_error(&e))?;
         Ok(removed)
     }
 
@@ -164,7 +163,7 @@ impl MappingStore {
         slot.enabled = enabled;
         let out = slot.clone();
         self.persist_locked(&guard)
-            .map_err(|e| ControlError::other(format!("保存映射表失败: {e}")))?;
+            .map_err(|e| save_error(&e))?;
         Ok(out)
     }
 
@@ -173,7 +172,7 @@ impl MappingStore {
         let mut guard = self.inner.write().await;
         *guard = mappings;
         self.persist_locked(&guard)
-            .map_err(|e| ControlError::other(format!("保存映射表失败: {e}")))?;
+            .map_err(|e| save_error(&e))?;
         Ok(guard.clone())
     }
 
@@ -185,8 +184,7 @@ impl MappingStore {
         if !path.exists() {
             return Ok(self.list().await);
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ControlError::other(format!("无法读取映射表 {}: {e}", path.display())))?;
+        let raw = read_store(path)?;
         let file: StoreFile = toml::from_str(&raw)
             .map_err(|e| ControlError::invalid(format!("无法解析映射表 {}: {e}", path.display())))?;
         let mut guard = self.inner.write().await;
@@ -223,6 +221,61 @@ impl MappingStore {
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+}
+
+/// 读映射表，并在权限类错误上补一条能直接定位原因的建议。
+///
+/// 为什么值得特殊处理：这个文件用「临时文件 + rename」原子写，而 `rename`
+/// 会把属主重置成**写入它的那个进程**。于是「先用 root 跑一次，再用服务用户
+/// 跑」就会得到一个 root:root 0600 的文件，之后服务永远起不来，报的还是一句
+/// 没有上下文的 `Permission denied (os error 13)`。部署时这个坑踩过一次
+/// （见 docs/DEPLOY.md），所以把它变成可读的错误信息。
+fn read_store(path: &Path) -> Result<String, ControlError> {
+    std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            ControlError::other(format!(
+                "无法读取映射表 {}: {e}{}",
+                path.display(),
+                owner_hint(path)
+            ))
+        } else {
+            ControlError::other(format!("无法读取映射表 {}: {e}", path.display()))
+        }
+    })
+}
+
+/// 权限不足时附上「现在是什么属主/权限」，以及该怎么做。
+fn owner_hint(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return format!(
+                "（文件属主 uid={} gid={} 权限 {:o}）。映射表必须能被**运行服务的用户**读写；\
+                 若之前用 root 跑过，rename 会把属主改回 root，请执行 \
+                 `chown <服务用户>:<组> {} && chmod 600 {}`",
+                meta.uid(),
+                meta.gid(),
+                meta.mode() & 0o777,
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    let _ = path;
+    String::new()
+}
+
+/// 写映射表失败时的错误（权限问题同样补上下文）。
+fn save_error(e: &std::io::Error) -> ControlError {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        ControlError::other(format!(
+            "保存映射表失败: {e}（目录必须是运行服务用户可写的；\
+             见 docs/DEPLOY.md 的权限小节）"
+        ))
+    } else {
+        ControlError::other(format!("保存映射表失败: {e}"))
     }
 }
 
@@ -283,6 +336,41 @@ mod tests {
         assert_eq!(store.list().await.len(), 2);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[mapping]]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    /// 权限不足时的错误信息必须包含「属主/权限」与可执行的修复命令，
+    /// 而不是只有一句 `Permission denied`。
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_error_is_actionable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("esc-store-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mappings.toml");
+        std::fs::write(&path, "[[mapping]]\nname = \"x\"\n").unwrap();
+        // 去掉所有读权限，制造 EACCES（若当前进程是 root 则读仍会成功，跳过断言）
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = MappingStore::load(&path);
+        match result {
+            Err(e) => {
+                assert!(e.message.contains("属主"), "应附上属主信息：{}", e.message);
+                assert!(e.message.contains("chown"), "应给出修复命令：{}", e.message);
+            }
+            Ok(_) => {
+                // root 不受权限位限制——此时清理即可，不算失败。
+                eprintln!("以 root 运行，权限位不生效，跳过断言");
+            }
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
