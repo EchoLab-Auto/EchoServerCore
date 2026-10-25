@@ -427,7 +427,16 @@ async fn docker_summary(docker: &Docker) -> Value {
             "message": "未检测到 Docker socket（这台机器可能没装 Docker）",
         });
     }
-    match docker.probe().await {
+    // 探活 + 取字段：`/info` 与 `/version` 的字段**不重叠**，两个都要。
+    //
+    //   /version → Version, ApiVersion, Os, Arch     （没有 RegistryConfig）
+    //   /info    → ServerVersion, OperatingSystem, Architecture,
+    //              RegistryConfig.Mirrors            （没有 ApiVersion）
+    //
+    // 早先只用 `/version` 探活，于是 mirrors 永远是空列表 —— 而「拉不动镜像」
+    // 时第一个要看的就是它。现在主调用用 `/info`（带 mirrors），
+    // ApiVersion 再单独问一次；后者失败无关紧要，不影响"可用"判定。
+    match docker.info().await {
         Ok(v) => {
             let containers = docker.containers().await;
             let (total, running, stopped) = match &containers {
@@ -437,9 +446,6 @@ async fn docker_summary(docker: &Docker) -> Value {
                 }
                 Err(_) => (0, 0, 0),
             };
-            // 加速器列表：拉镜像慢/失败时，第一件要确认的就是这个。
-            // 空列表 + 国内网络 = 基本拉不动，而 docker 的报错只会说
-            // "failed to do request ... i/o timeout"，完全指不到这里。
             let mirrors: Vec<String> = v
                 .get("RegistryConfig")
                 .and_then(|r| r.get("Mirrors"))
@@ -451,13 +457,23 @@ async fn docker_summary(docker: &Docker) -> Value {
                         .collect()
                 })
                 .unwrap_or_default();
+            let api_version = docker
+                .probe()
+                .await
+                .ok()
+                .and_then(|ver| {
+                    ver.get("ApiVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
             json!({
                 "state": "ok",
                 "socket": docker.socket_path().display().to_string(),
-                "version": v.get("Version").and_then(Value::as_str).unwrap_or(""),
-                "api_version": v.get("ApiVersion").and_then(Value::as_str).unwrap_or(""),
-                "os": v.get("Os").and_then(Value::as_str).unwrap_or(""),
-                "arch": v.get("Arch").and_then(Value::as_str).unwrap_or(""),
+                "version": v.get("ServerVersion").and_then(Value::as_str).unwrap_or(""),
+                "api_version": api_version,
+                "os": v.get("OperatingSystem").and_then(Value::as_str).unwrap_or(""),
+                "arch": v.get("Architecture").and_then(Value::as_str).unwrap_or(""),
                 "containers_total": total,
                 "containers_running": running,
                 "containers_stopped": stopped,

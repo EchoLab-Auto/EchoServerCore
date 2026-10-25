@@ -100,6 +100,9 @@ impl Docker {
     }
 
     /// 探活 + 取版本。失败即视为「不可用」。
+    ///
+    /// 注意：`/version` 的响应里**没有** `RegistryConfig`。要拿镜像加速器
+    /// 列表得用 `info()`——`/info` 里既有版本也有 `RegistryConfig.Mirrors`。
     pub async fn probe(&self) -> Result<Value, DockerError> {
         self.get_json("/version").await
     }
