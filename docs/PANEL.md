@@ -15,7 +15,7 @@
 # 1) 引擎配置（旧 hub.toml 就能用，另加一个 store 指向映射表）
 cat > /etc/esc/engine.toml <<'EOF'
 role  = "hub"
-store = "/etc/esc/mappings.toml"
+store = "/var/lib/esc/mappings.toml"
 
 [hub]
 listen = "0.0.0.0:4433"
@@ -54,8 +54,25 @@ esc-host -c /etc/esc/host.toml
 想从别的机器访问，推荐用 SSH 端口转发而不是直接暴露：
 
 ```bash
-ssh -L 8787:127.0.0.1:8787 root@<公网服务器>
-# 然后本机浏览器开 http://127.0.0.1:8787/
+ssh -N -f -L 18787:127.0.0.1:8787 root@<公网服务器>
+# 然后本机浏览器开 http://127.0.0.1:18787/
+```
+
+`-N` 只做转发不开 shell，`-f` 放后台。本地端口**不一定用 8787**——很多人
+本机 8787 上已经跑着别的东西（部署这套时就是撞上了 EchoAgent XR），
+真实情况是端口冲突后 `ssh` 只在 stderr 里吐一句
+`bind [127.0.0.1]:8787: Address already in use`，而 `-f` 已经返回 0，
+看起来像成功了、实际访问到的是别的服务。所以：**先 `ss -tln | grep 18787`
+确认本地端口空闲**，或者干脆选个不常用的高位端口。
+
+把转发写进 `~/.ssh/config` 更省事，以后只敲 `ssh -N -f cloud2`：
+
+```
+Host cloud2
+  HostName <公网IP>
+  User root
+  LocalForward 18787 127.0.0.1:8787
+  ServerAliveInterval 30
 ```
 
 ## 界面能做什么
