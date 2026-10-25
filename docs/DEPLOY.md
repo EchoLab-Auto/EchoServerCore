@@ -229,16 +229,35 @@ auth   = "admin:<口令>"
 
 ### 3. 权限（这一步不做会 repeat 坑 #2 与坑 #8）
 
-映射表要能写，而单元里 `ProtectSystem=strict`：
+映射表是**运行时状态**，放在 `/var/lib/esc/mappings.toml`（FHS 惯例），
+由 unit 里的 `StateDirectory=esc` 自动创建目录并赋予 `User=esc` 的属主——
+`StateDirectory=` 隐含一条 `ReadWritePaths`，所以 `ProtectSystem=strict` 下
+这个目录仍然可写。`/etc/esc` 保持整体只读（配置与证书不该被写）。
 
 ```bash
-touch /etc/esc/mappings.toml
-chown esc:esc /etc/esc/mappings.toml
-chmod 600 /etc/esc/mappings.toml
-# 单元里已声明 ReadWritePaths=/etc/esc/mappings.toml，其余 /etc/esc 仍只读
+# engine.toml 里：store = "/var/lib/esc/mappings.toml"
 systemctl disable --now esc-hub      # 先停掉旧的静态 hub
-systemctl enable --now esc-host
+systemctl enable --now esc-host      # StateDirectory 会自动建 /var/lib/esc
 ```
+
+#### 坑 #10：`ReadWritePaths=<单文件>` 不够，原子写要的是**目录**可写
+
+第一次部署时映射表放在 `/etc/esc/mappings.toml`，单元里写
+`ReadWritePaths=-/etc/esc/mappings.toml`。结果是：**服务起得来、隧道正常、
+面板能读，但一增删映射就 502**：
+
+```json
+{"error":"保存映射表失败: Read-only file system (os error 30)"}
+```
+
+原因是原子写的实现是「同目录建临时文件 → rename」（跨文件系统 rename 会
+EXDEV，所以临时文件必须同目录）。只放开一个文件的可写权限，目录仍然是
+`ProtectSystem=strict` 下的只读挂载，`File::create("mappings.tmp")` 直接 EROFS。
+
+教训：**状态与配置要分开挂**。配置/证书 `/etc/esc` 只读，状态 `/var/lib/esc`
+可写；不要为了省事把状态塞进配置目录再逐文件放开权限。
+
+现在引擎对这两类错误（EACCES / EROFS）都会附上成因与修法，不再只给 `os error 30`。
 
 首次启动会把 `engine.toml` 里的 `[[service]]` 播种进 `mappings.toml`，
 日志里能看到 `seeded mapping store from static config`。

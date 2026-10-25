@@ -31,10 +31,17 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# 证书与配置只读
+# 证书与配置只读：/etc/esc 下不应有任何运行时写入
 ReadOnlyPaths=/etc/esc
-# 但映射表要能写（面板增删映射时持久化）
-ReadWritePaths=-/etc/esc/mappings.toml
+
+# 映射表是**运行时状态**，放 /var/lib/esc（FHS 惯例），由 StateDirectory 自动
+# 创建、赋予 User= 的属主，并隐含一条 ReadWritePaths —— 于是 ProtectSystem=strict
+# 下这个目录仍然可写。
+#
+# 为什么不用 `ReadWritePaths=/etc/esc/mappings.toml`：原子写要**在同目录建临时
+# 文件**再 rename，只放开单个文件不够，目录也必须可写。而把配置目录放开写权限
+# 又违背 "配置只读、状态可写" 的分界。详见 docs/DEPLOY.md。
+StateDirectory=esc
 # 面板是宿主拉起的子进程，插件二进制必须可执行
 # （放在 /usr/local/libexec/esc/ 下，属于系统路径，ProtectSystem=strict 下只读可执行）
 

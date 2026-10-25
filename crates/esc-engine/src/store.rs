@@ -137,8 +137,7 @@ impl MappingStore {
             }
         };
 
-        self.persist_locked(&guard)
-            .map_err(|e| save_error(&e))?;
+        self.persist_locked(&guard)?;
         Ok(updated)
     }
 
@@ -149,8 +148,7 @@ impl MappingStore {
             .position(|m| m.id == id)
             .ok_or_else(|| ControlError::not_found(format!("映射 id={id} 不存在")))?;
         let removed = guard.remove(idx);
-        self.persist_locked(&guard)
-            .map_err(|e| save_error(&e))?;
+        self.persist_locked(&guard)?;
         Ok(removed)
     }
 
@@ -162,8 +160,7 @@ impl MappingStore {
             .ok_or_else(|| ControlError::not_found(format!("映射 id={id} 不存在")))?;
         slot.enabled = enabled;
         let out = slot.clone();
-        self.persist_locked(&guard)
-            .map_err(|e| save_error(&e))?;
+        self.persist_locked(&guard)?;
         Ok(out)
     }
 
@@ -171,8 +168,7 @@ impl MappingStore {
     pub async fn replace_all(&self, mappings: Vec<Mapping>) -> Result<Vec<Mapping>, ControlError> {
         let mut guard = self.inner.write().await;
         *guard = mappings;
-        self.persist_locked(&guard)
-            .map_err(|e| save_error(&e))?;
+        self.persist_locked(&guard)?;
         Ok(guard.clone())
     }
 
@@ -193,12 +189,11 @@ impl MappingStore {
     }
 
     /// 调用方已持有写锁。
-    fn persist_locked(&self, mappings: &[Mapping]) -> std::io::Result<()> {
+    fn persist_locked(&self, mappings: &[Mapping]) -> Result<(), ControlError> {
         let Some(path) = &self.path else { return Ok(()) };
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+        if let Some(dir) = dir {
+            std::fs::create_dir_all(dir).map_err(|e| write_failed(path, e))?;
         }
         let body = toml::to_string_pretty(&StoreFile { mapping: mappings.to_vec() })
             .unwrap_or_default();
@@ -206,20 +201,23 @@ impl MappingStore {
             "# esc 映射表 —— 面板编辑的就是这个文件。\n\
              # 手工改完在面板点「重新加载」即可生效，不需要重启。\n\n{body}"
         );
+        // 临时文件必须与目标同目录：跨文件系统的 rename 会失败（EXDEV）。
+        // 代价是这个**目录**必须可写——systemd 沙箱下这就是
+        // `ReadWritePaths=` / `StateDirectory=` 要覆盖的位置，见 write_failed。
         let tmp = path.with_extension("tmp");
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| write_failed(&tmp, e))?;
             // 映射表可能含内网地址，按 0600 保存。
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
             }
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
+            f.write_all(text.as_bytes()).map_err(|e| write_failed(&tmp, e))?;
+            f.sync_all().map_err(|e| write_failed(&tmp, e))?;
         }
-        std::fs::rename(&tmp, path)?;
+        std::fs::rename(&tmp, path).map_err(|e| write_failed(path, e))?;
         Ok(())
     }
 }
@@ -267,15 +265,30 @@ fn owner_hint(path: &Path) -> String {
     String::new()
 }
 
-/// 写映射表失败时的错误（权限问题同样补上下文）。
-fn save_error(e: &std::io::Error) -> ControlError {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        ControlError::other(format!(
-            "保存映射表失败: {e}（目录必须是运行服务用户可写的；\
-             见 docs/DEPLOY.md 的权限小节）"
-        ))
-    } else {
-        ControlError::other(format!("保存映射表失败: {e}"))
+/// 写映射表失败时的错误。
+///
+/// 这两类错误在生产上几乎只有一种成因，而裸的 `os error 30/13` 完全看不出
+/// 来龙去脉，所以在这里就地翻译：
+///
+/// * `EROFS` —— 目录被 systemd 沙箱设成只读（`ProtectSystem=strict`）；
+/// * `EACCES` —— 属主/权限不对（常见于曾用 root 跑过，见 DEPLOY.md 坑 #8）。
+fn write_failed(path: &Path, e: std::io::Error) -> ControlError {
+    let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => ControlError::other(format!(
+            "保存映射表失败（{}）: {e}{}。目录必须属于运行服务的用户；\
+             若之前用 root 跑过，rename 会把属主改回 root",
+            path.display(),
+            owner_hint(path)
+        )),
+        std::io::ErrorKind::ReadOnlyFilesystem => ControlError::other(format!(
+            "保存映射表失败（{}）: 目录 {dir} 是只读的。\
+             映射表要放在运行时可写的位置（本仓推荐 /var/lib/esc/mappings.toml），\
+             并在 systemd 单元里用 StateDirectory= 或 ReadWritePaths= 覆盖该目录——\
+             注意 `ReadWritePaths=<单个文件>` 不够：原子写需要在同目录建临时文件",
+            path.display()
+        )),
+        other => ControlError::other(format!("保存映射表失败（{}）: {other}", path.display())),
     }
 }
 

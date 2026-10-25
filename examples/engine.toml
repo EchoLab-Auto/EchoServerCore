@@ -4,11 +4,16 @@
 #   role  —— 显式声明角色（两个段落都写时必须给）
 #   store —— 映射表路径（默认是本文件同目录下的 mappings.toml）
 #
+# 注意 store 指向的位置必须**运行时可写**：它用「临时文件 + rename」原子写，
+# 所以是**目录**要可写，不是单个文件。生产上建议 /var/lib/esc/mappings.toml +
+# systemd 的 StateDirectory=esc（单元里已这样配）；放在 /etc 下会撞上
+# ProtectSystem=strict 的只读挂载。
+#
 # 首次启动会用下面的 [[service]] 播种映射表；之后映射表就是唯一事实来源，
 # 面板（或手工编辑 + 重新加载）改的是它，本文件里的 [[service]] 不再参与。
 
 role  = "hub"
-store = "/etc/esc/mappings.toml"
+store = "/var/lib/esc/mappings.toml"
 
 [hub]
 listen = "0.0.0.0:4433"

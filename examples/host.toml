@@ -5,8 +5,10 @@
 [engine]
 # 引擎配置的路径（也可以把 [engine] 段直接写成引擎配置的内联形式）
 config = "/etc/esc/engine.toml"
-# 可选：覆盖映射表位置（默认取引擎配置同目录下的 mappings.toml）
-# store = "/etc/esc/mappings.toml"
+# 可选：覆盖映射表位置（默认取引擎配置同目录下的 mappings.toml）。
+# 这个位置必须在运行时**可写**（原子写要在同目录建临时文件），
+# 生产上配合 systemd 的 StateDirectory=esc 用 /var/lib/esc/mappings.toml。
+# store = "/var/lib/esc/mappings.toml"
 
 [panel]
 # false = 纯隧道模式，没有任何管理面
