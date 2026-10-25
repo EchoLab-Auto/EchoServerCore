@@ -44,11 +44,19 @@ Error: cannot read /etc/esc/hub.toml: Permission denied (os error 13)
 
 修复：`chown root:esc` + `chmod 640`。同理私钥用 `640 root:esc`。
 
-### 3. 云厂商无 hairpin NAT
+### 3. 曾被误判为"云厂商无 hairpin NAT"（实为安全组）
 
-在 Hub 本机连接它自己的公网 IP `114.132.241.46:4433` 会失败 —— 腾讯云不做
-NAT 回环。本机自测必须走内网 IP `10.1.0.8:4433`，因此 **hub 证书的 SAN
-需要同时包含公网 IP 和内网 IP**：
+一开始在 Hub 本机连接它自己的公网 IP `114.132.241.46:4433` 失败，我判断成
+"腾讯云不做 NAT 回环"。**这个结论是错的** —— 安全组放行 4433 / 2222 之后，
+从 Hub 本机访问 `114.132.241.46:2222` 立刻返回 `HTTP 200`，回环一直是通的。
+当时的失败纯粹是安全组把 SYN 丢了，表现出来和"没有回环"一模一样。
+
+教训：**在云上，"连不上自己的公网 IP" 有两种可能（安全组 / 无回环），
+不能只凭现象断言。** 区分方法：从外部探针（check-host.net）测同一个端口，
+若外部也不通 → 安全组；若外部通而本机不通 → 才是回环问题。
+
+不过下面这条仍然值得保留，因为 hub 证书的 SAN 同时写公网和内网 IP
+才让两种访问方式都能通过校验：
 
 ```bash
 esc pki sign --ca-dir ... --kind server \
@@ -129,3 +137,36 @@ systemctl restart esc-hub          # 或 systemctl --user restart esc-spoke
 ```
 
 Hub 重启期间 Spoke 会自动退避重连（实测 0.40 s 恢复，见 `TESTING.md`）。
+
+## 生产实例（第一组映射）
+
+```
+公网 114.132.241.46:2222  ──►  Hub(cloud-server-2)  ──mTLS+yamux──►
+     Spoke(evence-4090-24)  ──►  127.0.0.1:8080  (EchoAgent Panel)
+```
+
+Hub 侧配置（`/etc/esc/hub.toml`）：
+
+```toml
+[[service]]
+name   = "4090-8080"
+listen = "0.0.0.0:2222"
+spoke  = "evence-4090"     # 固定到指定 spoke，别的机器无法顶替这个服务
+```
+
+Spoke 侧（4090，`~/.config/esc/spoke.toml`）：用户级 systemd 单元
+`esc-spoke.service` + `loginctl enable-linger`，不依赖 root。
+
+安装步骤（在 4090 上）：
+
+```bash
+# 1) 从已有节点经 overlay 拷二进制（避免重复编译）
+scp 10.10.10.250:~/.local/bin/esc ~/.local/bin/esc    # 双向校验 sha256
+# 2) 生成私钥 + CSR，把 CSR 拿到持 CA 的机器上签
+~/.local/bin/esc pki keygen --out ~/esc --id evence-4090
+# 3) 签好的 .pem 拷回 ~/esc/，连同 ca.pem
+# 4) 写配置与 unit
+~/.local/bin/esc check -c ~/.config/esc/spoke.toml --role spoke
+systemctl --user enable --now esc-spoke
+loginctl enable-linger "$USER"
+```
