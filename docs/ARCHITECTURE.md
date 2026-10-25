@@ -15,7 +15,7 @@
      │  HTTP        │  Ctx（服务定位器）                                               │
      ▼              │   └─ ServiceKey<Arc<dyn TunnelControl>>  "esc.tunnel.control"    │
 ┌─────────────────┐ │        ▲                           ▲                            │
-│ esc-plugin-panel│ │        │ provide（mount 时）        │ require                     │
+│ esc-plugin-tunnel-panel│ │        │ provide（mount 时）        │ require                     │
 │  （子进程插件）  │ │  ┌─────┴───────────┐        ┌──────┴────────────┐               │
 │  axum + 单页前端 │ │  │ 进程内插件       │        │ 宿主服务          │               │
 │                 │ │  │ esc.tunnel      │        │ esc.control       │               │
@@ -33,7 +33,7 @@
 
 | 层 | 认识什么 | 不认识什么 |
 |---|---|---|
-| `esc-plugin-panel`（子进程） | `esc-control-api` 的方法名与 JSON 形状、HTTP | 隧道、TLS、yamux、`esc-engine`、宿主 |
+| `esc-plugin-tunnel-panel`（子进程） | `esc-control-api` 的方法名与 JSON 形状、HTTP | 隧道、TLS、yamux、`esc-engine`、宿主 |
 | `esc-host`（宿主） | 插件框架、`Ctx`、`esc-control-api` 的请求信封 | HTTP、隧道实现、yamux |
 | `esc-plugin-tunnel`（进程内） | `esc-engine`、`esc-control-api` | HTTP、宿主、插件框架之外的东西 |
 
@@ -53,12 +53,34 @@ crates/
       pipe.rs        带计数的双向搬运（替代 copy_bidirectional）
   esc-control-api/   ★ 新增：控制面契约（DTO + 方法名 + 信封 + trait）
   esc-plugin-tunnel/ ★ 新增：进程内插件，把引擎注册进 Ctx
-  esc-plugin-panel/  ★ 新增：子进程插件，HTTP + 单页前端
+  esc-panel-auth/    ★ 新增：两个面板共用的访问控制（Basic + 白名单 + 限速）
+  esc-plugin-tunnel-panel/
+                     ★ 新增：子进程插件，端口映射面板（HTTP + 单页前端，:2223）
+  esc-server-panel/  ★ 新增：独立进程，主机指标 + Docker 管理面板（:2224）
   esc-host/          ★ 新增：组合根（宿主二进制 + 可复用 lib）
   esc-hub/           保留：`esc hub` 的薄封装（行为不变）
   esc-spoke/         保留：`esc spoke` 的薄封装（行为不变）
   esc-cli/           保留：`esc` 二进制（hub / spoke / check / pki）
 ```
+
+依赖方向（只能向下）：
+
+```
+esc-cli ──▶ esc-hub / esc-spoke ──▶ esc-engine ──▶ esc-common
+                                              └──▶ esc-control-api
+
+esc-host ──▶ esc-plugin-tunnel ──▶ esc-engine
+        └──▶ esc-control-api
+
+esc-plugin-tunnel-panel ──▶ esc-control-api      ← 没有 esc-engine（物理隔离）
+                        └──▶ esc-panel-auth
+
+esc-server-panel ──▶ esc-panel-auth              ← 只依赖这一个
+```
+
+最后两行是架构约束，不是「暂时没用到」：面板物理上无法调用引擎内部函数，
+只能走 `HostCall("esc.control", …)`；服务器面板与隧道生态完全无关。
+`docs/SERVER-PANEL.md` 里解释了为什么后者要独立成进程（`docker.sock` ≈ root）。
 
 ## 三个关键决策
 
@@ -80,8 +102,8 @@ crates/
 `esc-engine`、没有 `rustls`、没有 `yamux`：
 
 ```bash
-$ cargo tree -p esc-plugin-panel --depth 1
-esc-plugin-panel
+$ cargo tree -p esc-plugin-tunnel-panel --depth 1
+esc-plugin-tunnel-panel
 ├── axum
 ├── echo-plugin-sdk      # 插件侧运行时
 ├── esc-control-api      # ← 唯一的领域依赖：只有 serde 结构体和方法名
@@ -136,7 +158,7 @@ esc-plugin-panel
 
 `abort` 下连健康任务的输出都没来得及打印——这就是「一个坏连接带走全部隧道」。
 代价是三个二进制各大约 +13~15%（`esc` 3.10 MB → 3.51 MB，`esc-host` 3.08 MB →
-3.55 MB，`esc-plugin-panel` 1.52 MB → 1.74 MB），对一台服务器上的常驻进程来说
+3.55 MB，`esc-plugin-tunnel-panel` 1.52 MB → 1.74 MB），对一台服务器上的常驻进程来说
 可以忽略。
 
 配套地，数据面上的 `expect()` 也都改成了优雅降级（状态查询路径宁可返回一条
@@ -169,6 +191,43 @@ spoke   = "evence-4090"      # 可选：钉住 provider
 一条记录就能在面板上显示「公网 2222 → 内网 8080」这条完整链路，也能据此导出
 任意一侧的静态配置。角色决定哪几个字段生效：hub 只读 `listen`/`spoke`，
 spoke 只读 `local`。
+
+## 名字的三套写法
+
+同一个东西在三个层面有三个名字，改代码前先看清楚在改哪一层。这套对应关系是
+刻意维持的：**`esc-plugin-X` ↔ `esc.X`**。
+
+| Cargo crate / 目录 | 框架 manifest id | 二进制 | 形态 |
+|---|---|---|---|
+| `esc-plugin-tunnel` | `esc.tunnel` | （无，进程内） | `esc-host` 的进程内插件 |
+| `esc-plugin-tunnel-panel` | `esc.tunnel-panel` | `esc-plugin-tunnel-panel` | `esc-host` 的子进程插件 |
+| —（不是插件） | — | `esc-server-panel` | 独立 systemd 服务 |
+
+为什么两套分隔符：Rust crate 名惯例用连字符（`use` 时自动变下划线），框架的
+plugin id 用点做命名空间，像反向域名——将来生态里若有别的项目写插件，
+`esc.tunnel-panel` 不会和别人的 `panel` 撞。
+
+### 两个面板的名字必须能自证
+
+项目里有**两个**面板，只说「panel」永远含糊：
+
+| | 隧道面板 | 服务器面板 |
+|---|---|---|
+| crate / 二进制 | `esc-plugin-tunnel-panel` | `esc-server-panel` |
+| 框架 id | `esc.tunnel-panel` | 无（不是插件） |
+| 端口 | 2223 | 2224 |
+| 管什么 | 端口映射 | 主机指标 + Docker |
+
+`esc-server-panel` 名字里**没有** `plugin-` 不是笔误——它确实不是插件（不实现
+`Plugin` trait、不被任何宿主 mount）。这条前缀本身就是「它在哪一层」的答案。
+
+同理，它给容器打的标签是 `esc.server-panel=1` 而不是笼统的 `esc.panel=1`：
+`docker ps --filter label=esc.server-panel` 能自证来源。
+
+### 遗留的旧名
+
+`esc-hub` / `esc-spoke` 只有 71 行和 58 行，是转发到 `esc-engine` 的兼容层
+——保留名字是为了让老的 `esc hub -c hub.toml` 命令与 systemd 单元不用改。
 
 ## 依赖与契约的两处「钉住」
 
@@ -218,7 +277,7 @@ ErrorKind::http_status() -> u16           // 400 / 404 / 409 / 409 / 503 / 502
 | 想做的事 | 改哪里 |
 |---|---|
 | 加一个控制方法 | `esc-control-api`：加方法名 + `TunnelControl` 方法 + `dispatch` 分支 → 引擎实现 → 面板加 HTTP 路由 |
-| 换前端 | 只改 `esc-plugin-panel/web/index.html`（单文件，无构建步骤） |
+| 换前端 | 只改 `esc-plugin-tunnel-panel/web/index.html`（单文件，无构建步骤） |
 | 换个面板实现（别的语言） | 讲同一套 `HostCall("esc.control", method, params)` 即可，宿主不用改 |
 | 加一个新插件（比如证书签发 UI） | 写一个 `PluginHandler` 子进程插件 + 在宿主里 `supervisor.start(...)`；它通过 `HostCall` 拿数据 |
 | 换隧道实现 | 在 Ctx 里注册同一个 `ServiceKey<Arc<dyn TunnelControl>>`，面板完全不用知道 |

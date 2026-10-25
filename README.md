@@ -150,7 +150,7 @@ local = "127.0.0.1:3000"
 
 ```bash
 cargo build --release \
-  --bin esc --bin esc-host --bin esc-plugin-panel
+  --bin esc --bin esc-host --bin esc-plugin-tunnel-panel
 
 # 引擎配置：旧的 hub.toml 直接能用，加两行即可
 #   role  = "hub"
@@ -166,7 +166,7 @@ config = "/etc/esc/engine.toml"
 
 [panel]
 enabled = true
-command = "/usr/local/libexec/esc/esc-plugin-panel"
+command = "/usr/local/libexec/esc/esc-plugin-tunnel-panel"
 
 [panel.config]
 listen = "127.0.0.1:8787"      # 默认只绑回环
@@ -245,8 +245,8 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 |---|---|
 | `esc-engine` 集成测试 | spoke 已连接时**动态**加映射能被立即授权、数据真的穿过去、停用后端口立即释放 |
 | `esc-plugin-tunnel` 测试 | 插件 mount 后 Ctx 里出现隧道服务；配置非法时 fail-closed |
-| `esc-plugin-panel` HTTP 测试 | 每个 REST 端点映射到正确的契约方法；URL 里的 id 覆盖 body；口令缺失即 401 |
-| `esc-plugin-panel` 端到端测试 | 浏览器 API → 子进程面板 → HostCall → 宿主 → 进程内插件 → 引擎 → spoke → 回显服务，全链路真实流量 |
+| `esc-plugin-tunnel-panel` HTTP 测试 | 每个 REST 端点映射到正确的契约方法；URL 里的 id 覆盖 body；口令缺失即 401 |
+| `esc-plugin-tunnel-panel` 端到端测试 | 浏览器 API → 子进程面板 → HostCall → 宿主 → 进程内插件 → 引擎 → spoke → 回显服务，全链路真实流量 |
 
 ## 已知边界（当前版本故意不做）
 
@@ -265,7 +265,7 @@ crates/
   esc-engine/        可编程内核：动态端口绑定 / 注册表 / 映射表 / 计数管道
   esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
   esc-plugin-tunnel/ 进程内插件：把引擎注册进宿主的 Ctx
-  esc-plugin-panel/  子进程插件：axum + 单文件前端，只认契约
+  esc-plugin-tunnel-panel/  子进程插件：axum + 单文件前端，只认契约
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
   esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）

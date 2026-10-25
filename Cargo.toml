@@ -10,7 +10,7 @@ members = [
     "crates/esc-spoke",
     "crates/esc-cli",
     "crates/esc-plugin-tunnel",
-    "crates/esc-plugin-panel",
+    "crates/esc-plugin-tunnel-panel",
     "crates/esc-host",
 
 ]

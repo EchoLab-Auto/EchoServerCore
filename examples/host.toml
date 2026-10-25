@@ -14,7 +14,7 @@ config = "/etc/esc/engine.toml"
 # false = 纯隧道模式，没有任何管理面
 enabled = true
 # 面板插件可执行文件；相对路径按宿主可执行文件所在目录解析
-command = "/usr/local/libexec/esc/esc-plugin-panel"
+command = "/usr/local/libexec/esc/esc-plugin-tunnel-panel"
 
 # 原样透传给面板插件
 [panel.config]

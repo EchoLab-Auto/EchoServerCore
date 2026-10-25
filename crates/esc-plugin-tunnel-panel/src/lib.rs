@@ -48,8 +48,11 @@ use tokio_util::sync::CancellationToken;
 
 use esc_control_api::{method, CONTROL_SERVICE};
 
-/// 面板在宿主里暴露的贡献名（宿主可以用 `invoke("esc.panel", …)` 探测它）。
-pub const PANEL_KEY: &str = "esc.panel";
+/// 本插件在宿主里暴露的贡献名（宿主可以用 `invoke("esc.tunnel-panel", …)` 探测它）。
+///
+/// 与 crate 名 `esc-plugin-tunnel-panel` 一一对应：`esc-plugin-X` ↔ `esc.X`。
+/// 加 `tunnel-` 前缀是因为项目里有**两个**面板，只叫 `esc.panel` 分不清是哪个。
+pub const PANEL_KEY: &str = "esc.tunnel-panel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 配置
@@ -535,7 +538,7 @@ pub async fn run() -> std::io::Result<()> {
     serve_stdio_with(
         Panel::new(),
         ServeOptions {
-            plugin_id: "esc.panel".into(),
+            plugin_id: PANEL_KEY.into(),
             ..Default::default()
         },
     )

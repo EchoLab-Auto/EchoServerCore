@@ -1,16 +1,16 @@
 [package]
-name = "esc-plugin-panel"
+name = "esc-plugin-tunnel-panel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Web panel as a subprocess plugin: REST + single-file UI, talks to the tunnel via HostCall only"
 
 [lib]
-name = "esc_plugin_panel"
+name = "esc_plugin_tunnel_panel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "esc-plugin-panel"
+name = "esc-plugin-tunnel-panel"
 path = "src/main.rs"
 
 [dependencies]

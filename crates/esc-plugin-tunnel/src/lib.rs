@@ -17,7 +17,7 @@
 //!   esc-host
 //!     ├─ Ctx: ServiceKey<Arc<dyn TunnelControl>>  ← 本插件 mount 时 provide
 //!     ├─ 进程内插件 esc.tunnel（本 crate）
-//!     └─ 子进程插件 esc.panel  ── HostCall("esc.control", …) ──▶ 宿主服务 ──▶ 上面那个服务
+//!     └─ 子进程插件 esc.tunnel-panel  ── HostCall("esc.control", …) ──▶ 宿主服务 ──▶ 上面那个服务
 //! ```
 //!
 //! `mount()` 是同步的（框架契约），而启动引擎是异步的。所以 mount 只做两件事：

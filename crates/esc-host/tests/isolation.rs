@@ -71,7 +71,7 @@ fn missing_panel_binary_does_not_stop_the_tunnel() {
     std::fs::write(
         &host_cfg,
         format!(
-            "[engine]\nconfig = \"{}\"\n\n[panel]\nenabled = true\ncommand = \"/nonexistent/esc-plugin-panel\"\n",
+            "[engine]\nconfig = \"{}\"\n\n[panel]\nenabled = true\ncommand = \"/nonexistent/esc-plugin-tunnel-panel\"\n",
             engine.display()
         ),
     )

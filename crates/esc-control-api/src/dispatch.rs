@@ -6,7 +6,7 @@
 //! 三方唯一共享的东西就是这个 crate：
 //!
 //! ```text
-//!   esc-plugin-panel ──HTTP/REST──▶ 浏览器
+//!   esc-plugin-tunnel-panel ──HTTP/REST──▶ 浏览器
 //!          │  HostCall(esc.control, ControlRequest)
 //!          ▼
 //!   esc-host ──Invoke(esc.tunnel.control)──▶ esc-plugin-tunnel

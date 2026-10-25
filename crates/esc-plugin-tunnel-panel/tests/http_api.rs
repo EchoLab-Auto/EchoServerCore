@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use esc_control_api::method;
-use esc_plugin_panel::{router, ControlBackend, Panel, PanelConfig};
+use esc_plugin_tunnel_panel::{router, ControlBackend, Panel, PanelConfig};
 
 /// 假后端：记录每次调用的 (method, params)，返回预设结果。
 #[derive(Default)]

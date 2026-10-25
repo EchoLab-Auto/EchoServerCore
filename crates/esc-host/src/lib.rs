@@ -6,7 +6,7 @@
 //! 2. 挂载进程内插件 `esc.tunnel` → 它把 `Arc<dyn TunnelControl>` 放进 `Ctx`；
 //! 3. 注册宿主服务 `esc.control` → 把子进程插件的 `HostCall` 转成对上面那个
 //!    服务的 `dispatch(ControlRequest)` 调用；
-//! 4. 用 `PluginSupervisor` 拉起子进程插件 `esc.panel`，退出时优雅排空。
+//! 4. 用 `PluginSupervisor` 拉起子进程插件 `esc.tunnel-panel`，退出时优雅排空。
 //!
 //! ```text
 //!   浏览器 ──▶ esc-panel（子进程，axum）
@@ -43,8 +43,10 @@ use esc_plugin_tunnel::TunnelPlugin;
 
 /// 隧道插件在注册表里的 id。
 pub const TUNNEL_PLUGIN_ID: &str = "esc.tunnel";
-/// 面板插件的 id（与面板 `Hello` 里的 plugin_id 一致）。
-pub const PANEL_PLUGIN_ID: &str = "esc.panel";
+/// 隧道面板插件的 id（与面板 `Hello` 里的 plugin_id 一致）。
+///
+/// 名字对齐 crate：`esc-plugin-tunnel-panel` ↔ `esc.tunnel-panel`。
+pub const TUNNEL_PANEL_PLUGIN_ID: &str = "esc.tunnel-panel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 配置
@@ -82,7 +84,7 @@ fn empty_table() -> toml::Value {
 }
 
 fn default_panel_command() -> String {
-    "esc-plugin-panel".to_string()
+    "esc-plugin-tunnel-panel".to_string()
 }
 
 impl Default for PanelSection {
@@ -198,7 +200,7 @@ impl Host {
         if cfg.panel.enabled {
             let program = panel_program.unwrap_or_else(|| resolve_program(&cfg.panel.command));
             let spec = PluginSpec {
-                plugin_id: PANEL_PLUGIN_ID.to_string(),
+                plugin_id: TUNNEL_PANEL_PLUGIN_ID.to_string(),
                 config: cfg.panel_json(),
             };
             match supervisor.start(spec, Box::new(StdioTransport::new(program.clone()))).await {
@@ -295,7 +297,7 @@ fn resolve_program(command: &str) -> PathBuf {
 async fn probe_panel_url(handle: &PluginHandle) -> Option<String> {
     for _ in 0..25 {
         let outcome = handle
-            .invoke(PANEL_PLUGIN_ID, InvokeContext::default(), Value::Null)
+            .invoke(TUNNEL_PANEL_PLUGIN_ID, InvokeContext::default(), Value::Null)
             .await;
         if let echo_plugin_host::api::InvokeOutcome::Ok { result, .. } = outcome {
             if result.get("serving").and_then(Value::as_bool) == Some(true) {

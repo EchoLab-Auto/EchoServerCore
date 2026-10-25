@@ -33,7 +33,7 @@ config = "/etc/esc/engine.toml"
 
 [panel]
 enabled = true
-command = "/usr/local/libexec/esc/esc-plugin-panel"
+command = "/usr/local/libexec/esc/esc-plugin-tunnel-panel"
 
 [panel.config]
 listen = "127.0.0.1:8787"

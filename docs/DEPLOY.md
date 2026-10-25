@@ -186,17 +186,17 @@ loginctl enable-linger "$USER"
 ```
 esc-host（systemd）
   ├─ 进程内插件 esc.tunnel  → esc-engine（hub 角色，绑 :4433 与各映射端口）
-  └─ 子进程插件 esc.panel   → HTTP :8787（只绑回环）+ 单页前端
+  └─ 子进程插件 esc.tunnel-panel → HTTP :2223（只绑回环）+ 单页前端
 ```
 
 ### 1. 装二进制
 
 ```bash
-cargo build --release --bin esc --bin esc-host --bin esc-plugin-panel
+cargo build --release --bin esc --bin esc-host --bin esc-plugin-tunnel-panel
 install -m755 target/release/esc             /usr/local/bin/esc
 install -m755 target/release/esc-host        /usr/local/bin/esc-host
 install -d -m755 /usr/local/libexec/esc
-install -m755 target/release/esc-plugin-panel /usr/local/libexec/esc/esc-plugin-panel
+install -m755 target/release/esc-plugin-tunnel-panel /usr/local/libexec/esc/esc-plugin-tunnel-panel
 ```
 
 > 面板是宿主**拉起的子进程**，不是 systemd 服务。想升级面板就换这个文件再
@@ -220,7 +220,7 @@ config = "/etc/esc/engine.toml"
 
 [panel]
 enabled = true
-command = "/usr/local/libexec/esc/esc-plugin-panel"
+command = "/usr/local/libexec/esc/esc-plugin-tunnel-panel"
 
 [panel.config]
 listen = "127.0.0.1:8787"
@@ -336,7 +336,7 @@ cloud2 没有对外 SSH 入口，二进制没法 `scp`；而它自己有 cargo +
 cd /opt/src/EchoServerCore
 git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main   # 见坑 #9
 git merge --ff-only FETCH_HEAD
-cargo build --release -j 2 --bin esc --bin esc-host --bin esc-plugin-panel
+cargo build --release -j 2 --bin esc --bin esc-host --bin esc-plugin-tunnel-panel
 ```
 
 | 项 | 实测 |
@@ -384,7 +384,7 @@ systemctl enable  --now esc-host
 | `esc check -c /etc/esc/engine.toml --role hub` | ✅ 旧 hub.toml 兼容（`role`/`store` 被忽略） |
 | `systemctl is-active esc-host` / `is-enabled` | ✅ active / enabled（`esc-hub` 已 disable） |
 | 监听 | `0.0.0.0:4433` 控制、`0.0.0.0:2222` 映射、`127.0.0.1:8787` 面板 |
-| 进程与内存 | `esc-host` RSS 6.5 MB（User=esc）+ `esc-plugin-panel` RSS 4.4 MB |
+| 进程与内存 | `esc-host` RSS 6.5 MB（User=esc）+ `esc-plugin-tunnel-panel` RSS 4.4 MB |
 | 面板认证 | 无口令 401；带口令 200，标题 `esc 隧道面板 · cloud-server-2` |
 | 映射表 | `/var/lib/esc/mappings.toml`，`esc:esc 600`，由 `[[service]]` 播种 |
 | 运行时增删映射 | ✅ POST 200 → `127.0.0.1:2399` 立即监听 → 落盘 → 停用 100ms 内释放 → 删除 |
@@ -484,7 +484,7 @@ allow_cidrs = []          # 未设白名单：家用宽带 IP 会变，写死容
 
 | 检查项 | 结果 |
 |---|---|
-| 监听 | `0.0.0.0:2223`（esc-plugin-panel），4433/2222 不变 |
+| 监听 | `0.0.0.0:2223`（esc-plugin-tunnel-panel），4433/2222 不变 |
 | 启动 WARN | ✅ 打出「管理面已暴露到网络 / 口令以 Basic 明文传输」 |
 | 无口令 | 401 |
 | 带口令 | 200，能读 status / mappings |

@@ -554,7 +554,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "esc-plugin-panel"
+name = "esc-plugin-tunnel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "echo-context",
+ "echo-plugin",
+ "esc-common",
+ "esc-control-api",
+ "esc-engine",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "esc-plugin-tunnel-panel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -573,22 +589,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "esc-plugin-tunnel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "echo-context",
- "echo-plugin",
- "esc-common",
- "esc-control-api",
- "esc-engine",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]

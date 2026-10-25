@@ -4,7 +4,7 @@
 //!   HTTP 测试客户端
 //!        │  POST /api/mappings
 //!        ▼
-//!   esc-plugin-panel（真子进程，stdio 插件）
+//!   esc-plugin-tunnel-panel（真子进程，stdio 插件）
 //!        │  HostCall("esc.control", "mapping.upsert")
 //!        ▼
 //!   esc-host（本测试进程内：PluginSupervisor + Ctx + 宿主服务）
@@ -138,7 +138,7 @@ async fn panel_addr(host: &Host) -> String {
     let panel = host.panel().expect("面板插件应当已启动").clone();
     for _ in 0..60 {
         if let InvokeOutcome::Ok { result, .. } = panel
-            .invoke("esc.panel", InvokeContext::default(), Value::Null)
+            .invoke("esc.tunnel-panel", InvokeContext::default(), Value::Null)
             .await
         {
             if result.get("serving").and_then(Value::as_bool) == Some(true) {
@@ -223,7 +223,7 @@ auth   = "admin:secret"
 title  = "e2e 面板"
 "#,
         engine = engine_path.display(),
-        panel = env!("CARGO_BIN_EXE_esc-plugin-panel"),
+        panel = env!("CARGO_BIN_EXE_esc-plugin-tunnel-panel"),
     );
     let host = Host::start(HostConfig::parse(&host_toml).unwrap(), None)
         .await

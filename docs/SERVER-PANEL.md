@@ -3,7 +3,7 @@
 一个看主机指标、管 Docker 容器的 Web 面板。默认端口 `2224`。
 
 它是**独立进程**，不是 `esc-host` 的插件——理由在下面「为什么不做成插件」。
-和隧道面板（`esc-plugin-panel`）共享同一套访问控制（`esc-panel-auth`），
+和隧道面板（`esc-plugin-tunnel-panel`）共享同一套访问控制（`esc-panel-auth`），
 但两者互不依赖：隧道面板挂了不影响服务器面板，反之亦然。
 
 ```
@@ -259,7 +259,7 @@ curl --unix-socket /var/run/docker.sock http://d/containers/json?all=1 | head -c
 两者可以部署在同一台机器上（cloud2 就是这样：`2223` 隧道面板、`2224` 服务器面板），
 也可以只装一个。
 
-| | 隧道面板 `esc-plugin-panel` | 服务器面板 `esc-server-panel` |
+| | 隧道面板 `esc-plugin-tunnel-panel` | 服务器面板 `esc-server-panel` |
 |---|---|---|
 | 形态 | `esc-host` 的子进程插件 | 独立 systemd 服务 |
 | 端口 | 2223 | 2224 |
@@ -461,8 +461,8 @@ grep ^Groups /proc/$(systemctl show esc-server-panel -p MainPID --value)/status
 重启策略 unless-stopped
 ```
 
-创建出的容器会打上 `esc.panel=1` 标签——以后想分辨「哪些是从 Web 建的」,
-`docker ps --filter label=esc.panel` 就够了。
+创建出的容器会打上 `esc.server-panel=1` 标签——以后想分辨「哪些是从 Web 建的」,
+`docker ps --filter label=esc.server-panel` 就够了。
 
 **刻意不提供的字段**：`Privileged`、`CapAdd`、`PidMode`、`NetworkMode=host`、
 `--device`。把这些摆到 Web 表单上，等于把「一条命令拿到宿主机 root」包装成

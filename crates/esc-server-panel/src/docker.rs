@@ -1092,7 +1092,7 @@ impl CreateSpec {
             "Env": self.env,
             "ExposedPorts": exposed,
             "HostConfig": host_config,
-            "Labels": { "esc.panel": "1" },
+            "Labels": { "esc.server-panel": "1" },
         });
         if !self.cmd.is_empty() {
             body["Cmd"] = json!(self.cmd);
@@ -1769,8 +1769,10 @@ mod tests {
         );
         assert_eq!(body["HostConfig"]["RestartPolicy"]["Name"], "unless-stopped");
         assert_eq!(body["HostConfig"]["Binds"][0], "/srv/web:/usr/share/nginx/html:ro");
-        // 面板创建的容器打个标签，方便以后分辨哪些是从 Web 建出来的
-        assert_eq!(body["Labels"]["esc.panel"], "1");
+        // 面板创建的容器打个标签，方便以后分辨哪些是从 Web 建出来的。
+        // 用 `esc.server-panel` 而不是笼统的 `esc.panel`：项目里有两个面板，
+        // 只有这个能创建容器，标签名应当能自证来源。
+        assert_eq!(body["Labels"]["esc.server-panel"], "1");
     }
 
     #[test]

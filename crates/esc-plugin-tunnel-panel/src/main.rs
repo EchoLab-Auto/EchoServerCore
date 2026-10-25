@@ -13,7 +13,7 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = esc_plugin_panel::run().await {
+    if let Err(e) = esc_plugin_tunnel_panel::run().await {
         eprintln!("panel plugin exited: {e}");
         std::process::exit(1);
     }
