@@ -64,14 +64,20 @@ struct Running {
 }
 
 async fn start(auth: Option<&str>) -> Running {
+    start_with(|cfg| cfg.auth = auth.map(str::to_string)).await
+}
+
+/// 用自定义配置起一个面板（测试白名单 / 限速这类需要改默认值的场景）。
+async fn start_with(tweak: impl FnOnce(&mut PanelConfig)) -> Running {
     let mock = Arc::new(Mock::default());
     let backend: Arc<dyn ControlBackend> = mock.clone();
-    let cfg = PanelConfig {
+    let mut cfg = PanelConfig {
         listen: "127.0.0.1:0".into(),
-        auth: auth.map(str::to_string),
+        auth: None,
         title: "测试面板".into(),
-        behind_proxy: false,
+        ..Default::default()
     };
+    tweak(&mut cfg);
     let token = CancellationToken::new();
     let panel = Panel::new();
     let addr = panel
@@ -277,4 +283,111 @@ async fn error_code_table_lives_in_the_contract() {
     assert_eq!(ErrorKind::Bind.http_status(), 409);
     assert_eq!(ErrorKind::Unavailable.http_status(), 503);
     assert_eq!(ErrorKind::Other.http_status(), 502);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 暴露到公网时的两道锁
+//
+// 这些用例走真实 socket，因此来源 IP 就是 127.0.0.1——正好可以验证白名单的
+// 「放行」与「拒绝」两侧，也能验证限速确实作用在 socket 来源上而不是某个头。
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn auth_failures_are_rate_limited_after_the_configured_budget() {
+    let r = start_with(|cfg| {
+        cfg.auth = Some("admin:s3cret".into());
+        cfg.max_auth_failures = 3;
+        cfg.auth_fail_window_secs = 60;
+    })
+    .await;
+
+    for i in 0..3 {
+        let (code, _) = common::http(
+            &r.addr,
+            "GET",
+            "/api/status",
+            None,
+            Some(&common::basic("admin:wrong")),
+        )
+        .await;
+        assert_eq!(code, 401, "第 {} 次错误口令应仍是 401", i + 1);
+    }
+
+    // 预算用完之后，**即使口令正确**也要挡住——否则限速就形同虚设。
+    let (code, body) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:s3cret")),
+    )
+    .await;
+    assert_eq!(code, 429, "超出失败预算应 429，实际 {code}: {body}");
+    assert!(r.mock.calls.lock().unwrap().is_empty(), "被限速的请求不应触达后端");
+
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn successful_auth_resets_the_failure_counter() {
+    let r = start_with(|cfg| {
+        cfg.auth = Some("admin:s3cret".into());
+        cfg.max_auth_failures = 2;
+        cfg.auth_fail_window_secs = 60;
+    })
+    .await;
+
+    // 先错一次，然后用正确口令进来 —— 计数应被清零。
+    let _ = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:no"))).await;
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    assert_eq!(code, 200);
+
+    // 若计数没被清零，这里第一次错就会撞到「3 次」预算。
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:no"))).await;
+    assert_eq!(code, 401, "成功登录后计数应重置，不该直接 429");
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    assert_eq!(code, 200);
+
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn allow_cidrs_lets_matching_sources_in_and_blocks_the_rest() {
+    // 回环在白名单里 → 照常工作
+    let r = start_with(|cfg| {
+        cfg.auth = Some("admin:s3cret".into());
+        cfg.allow_cidrs = vec!["127.0.0.0/8".into()];
+    })
+    .await;
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    assert_eq!(code, 200, "白名单内的来源应放行");
+    r.token.cancel();
+
+    // 回环不在白名单里 → 403，且**不消耗认证预算、不触达后端**
+    let r = start_with(|cfg| {
+        cfg.auth = Some("admin:s3cret".into());
+        cfg.allow_cidrs = vec!["10.0.0.0/8".into()];
+    })
+    .await;
+    let (code, body) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    assert_eq!(code, 403, "白名单外的来源应 403，实际 {code}: {body}");
+    assert!(r.mock.calls.lock().unwrap().is_empty(), "白名单外的请求不应触达后端");
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn malformed_allow_cidrs_fail_config_validation() {
+    // 写错的白名单必须报错，而不是「解析不了就当没配」——那会把管理面静默开给所有人。
+    let mut cfg = PanelConfig {
+        auth: Some("admin:s3cret".into()),
+        ..Default::default()
+    };
+    cfg.allow_cidrs = vec!["10.0.0.0/33".into()];
+    assert!(cfg.validate().is_err());
+
+    cfg.allow_cidrs = vec!["not-an-ip".into()];
+    assert!(cfg.validate().is_err());
+
+    cfg.allow_cidrs = vec!["10.0.0.0/8".into(), "::1".into()];
+    assert!(cfg.validate().is_ok(), "IPv4 CIDR 与 IPv6 精确地址都应被接受");
 }

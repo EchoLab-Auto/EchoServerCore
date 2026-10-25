@@ -426,3 +426,38 @@ systemctl enable  --now esc-hub      # 旧 unit 与 /etc/esc/hub.toml 都还在
 ```bash
 ssh -L 8787:127.0.0.1:8787 root@114.132.241.46
 ```
+
+## 把面板暴露到公网（可选）
+
+默认只听回环。要改成公网访问：
+
+```bash
+# /etc/esc/host.toml
+[panel.config]
+listen = "0.0.0.0:2223"
+auth   = "admin:<20 位以上随机口令>"
+allow_cidrs = ["<你的出口 IP 段>"]      # 强烈建议
+max_auth_failures = 8                   # 默认值，可省略
+auth_fail_window_secs = 60
+```
+
+```bash
+systemctl restart esc-host
+ss -tlnp | grep 2223                    # 确认监听
+```
+
+### 三个容易漏掉的前提
+
+1. **云厂商安全组**要放行该端口。主机上 `ss` 看着在监听、外部却连不上，九成是
+   安全组没开（面板自身不会碰防火墙）；
+2. **别和映射端口撞车**。映射用的是 `2222` 这类公网端口，面板换个别的，
+   否则引擎绑端口会报 `conflict`；
+3. **改了 `listen` 记得看日志有没有那条 WARN**：面板在非回环地址上启动会打
+   「管理面已暴露到网络」的警告，说明它确实生效了。
+
+### 回退到只监听回环
+
+```bash
+sed -i 's/^listen = "0.0.0.0:2223"/listen = "127.0.0.1:8787"/' /etc/esc/host.toml
+systemctl restart esc-host
+```
