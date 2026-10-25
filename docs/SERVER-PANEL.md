@@ -334,3 +334,97 @@ setpriv --reuid=esc --regid=esc --clear-groups \
 
 如果将来不想保留这个放宽，替代方案是把服务器面板的配置放到独立目录
 （如 `/etc/esc-monitor/`），并在 unit 里用 `--config` 指过去。
+
+## 在 cloud2 上安装 Docker（2026-10-25 实操）
+
+面板先上线、Docker 后装，正好验证了「没有 Docker 也能用、装完不用改配置」。
+
+### 为什么用 Ubuntu 仓库的 `docker.io` 而不是官方 CE
+
+```bash
+apt-cache policy docker.io
+#   Candidate: 29.1.3-0ubuntu4.1      ← Ubuntu 26.04 universe
+curl -s -o /dev/null -w "%{http_code}" https://download.docker.com/linux/ubuntu/dists/
+#   000                               ← 国内直连不通
+```
+
+官方 CE 需要先加 `download.docker.com` 的源，而这台机器拉不到。Ubuntu 仓库的
+`docker.io` 是 **29.1.3**——与官方 CE 同步发布的打包版本，不缺功能，而且走
+腾讯云内网镜像（`mirrors.tencentyun.com`）装起来很快。
+
+### 坑 C：腾讯云内网镜像加速器在这台机器上不通
+
+装完直接配了 `mirror.ccs.tencentyun.com`（腾讯云 CVM 的内网加速器）：
+
+```
+Registry Mirrors: http://mirror.ccs.tencentyun.com/
+docker pull hello-world
+→ dial tcp 169.254.0.51:80: i/o timeout
+```
+
+它解析到 `169.254.0.51`（链路本地地址），这台机器访问不到——**内网加速器只对
+同 VPC 的 CVM 生效**，不是"在腾讯云上就一定可用"。
+
+换成公共镜像（从 cloud2 上实测 `/v2/` 响应）：
+
+| 镜像 | 响应 | 说明 |
+|---|---|---|
+| `docker.m.daocloud.io` | 401 | 活的（401 = 需要 token，正常） |
+| `docker.1ms.run` | 401 | 活的 |
+| `docker.xuanyuan.me` | 401 | 活的 |
+| `docker.1panel.live` | 200 | 活的 |
+| `registry-1.docker.io` | 超时 | 直连不通 |
+
+配三个做冗余（docker 会依次尝试）：
+
+```json
+{
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me"
+  ],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "20m", "max-file": "3" },
+  "live-restore": true
+}
+```
+
+### 那两个 daemon 配置不是可选项
+
+- **`log-opts` 必须设**。docker 默认的 `json-file` 驱动**没有大小上限**，
+  一个话多的容器（nginx access log、应用的 debug log）能几个月吃满磁盘。
+  `20m × 3` = 单容器最多 60 MB，够排查问题又不至于失控。
+- **`live-restore: true`** 让 `systemctl restart docker` 不杀掉运行中的容器。
+  升级 docker 或改 daemon.json 时不至于把所有服务停一遍。
+
+### 装完之后还要做三件事，否则面板还是「未安装」
+
+```bash
+# ① 面板用户加入 docker 组
+/usr/sbin/usermod -aG docker esc-monitor
+
+# ② 删掉没 Docker 时用的 drop-in（SupplementaryGroups= 需要 docker 组存在）
+rm /etc/systemd/system/esc-server-panel.service.d/no-docker.conf
+
+# ③ 重载并重启（缺失会踩坑 A 的 216/GROUP）
+systemctl daemon-reload && systemctl reset-failed esc-server-panel
+systemctl restart esc-server-panel
+
+# 验证进程确实拿到了 docker 组（gid 通常是 107）
+grep ^Groups /proc/$(systemctl show esc-server-panel -p MainPID --value)/status
+#   Groups:	107 982
+```
+
+### 装完验证的结果
+
+| 检查项 | 结果 |
+|---|---|
+| `docker --version` | 29.1.3 |
+| 面板 `docker.state` | `ok`，API 1.52 |
+| 拉镜像 | ✅ `hello-world`、`alpine` 都成功 |
+| 列表 / 日志 / 资源 | ✅ 日志里的中文正常显示（复用流按帧解码，不会切多字节字符） |
+| 面板 pause / unpause | ✅ 200，`docker ps` 显示 `(Paused)` |
+| 面板 start | ✅ 200 |
+| **面板 stop** | ⚠️ **第一次报 504，见下** |
+| 磁盘 | `/var/lib/docker` 204 KB（两个基础镜像），换到 33% |
