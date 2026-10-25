@@ -512,3 +512,65 @@ IP，写死网段后一旦换 IP 就把自己锁在外面，而恢复需要另�
    TLS 终结（nginx/Caddy + 域名），面板退回只听回环；
 2. **面板权限很大**：能增删公网端口映射，等于能改内网暴露面；
 3. **`/healthz` 也过认证层**，探针要么带 Basic、要么做 TCP 探活。
+
+## 可靠的部署通道：git bundle + scp
+
+cloud2 直连 github 极不稳定（多次 130 s 超时，`git fetch` 报
+`Failed to connect to github.com port 443`）。但**它自己的 sshd 是通的**
+（本机公钥在 `/root/.ssh/authorized_keys` 里）。所以用这条路更新源码：
+
+```bash
+# 本机（有完整仓库）
+cd <repo> && git bundle create /tmp/esc.bundle main
+
+# 本机 — 传到共享分区（不要用 /tmp，见下）
+scp /tmp/esc.bundle root@<host>:/opt/src/esc.bundle
+
+# 远端
+cd /opt/src/EchoServerCore
+git fetch /opt/src/esc.bundle main
+git reset --hard FETCH_HEAD        # [local] 提交会被丢弃（上游已含等价内容）
+```
+
+实测：bundle 290 KB，scp **1.7 秒**完成——比 `git fetch` 反复超时快两个数量级。
+校验 `sha256sum` 一致再 fetch，避免半包。
+
+### 为什么传到 `/opt/src` 而不是 `/tmp`
+
+`/tmp` 是 tmpfs，而且**在 agent 的沙箱里可能不是同一份**：sandbox 有自己的
+mount namespace，`scp` 写进真机的 `/tmp`，而沙箱里的 `/tmp` 是另一份，
+于是「scp 成功、文件不存在」。`/opt`、`/var`、`/etc` 在根分区，两边一致。
+
+```bash
+# 校验（远端）
+ls -l /opt/src/esc.bundle && sha256sum /opt/src/esc.bundle
+```
+
+### 为什么不直接传二进制
+
+可以（同一个 x86_64、旧 glibc 编译的二进制能在新系统上跑），但传源码有三个
+好处：cloud2 自己 `cargo build` 保证依赖与本地一致；`node --check` 之类只能
+在源码上跑；出问题时 `git log` 在机器上就是完整的。
+
+只有在一台机器完全没装 Rust 时才值得传二进制。
+
+## 前端 JS 的语法校验
+
+面板前端是单文件 HTML（没有构建步骤），所以没有天然的类型/语法检查点。本机
+没有 node，但 **cloud2 有 node v22**：
+
+```bash
+# 远端
+python3 -c "
+import re, pathlib
+html = pathlib.Path('crates/esc-server-panel/web/index.html').read_text()
+js = re.search(r'<script>(.*?)</script>', html, re.S).group(1)
+pathlib.Path('/tmp/sp-check.js').write_text(js)
+print('JS 行数:', len(js.splitlines()))
+"
+node --check /tmp/sp-check.js && echo "✅ 语法正确"
+```
+
+`node --check` 只验语法（不执行），但能抓住模板字符串里漏引号、括号不配对
+这类会在浏览器里变成「整页白屏」的错误。**每次改前端都该跑一次**——
+它的成本是两秒，而白屏的排查成本是半小时。
