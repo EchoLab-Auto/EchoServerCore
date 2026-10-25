@@ -46,6 +46,12 @@ impl ControlBackend for Mock {
             method::CONFIG_EXPORT => Ok(json!({
                 "role": "hub", "filename": "hub.toml", "toml": "[[service]]\nname = \"demo\"\n"
             })),
+            // 引擎侧错误：code 由契约的 ErrorKind::as_code 生成
+            "mapping.boom" => Err((
+                StatusCode::from_u16(esc_control_api::ErrorKind::Conflict.http_status())
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                "端口 0.0.0.0:2222 已被映射 \"other\" 占用".to_string(),
+            )),
             other => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("unexpected {other}"))),
         }
     }
@@ -242,4 +248,33 @@ async fn router_can_be_built_without_serving() {
     let mock = Arc::new(Mock::default());
     let backend: Arc<dyn ControlBackend> = mock;
     let _ = router(backend, &PanelConfig::default());
+}
+
+/// 错误码/状态码的对应表住在契约里，不在面板里 —— 这条测试锁住它。
+#[tokio::test]
+async fn error_code_table_lives_in_the_contract() {
+    use esc_control_api::ErrorKind;
+
+    // 往返：as_code → from_code 必须回到原值
+    for kind in [
+        ErrorKind::Other,
+        ErrorKind::Invalid,
+        ErrorKind::Conflict,
+        ErrorKind::Bind,
+        ErrorKind::NotFound,
+        ErrorKind::Unavailable,
+    ] {
+        assert_eq!(ErrorKind::from_code(kind.as_code()), kind, "{kind:?}");
+    }
+    // 未知码不 panic，归为 Other（向前兼容：将来加了新类别，老面板仍能工作）
+    assert_eq!(ErrorKind::from_code("some_future_kind"), ErrorKind::Other);
+    assert_eq!(ErrorKind::from_code(""), ErrorKind::Other);
+
+    // 状态码是给外部看的，别退化成全场 500
+    assert_eq!(ErrorKind::Invalid.http_status(), 400);
+    assert_eq!(ErrorKind::NotFound.http_status(), 404);
+    assert_eq!(ErrorKind::Conflict.http_status(), 409);
+    assert_eq!(ErrorKind::Bind.http_status(), 409);
+    assert_eq!(ErrorKind::Unavailable.http_status(), 503);
+    assert_eq!(ErrorKind::Other.http_status(), 502);
 }

@@ -51,12 +51,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 
 # ── Web / 插件化 ─────────────────────────────────────────────────────
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
-# 插件框架：宿主 / 插件契约 / 插件侧运行时（pinned 到 main 上的具体提交）
-echo-context = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
-echo-plugin = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
-echo-plugin-api = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
-echo-plugin-host = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+# 插件框架：宿主 / 插件契约 / 插件侧运行时。
+#
+# 钉在 tag 上（框架 README 的推荐做法）。`v0.11.1` = commit a16b3e5，记在这里
+# 是为了万一 tag 被移动时还能追溯到底跑的哪份代码。
+# 注意：这些 crate 的 package version 恒为 0.1.0（仓库发布号走 git tag），
+# 所以 `version = "0.1.0"` 之类的约束毫无意义，必须靠 tag 钉住。
+echo-context = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+echo-plugin = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+echo-plugin-api = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+echo-plugin-host = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
 async-trait = "0.1"
 base64 = "0.22"
 

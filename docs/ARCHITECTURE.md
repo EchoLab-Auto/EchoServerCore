@@ -170,6 +170,39 @@ spoke   = "evence-4090"      # 可选：钉住 provider
 任意一侧的静态配置。角色决定哪几个字段生效：hub 只读 `listen`/`spoke`，
 spoke 只读 `local`。
 
+## 依赖与契约的两处「钉住」
+
+### 插件框架的版本怎么钉
+
+框架的 6 个 crate 的 package version **恒为 `0.1.0`**，发布号走 git tag。所以
+`version = "0.1.0"` 这种约束毫无意义（任何一版都满足）。本仓钉在 tag 上：
+
+```toml
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+```
+
+`v0.11.1` = commit `a16b3e5`。升级框架 = 改这一个 tag（五个依赖一起），
+然后 `cargo update` + 跑测试。因为框架在 0.x 允许 breaking，升级前值得先看
+它的 `CHANGELOG.md`。
+
+### 错误码表住在契约里
+
+宿主要把 `ControlError` 跨过 `HostCall` 传给面板，而 `HostCall` 的错误只有
+`(code: String, message: String)` 两个字符串。如果宿主用 `format!("{:?}", kind)`
+生成码、面板用硬编码字符串解析，那就是**两处独立的假定**——改一处忘了另一处，
+所有错误会静默降级成 502。
+
+所以码表放在 `esc-control-api`：
+
+```rust
+ErrorKind::as_code()   // → "invalid" / "not_found" / "conflict" / "bind" / "unavailable" / "other"
+ErrorKind::from_code(&str) -> ErrorKind   // 未知码 → Other（向前兼容）
+ErrorKind::http_status() -> u16           // 400 / 404 / 409 / 409 / 503 / 502
+```
+
+宿主调 `as_code`，面板调 `from_code` + `http_status`，两边不可能漂移。
+加新错误类别时只有一处要改，而且会被迫回答「它对外应该是 400 还是 409」。
+
 ## 兼容性
 
 - `esc hub -c hub.toml` / `esc spoke -c spoke.toml` **行为不变**：原来的

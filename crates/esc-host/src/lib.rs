@@ -30,11 +30,11 @@ use echo_plugin::{MountContext, Plugin, PluginRegistry};
 use echo_plugin_host::api::InvokeContext;
 use echo_plugin_host::host_service::HostService;
 use echo_plugin_host::stdio::StdioTransport;
-use echo_plugin_host::supervisor::{PluginHandle, PluginSupervisor};
+use echo_plugin_host::supervisor::{PluginHandle, PluginState, PluginSupervisor};
 use echo_plugin_host::transport::PluginSpec;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use esc_control_api::{
     dispatch, ControlError, ControlRequest, ControlResponse, TunnelControl, CONTROL_SERVICE,
@@ -150,7 +150,8 @@ impl HostService for EngineHostService {
             Ok(resp.data)
         } else {
             let err = resp.error.unwrap_or_else(|| ControlError::other("控制调用失败"));
-            Err((format!("{:?}", err.kind).to_lowercase(), err.message))
+            // 用契约里的 `as_code`（不是 `{:?}`）：面板按同一份码表解析。
+            Err((err.kind.as_code().to_string(), err.message))
         }
     }
 }
@@ -206,6 +207,7 @@ impl Host {
                     if let Some(url) = probe_panel_url(&handle).await {
                         info!(url = %url, "web panel is up");
                     }
+                    watch_panel(handle.clone());
                     panel = Some(handle);
                 }
                 Err(e) => {
@@ -242,6 +244,38 @@ impl Host {
         let keys = self.ctx.keys();
         info!(keys = ?keys, "host stopped");
     }
+}
+
+/// 盯着面板的状态。
+///
+/// supervisor 对崩溃的插件最多重启 5 次，之后把它钉在 `Failed` 并且**不再
+/// 尝试**。这对隧道毫无影响（数据面照跑），但对运维是真问题：面板打不开，
+/// 而日志里只有 supervisor 的普通 warn，很容易几个月没人发现。
+///
+/// 所以这里在状态变成 `Failed` 时打一条 ERROR，说清楚「面板已永久停摆、
+/// 隧道仍在运行、怎么恢复」。
+fn watch_panel(handle: PluginHandle) {
+    tokio::spawn(async move {
+        let mut reported = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            match handle.state() {
+                PluginState::Failed(why) if !reported => {
+                    reported = true;
+                    error!(
+                        restarts = handle.restarts(),
+                        reason = %why,
+                        "面板插件已停摆（重启预算耗尽）——隧道仍在正常转发，\
+                         但 Web 面板不再可用。排查原因后重启本服务即可恢复：\
+                         systemctl restart esc-host。原始原因见上方 supervisor 日志。"
+                    );
+                }
+                // 面板被正常停掉（宿主收尾流程）→ 哨兵使命结束。
+                PluginState::Stopped | PluginState::Draining => return,
+                _ => {}
+            }
+        }
+    });
 }
 
 /// 相对路径按宿主可执行文件所在目录解析，这样 `cargo run` 时不用配绝对路径。

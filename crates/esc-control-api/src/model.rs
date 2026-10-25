@@ -250,6 +250,49 @@ pub enum ErrorKind {
     Unavailable,
 }
 
+impl ErrorKind {
+    /// 机器可读的短码。**这是契约的一部分**：宿主用它生成
+    /// `HostCall` 的错误码，面板用它决定 HTTP 状态码。两边都调这一个
+    /// 函数，所以不会出现「宿主说 notfound、面板只认 not_found」这种漂移。
+    pub fn as_code(self) -> &'static str {
+        match self {
+            ErrorKind::Other => "other",
+            ErrorKind::Invalid => "invalid",
+            ErrorKind::Conflict => "conflict",
+            ErrorKind::Bind => "bind",
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::Unavailable => "unavailable",
+        }
+    }
+
+    /// 把 [`Self::as_code`] 的结果解回来；未知码归为 [`ErrorKind::Other`]。
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "invalid" => ErrorKind::Invalid,
+            "conflict" => ErrorKind::Conflict,
+            "bind" => ErrorKind::Bind,
+            "not_found" => ErrorKind::NotFound,
+            "unavailable" => ErrorKind::Unavailable,
+            _ => ErrorKind::Other,
+        }
+    }
+
+    /// 这个错误该对应哪个 HTTP 状态码。
+    ///
+    /// 放在契约里而不是面板里，是为了让「新增一个错误类别」只需要改一处
+    /// （顺带迫使作者想清楚它对外应该长什么样）。
+    pub fn http_status(self) -> u16 {
+        match self {
+            ErrorKind::Invalid => 400,
+            ErrorKind::NotFound => 404,
+            ErrorKind::Conflict => 409,
+            ErrorKind::Bind => 409,
+            ErrorKind::Unavailable => 503,
+            ErrorKind::Other => 502,
+        }
+    }
+}
+
 impl ControlError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self { message: message.into(), kind }

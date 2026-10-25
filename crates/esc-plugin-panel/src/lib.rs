@@ -27,6 +27,7 @@ pub mod web;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -139,6 +140,11 @@ pub trait ControlBackend: Send + Sync + 'static {
     async fn call(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)>;
 }
 
+/// 引擎侧的操作（bind、写映射表、查状态）都是毫秒级的，所以 10 秒已经是
+/// 非常宽松的上限。默认的 30 秒会让浏览器在一个真的卡住的调用上白等半分钟，
+/// 而这时用户想看到的是「引擎没响应」而不是转圈。
+const CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 生产实现：走插件框架的 `HostCall`。
 pub struct HostCallBackend {
     host: HostClient,
@@ -153,19 +159,37 @@ impl HostCallBackend {
 #[async_trait]
 impl ControlBackend for HostCallBackend {
     async fn call(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
-        match self.host.call(CONTROL_SERVICE, method, params).await {
+        match self
+            .host
+            .call_with_timeout(CONTROL_SERVICE, method, params, CONTROL_CALL_TIMEOUT)
+            .await
+        {
             Ok(v) => Ok(v),
             Err(e) => {
-                let text = e.to_string();
-                // 引擎侧的错误已经带上了人类可读的原因，尽量原样透给浏览器。
-                let status = if text.contains("not_found") {
-                    StatusCode::NOT_FOUND
-                } else if text.contains("invalid") {
-                    StatusCode::BAD_REQUEST
-                } else if text.contains("conflict") {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::BAD_GATEWAY
+                // 用 `code` 而不是解析 `Display` 文本来决定状态码：错误文本会变，
+                // 机器可读的 code 是契约的一部分。
+                let (status, text) = match &e {
+                    echo_plugin_sdk::HostCallError::Timeout => (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "引擎在 {}s 内没有响应（{}）——看宿主日志确认隧道引擎是否卡住",
+                            CONTROL_CALL_TIMEOUT.as_secs(),
+                            method
+                        ),
+                    ),
+                    echo_plugin_sdk::HostCallError::Closed => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "与宿主的连接已断开，面板即将退出".to_string(),
+                    ),
+                    echo_plugin_sdk::HostCallError::Service { code, message } => {
+                        // 码表在契约里（`ErrorKind::as_code` / `http_status`），
+                        // 面板只管把码翻成状态码，不维护第二份字符串表。
+                        let kind = esc_control_api::ErrorKind::from_code(code);
+                        let status = StatusCode::from_u16(kind.http_status())
+                            .unwrap_or(StatusCode::BAD_GATEWAY);
+                        (status, message.clone())
+                    }
+                    other => (StatusCode::BAD_GATEWAY, other.to_string()),
                 };
                 Err((status, text))
             }
