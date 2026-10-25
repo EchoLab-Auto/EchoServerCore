@@ -25,17 +25,18 @@
 pub mod web;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use esc_panel_auth::{AccessControl, AuthConfig, Denied};
 use echo_plugin_sdk::echo_plugin_api::ServiceContribution;
 use echo_plugin_sdk::{
     async_trait, serve_stdio_with, Contribution, HostClient, InvokeOutcome, InvokeRequest,
@@ -96,46 +97,24 @@ impl Default for PanelConfig {
 impl PanelConfig {
     pub fn from_json(v: &Value) -> Self {
         let d = Self::default();
+        let shared = AuthConfig::from_json(v);
         Self {
             listen: v
                 .get("listen")
                 .and_then(Value::as_str)
                 .unwrap_or(&d.listen)
                 .to_string(),
-            auth: v
-                .get("auth")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && s.contains(':'))
-                .map(str::to_string),
+            auth: shared.auth.clone(),
             title: v
                 .get("title")
                 .and_then(Value::as_str)
                 .unwrap_or(&d.title)
                 .to_string(),
             behind_proxy: v.get("behind_proxy").and_then(Value::as_bool).unwrap_or(false),
-            max_auth_failures: v
-                .get("max_auth_failures")
-                .and_then(Value::as_u64)
-                .map(|n| n.min(u32::MAX as u64) as u32)
-                .unwrap_or(d.max_auth_failures),
-            auth_fail_window_secs: v
-                .get("auth_fail_window_secs")
-                .and_then(Value::as_u64)
-                .unwrap_or(d.auth_fail_window_secs),
-            allow_cidrs: v
-                .get("allow_cidrs")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            // 与访问控制有关的字段统一由共享 crate 解析，避免两套规则漂移。
+            max_auth_failures: shared.max_auth_failures,
+            auth_fail_window_secs: shared.auth_fail_window_secs,
+            allow_cidrs: shared.allow_cidrs,
         }
     }
 
@@ -166,13 +145,18 @@ impl PanelConfig {
         }
         // 白名单写错了必须报错，不能「解析失败就当没限制」——那样会静默地把
         // 管理面开给所有人，而配置看起来还像是锁着的。
-        for rule in &self.allow_cidrs {
-            AllowRule::parse(rule)?;
+        // 具体校验在共享的 `AuthConfig` 里（服务器面板用同一份）。
+        self.auth_config().validate()
+    }
+
+    /// 把本配置里与访问控制相关的字段打包给 `esc-panel-auth`。
+    pub fn auth_config(&self) -> AuthConfig {
+        AuthConfig {
+            auth: self.auth.clone(),
+            allow_cidrs: self.allow_cidrs.clone(),
+            max_auth_failures: self.max_auth_failures,
+            auth_fail_window_secs: self.auth_fail_window_secs,
         }
-        if self.auth_fail_window_secs == 0 {
-            return Err("auth_fail_window_secs 必须大于 0".to_string());
-        }
-        Ok(())
     }
 }
 
@@ -243,130 +227,8 @@ impl ControlBackend for HostCallBackend {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 暴露到公网时的两道锁：来源白名单 + 认证失败限速
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// 一条来源白名单规则。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AllowRule {
-    /// IPv4 网段：`base` 已按 `mask` 归零。
-    V4 { base: u32, mask: u32 },
-    /// 精确地址（IPv6 目前只能精确匹配）。
-    Exact(IpAddr),
-}
-
-impl AllowRule {
-    /// 解析 `1.2.3.4` / `1.2.3.0/24` / `::1`。
-    ///
-    /// 故意只支持 IPv4 CIDR：IPv6 前缀匹配要考虑的作用域太多，写个半吊子的
-    /// 实现比不支持更危险。IPv6 请写完整地址精确匹配。
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let text = text.trim();
-        if let Some((addr, len)) = text.rsplit_once('/') {
-            let addr: Ipv4Addr = addr
-                .trim()
-                .parse()
-                .map_err(|_| format!("allow_cidrs 里的 {text:?} 无法解析（只支持 IPv4 CIDR）"))?;
-            let len: u32 = len
-                .trim()
-                .parse()
-                .map_err(|_| format!("allow_cidrs 里的 {text:?} 前缀长度不是数字"))?;
-            if len > 32 {
-                return Err(format!("allow_cidrs 里的 {text:?} 前缀长度超过 32"));
-            }
-            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-            return Ok(Self::V4 {
-                base: u32::from(addr) & mask,
-                mask,
-            });
-        }
-        let addr: IpAddr = text
-            .parse()
-            .map_err(|_| format!("allow_cidrs 里的 {text:?} 不是合法 IP"))?;
-        Ok(Self::Exact(addr))
-    }
-
-    pub fn matches(&self, ip: IpAddr) -> bool {
-        match (self, ip) {
-            (Self::V4 { base, mask }, IpAddr::V4(v4)) => (u32::from(v4) & mask) == *base,
-            (Self::Exact(want), got) => *want == got,
-            _ => false,
-        }
-    }
-}
-
-/// 某个来源的错误口令次数。
-#[derive(Debug, Clone, Copy)]
-struct FailEntry {
-    count: u32,
-    since: Instant,
-}
-
-/// 认证失败限速器。
-///
-/// 只针对**失败**计数——正常使用者不该因为刷新页面被挡。窗口是「首次失败起算」
-/// 的固定窗口，简单且足够：扫描器会一直撞在这堵墙上，真人很难在一分钟内输错 8 次。
-#[derive(Debug)]
-pub struct AuthGuard {
-    max_failures: u32,
-    window: Duration,
-    state: Mutex<HashMap<IpAddr, FailEntry>>,
-}
-
-impl AuthGuard {
-    pub fn new(max_failures: u32, window: Duration) -> Self {
-        Self {
-            max_failures,
-            window,
-            state: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// 是否已被限速；返回建议的重试等待时间。
-    pub fn blocked_for(&self, ip: IpAddr) -> Option<Duration> {
-        if self.max_failures == 0 {
-            return None;
-        }
-        let map = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.get(&ip)?;
-        let elapsed = entry.since.elapsed();
-        if entry.count >= self.max_failures && elapsed < self.window {
-            Some(self.window - elapsed)
-        } else {
-            None
-        }
-    }
-
-    /// 记一次失败。
-    pub fn record_failure(&self, ip: IpAddr) {
-        if self.max_failures == 0 {
-            return;
-        }
-        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // 表是有界的：公网面板天天被扫，不设上限等于给对面一个内存放大招。
-        if map.len() >= 4096 {
-            let window = self.window;
-            map.retain(|_, e| e.since.elapsed() < window);
-            if map.len() >= 4096 {
-                map.clear();
-            }
-        }
-        let now = Instant::now();
-        let entry = map.entry(ip).or_insert(FailEntry { count: 0, since: now });
-        if entry.since.elapsed() >= self.window {
-            *entry = FailEntry { count: 1, since: now };
-        } else {
-            entry.count = entry.count.saturating_add(1);
-        }
-    }
-
-    /// 认证成功后清掉该来源的计数——避免正常用户手滑几次后被越攒越久。
-    pub fn clear(&self, ip: IpAddr) {
-        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(&ip);
-    }
-}
+// 访问控制（Basic 认证 / 来源白名单 / 失败限速）住在 `esc-panel-auth` 里。
+// 那边有一份完整实现与测试，服务器面板也用它——这套逻辑不能有两份。
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP
@@ -375,10 +237,8 @@ impl AuthGuard {
 #[derive(Clone)]
 struct AppState {
     backend: Arc<dyn ControlBackend>,
-    auth: Option<String>,
     title: String,
-    guard: Arc<AuthGuard>,
-    allow: Arc<Vec<AllowRule>>,
+    access: Arc<AccessControl>,
 }
 
 struct ApiError(StatusCode, String);
@@ -399,18 +259,8 @@ impl From<(StatusCode, String)> for ApiError {
 pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
     let state = AppState {
         backend,
-        auth: cfg.auth.clone(),
         title: cfg.title.clone(),
-        guard: Arc::new(AuthGuard::new(
-            cfg.max_auth_failures,
-            Duration::from_secs(cfg.auth_fail_window_secs.max(1)),
-        )),
-        allow: Arc::new(
-            cfg.allow_cidrs
-                .iter()
-                .filter_map(|r| AllowRule::parse(r).ok())
-                .collect(),
-        ),
+        access: Arc::new(AccessControl::new(&cfg.auth_config())),
     };
     Router::new()
         .route("/", get(index))
@@ -432,10 +282,6 @@ async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = st.auth.as_deref() else {
-        return next.run(req).await;
-    };
-
     // 来源地址来自 accept 的 socket（`into_make_service_with_connect_info`）。
     // 不走 X-Forwarded-For：那个头谁都能伪造，在白名单/限速里信它等于没锁。
     let peer: Option<IpAddr> = req
@@ -443,65 +289,10 @@ async fn auth_middleware(
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
 
-    if let Some(ip) = peer {
-        if !st.allow.is_empty() && !st.allow.iter().any(|rule| rule.matches(ip)) {
-            tracing::warn!(%ip, "panel request rejected: source not in allow_cidrs");
-            return (StatusCode::FORBIDDEN, "来源地址不在白名单内").into_response();
-        }
-        if let Some(wait) = st.guard.blocked_for(ip) {
-            let secs = wait.as_secs().max(1);
-            tracing::warn!(%ip, retry_after_secs = secs, "panel auth rate limited");
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, secs.to_string())],
-                "认证失败次数过多，请稍后再试",
-            )
-                .into_response();
-        }
+    match st.access.check(&headers, peer) {
+        Ok(()) => next.run(req).await,
+        Err(Denied(response)) => *response,
     }
-
-    let supplied = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic "))
-        .and_then(|b64| {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.decode(b64).ok()
-        })
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-
-    // 恒定时间比较：口令短且固定，但没理由给旁路留计时差。
-    let ok = supplied
-        .as_deref()
-        .map(|s| ct_eq(s.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
-    if ok {
-        if let Some(ip) = peer {
-            st.guard.clear(ip);
-        }
-        next.run(req).await
-    } else {
-        if let Some(ip) = peer {
-            st.guard.record_failure(ip);
-        }
-        (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"esc panel\", charset=\"UTF-8\"")],
-            "需要认证",
-        )
-            .into_response()
-    }
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 async fn index(State(st): State<AppState>) -> Html<String> {
@@ -749,63 +540,4 @@ pub async fn run() -> std::io::Result<()> {
         },
     )
     .await
-}
-
-#[cfg(test)]
-mod allow_rule_tests {
-    use super::AllowRule;
-    use std::net::IpAddr;
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn cidr_matches_only_inside_the_range() {
-        let rule = AllowRule::parse("10.1.0.0/16").unwrap();
-        assert!(rule.matches(ip("10.1.0.1")));
-        assert!(rule.matches(ip("10.1.255.254")));
-        assert!(!rule.matches(ip("10.2.0.1")), "相邻网段不该命中");
-        assert!(!rule.matches(ip("11.1.0.1")));
-    }
-
-    #[test]
-    fn host_bits_are_normalised_away() {
-        // 写成 1.2.3.4/24 时，应等价于 1.2.3.0/24 —— 否则会意外放行/拒绝。
-        let rule = AllowRule::parse("1.2.3.4/24").unwrap();
-        assert!(rule.matches(ip("1.2.3.99")));
-        assert!(!rule.matches(ip("1.2.4.1")));
-    }
-
-    #[test]
-    fn slash_zero_matches_everything_and_slash_32_matches_one() {
-        assert!(AllowRule::parse("0.0.0.0/0").unwrap().matches(ip("8.8.8.8")));
-
-        let one = AllowRule::parse("203.0.113.7/32").unwrap();
-        assert!(one.matches(ip("203.0.113.7")));
-        assert!(!one.matches(ip("203.0.113.8")));
-    }
-
-    #[test]
-    fn plain_address_is_exact_match_including_ipv6() {
-        let v4 = AllowRule::parse("203.0.113.7").unwrap();
-        assert!(v4.matches(ip("203.0.113.7")));
-        assert!(!v4.matches(ip("203.0.113.8")));
-
-        let v6 = AllowRule::parse("2001:db8::1").unwrap();
-        assert!(v6.matches(ip("2001:db8::1")));
-        assert!(!v6.matches(ip("2001:db8::2")));
-        // 跨族的规则天然不匹配，而不是报错
-        assert!(!v6.matches(ip("203.0.113.7")));
-    }
-
-    #[test]
-    fn malformed_rules_are_rejected_loudly() {
-        // 关键：解析失败不能静默变成「不限来源」。
-        assert!(AllowRule::parse("10.0.0.0/33").is_err());
-        assert!(AllowRule::parse("10.0.0.0/x").is_err());
-        assert!(AllowRule::parse("not-an-ip").is_err());
-        assert!(AllowRule::parse("2001:db8::/32").is_err(), "IPv6 前缀暂不支持，应报错而非误判");
-        assert!(AllowRule::parse("").is_err());
-    }
 }

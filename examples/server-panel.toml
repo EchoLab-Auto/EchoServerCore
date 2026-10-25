@@ -1,0 +1,32 @@
+# 服务器面板配置：主机指标 + Docker 容器管理
+#
+# 这个面板是**独立进程**（不是 esc-host 的插件），因为它要访问 docker socket
+# ——那等价于 root。隧道进程应该保持"无聊"：它越没有权限，出问题时越安全。
+# 理由与部署方式见 docs/SERVER-PANEL.md。
+
+# 监听地址。默认只绑回环：外网访问请用 SSH 转发，或配合下面的 allow_cidrs。
+listen = "127.0.0.1:2224"
+
+# 页面标题（显示在标签页与页头）
+title = "服务器面板"
+
+# Basic 认证，格式 user:password。
+# **非回环监听时必填**——没有它进程会拒绝启动（fail-closed）。
+# 面板能启停容器，所以口令请用长随机串：
+#   openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
+# auth = "admin:换成你自己的长口令"
+
+# 来源白名单：IPv4 CIDR 或精确 IP。空 = 不限来源。
+# 暴露到公网时这是最有效的一道锁（连 401 都拿不到）。
+# allow_cidrs = ["203.0.113.0/24", "198.51.100.7"]
+
+# 认证失败限速：同一来源在窗口内错太多次 → 429（正确口令也会被挡，60 秒后恢复）
+max_auth_failures = 8
+auth_fail_window_secs = 60
+
+# Docker socket。装在非默认位置时改这里。
+docker_socket = "/var/run/docker.sock"
+
+# 是否允许启停容器。false = 纯只读监控（连按钮都不显示）。
+# 只想看不想动的话关掉它，攻击面会小很多。
+allow_actions = true

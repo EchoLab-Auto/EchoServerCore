@@ -1,0 +1,256 @@
+# 服务器面板（server-panel）
+
+一个看主机指标、管 Docker 容器的 Web 面板。默认端口 `2224`。
+
+它是**独立进程**，不是 `esc-host` 的插件——理由在下面「为什么不做成插件」。
+和隧道面板（`esc-plugin-panel`）共享同一套访问控制（`esc-panel-auth`），
+但两者互不依赖：隧道面板挂了不影响服务器面板，反之亦然。
+
+```
+esc-host        ── 隧道 + 端口映射面板（:2223）
+esc-server-panel ── 主机指标 + Docker 管理（:2224）   ← 本文
+```
+
+## 界面有什么
+
+| 区块 | 内容 |
+|---|---|
+| CPU | 总使用率、每核柱状、负载 1/5/15、核数。多核下进程 CPU% 可超过 100% |
+| 内存 | 已用/总量、可用、缓存/缓冲、Swap。**已用 = 总量 − 可用**（不是 − 空闲） |
+| 网络 | 各接口累计与瞬时速率（排除回环）、总收发 |
+| 系统 | 主机名、发行版、内核、架构、运行时长 |
+| 磁盘 | 每个真实块设备的挂载点/设备/类型/使用率，`tmpfs`/`overlay` 等伪文件系统已过滤 |
+| Docker | 容器列表（状态灯、镜像、端口映射、Compose 项目分组）、启停/重启/暂停、日志、实时资源 |
+| 进程 | Top 20（按 CPU 降序），PID/名称/CPU%/RSS/线程/用户/命令行 |
+
+页面每 3 秒轮询一次主机指标，每 6 秒刷新一次容器列表。单文件前端，没有构建步骤。
+
+## 为什么不做成 `esc-host` 的插件
+
+`esc-host` 的沙箱是给数据面设计的：`User=esc`、`ProtectSystem=strict`、
+`PrivateDevices`、`SystemCallFilter=@system-service`。而服务器面板要读
+`/var/run/docker.sock` ——**在 Docker 里，能访问这个 socket 就等于 root**
+（可以起一个 `--privileged -v /:/host` 的容器）。
+
+把这两件事放进同一个进程，等于让「转发 TCP 的程序」拥有 root 等价权限。
+隧道是我们最希望保持"无聊"的组件：它只需要网络和证书，不应该有任何其他能力。
+
+所以拆开：
+
+```
+esc-host         User=esc         无 docker socket、文件系统只读
+esc-server-panel User=esc-monitor docker 组（能做容器操作，但不是 root）
+```
+
+即使服务器面板被攻破，攻击者拿到的是 docker 组权限（实际仍可提权到 root，
+但需要额外一步利用）；而隧道进程完全不受影响。
+
+## 部署
+
+```bash
+# 1. 装二进制
+install -d -m 0755 /usr/local/libexec/esc
+install -m 0755 esc-server-panel /usr/local/libexec/esc/esc-server-panel
+
+# 2. 专用用户 + docker 组（没有 docker 的话跳过 usermod）
+useradd --system --no-create-home --shell /usr/sbin/nologin esc-monitor 2>/dev/null || true
+usermod -aG docker esc-monitor
+
+# 3. 配置
+cat > /etc/esc/server-panel.toml <<'EOF'
+listen = "0.0.0.0:2224"
+title  = "服务器面板"
+auth   = "admin:<28 位随机口令>"
+allow_cidrs = []
+max_auth_failures = 8
+auth_fail_window_secs = 60
+docker_socket = "/var/run/docker.sock"
+allow_actions = true
+EOF
+chown root:esc-monitor /etc/esc/server-panel.toml
+chmod 640 /etc/esc/server-panel.toml
+
+# 4. 起服务
+install -m 0644 esc-server-panel.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now esc-server-panel
+```
+
+代码里的口令：
+
+```bash
+openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
+```
+
+## 配置项
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `listen` | `127.0.0.1:2224` | HTTP 监听地址 |
+| `title` | `服务器面板` | 页面标题 |
+| `auth` | 无 | `user:password`。**非回环监听时必填**，否则拒绝启动 |
+| `allow_cidrs` | `[]` | 来源白名单：IPv4 CIDR 或精确 IP。空 = 不限 |
+| `max_auth_failures` | `8` | 同一来源在窗口内的失败次数上限，超出 429 |
+| `auth_fail_window_secs` | `60` | 失败计数窗口 |
+| `docker_socket` | `/var/run/docker.sock` | Docker socket 路径 |
+| `allow_actions` | `true` | `false` = 纯只读监控（连按钮都不显示） |
+
+未知键会**报错**而不是忽略——`allow_action = false` 这种拼写错误如果被静默
+忽略，会变成「我明明关了啊」的谜案。
+
+## REST API
+
+全部需要认证（`/healthz` 也要，这样「未认证探测」与「未认证访问」表现一致）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/` | 页面 |
+| GET | `/healthz` | `ok`（探活用） |
+| GET | `/api/overview` | 主机指标 + Docker 摘要（前端轮询这个） |
+| GET | `/api/host` | 只有主机指标 |
+| GET | `/api/docker/containers` | 容器列表（含已停止的） |
+| GET | `/api/docker/containers/{id}` | 单容器详情（原始 Docker JSON） |
+| GET | `/api/docker/containers/{id}/logs?tail=300` | 日志尾部（已解码复用流） |
+| GET | `/api/docker/containers/{id}/stats` | 单次资源采样 |
+| GET | `/api/docker/images` | 镜像列表 |
+| POST | `/api/docker/containers/{id}/{action}` | `start` / `stop` / `restart` / `pause` / `unpause` |
+
+Docker 不可用时这些端点返回 **503**（服务不可用），而不是 500——前者说
+「这个功能在此环境不存在」，后者说「我们写错了」。
+
+### 刻意不提供的操作
+
+**create / rm / exec / pull / volume / network** 一概没有。允许清单在
+`docker.rs` 的 `ALLOWED_ACTIONS` 里，有一条测试专门锁住它——想加东西必须
+改测试并解释。
+
+理由：面板的定位是「看见不对的东西并把它拉起来」。每多一个写操作就多一个
+可被滥用的入口，而「删容器」和「起一个特权容器」在效果上都比「重启」严重
+得多，却只省一次 SSH。
+
+## 安全模型
+
+### docker socket = root
+
+这不是夸张。能访问 docker socket 的人可以：
+
+```bash
+docker run --rm -v /:/host -it alpine chroot /host
+```
+
+于是 `/etc/shadow`、SSH 私钥、所有数据都在手里。所以：
+
+- **口令必须是长随机串**，不要用你会复用到别处的东西；
+- `allow_actions = false` 时即使口令泄露，攻击面也只剩「读指标」；
+- 强烈建议配 `allow_cidrs`——它让白名单外的机器连 401 都拿不到。
+
+### 三道闸的细节
+
+实现在 `esc-panel-auth`（与隧道面板共用一份）：
+
+1. **来源白名单** —— 只认 socket 来源，**不看 `X-Forwarded-For`**。那个头谁都能
+   伪造，用它做访问控制等于没锁。放在反代后面时，白名单要写反代自己的地址。
+2. **失败限速** —— 按来源计数，超预算 429 + `Retry-After`。**正确口令也会被挡**
+   （否则限速形同虚设），60 秒后自动恢复。成功登录会清零。
+3. **Basic 认证** —— 常量时间比较。
+
+白名单解析失败会**拒绝启动**而不是「当没配」；后者会静默把管理面开给所有人，
+而配置文件看起来还锁着。
+
+### 明文 HTTP
+
+面板是纯 HTTP，Basic 认证把 `user:pass` 做 base64 ——**base64 是编码不是加密**，
+链路上任何一跳都能读。可信链路（家里宽带、公司内网）可以接受；公共 WiFi 不要用。
+需要更强保障就在前面挂 TLS 终结（nginx/Caddy + 域名），面板退回只听回环。
+
+### 沙箱
+
+unit 里给的限制：
+
+```
+ProtectSystem=strict         /usr /boot /etc 只读
+ProtectHome=read-only        看不到家目录内容
+PrivateTmp=true              私有 /tmp
+PrivateDevices=true          没有设备节点
+NoNewPrivileges=true         不能提权
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+```
+
+比 `esc-host` 宽松（要读 `/proc`、`/sys` 和 docker socket），但仍然划了线。
+
+## 没有 Docker 的机器上
+
+照样能用，只是 Docker 区块显示「未安装 Docker」，其余指标正常：
+
+```json
+{"docker": {"state": "unavailable", "socket": "/var/run/docker.sock",
+            "message": "未检测到 Docker socket（这台机器可能没装 Docker）"}}
+```
+
+装好 Docker 后刷新页面即可，不用改配置也不用重启面板。
+
+Docker 的三态是分开的，因为处置方式完全不同：
+
+| state | 含义 | 怎么办 |
+|---|---|---|
+| `unavailable` | socket 不存在 | 没装 Docker，或 socket 在非默认路径 |
+| `error` | socket 在但连不上 | daemon 没起来 / 用户不在 docker 组 / 权限不足 |
+| `ok` | 正常 | — |
+
+## 采样失败时的行为
+
+`/proc` 解析跑在 `spawn_blocking` 里。如果它 panic（曾经发生过：命令行按**字节**
+截断到 300，正好切在一个中文的中间），接口**不会**返回 500，而是返回一份空快照。
+
+但空快照必须带标记，否则前端显示「CPU 0% / 内存 0%」会让人以为机器很空闲——
+这是最坏的一种降级。所以响应里有 `sampling_error` 字段，前端据此显示红色横幅：
+
+```json
+{"sampling_error": "task 24 panicked with message \"end byte index 300 is not a char boundary\""}
+```
+
+日志里同时有一条 ERROR。回归测试见 `sys.rs::truncate_never_splits_a_multibyte_character`。
+
+## 排障
+
+```bash
+systemctl status esc-server-panel
+journalctl -u esc-server-panel -n 50
+
+# 端口是否在听
+ss -tlnp | grep 2224
+
+# 自己能不能连
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:2224/healthz   # 401 = 正常（需要认证）
+
+# Docker 权限
+docker -H unix:///var/run/docker.sock ps        # 用 root 试，排除面板自身问题
+sudo -u esc-monitor docker ps                   # 确认 esc-monitor 也能
+
+# 手动对照 Docker API（与面板走同一条路）
+curl --unix-socket /var/run/docker.sock http://d/version
+curl --unix-socket /var/run/docker.sock http://d/containers/json?all=1 | head -c 400
+```
+
+| 现象 | 多半是 |
+|---|---|
+| 端口在听但外部连不上 | 云厂商安全组没放行 |
+| 面板显示「Docker socket 存在但访问失败」 | `esc-monitor` 不在 docker 组，或 daemon 没起 |
+| 所有指标都是 0 | 看页头有没有采样失败横幅，再看日志里的 ERROR |
+| 容器动作返回 403 | 配置了 `allow_actions = false` |
+| 容器动作返回 503 | Docker 不可用（未安装或 daemon 挂了） |
+
+## 与隧道面板的关系
+
+两者可以部署在同一台机器上（cloud2 就是这样：`2223` 隧道面板、`2224` 服务器面板），
+也可以只装一个。
+
+| | 隧道面板 `esc-plugin-panel` | 服务器面板 `esc-server-panel` |
+|---|---|---|
+| 形态 | `esc-host` 的子进程插件 | 独立 systemd 服务 |
+| 端口 | 2223 | 2224 |
+| 管什么 | 端口映射（公网 → 内网） | 主机指标 + Docker 容器 |
+| 权限 | 无特权（`User=esc`） | docker 组（能管容器） |
+| 挂了会怎样 | 隧道照常转发 | 与隧道无关 |
+| 共享 | 访问控制（`esc-panel-auth`）、前端风格 | 同左 |

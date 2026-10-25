@@ -1,0 +1,40 @@
+[Unit]
+Description=esc server panel (host metrics + Docker container management)
+Documentation=https://github.com/EchoLab-Auto/EchoServerCore/blob/main/docs/SERVER-PANEL.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 专用用户 + docker 组：能通过 socket 管理容器，但不是 root。
+# 部署时创建：useradd --system --no-create-home --shell /usr/sbin/nologin esc-monitor
+#             usermod -aG docker esc-monitor
+User=esc-monitor
+Group=esc-monitor
+SupplementaryGroups=docker
+ExecStart=/usr/local/libexec/esc/esc-server-panel --config /etc/esc/server-panel.toml
+Restart=on-failure
+RestartSec=2s
+
+# ── 沙箱 ────────────────────────────────────────────────────────────────────
+# 这个进程要读 /proc、/sys 和 docker.sock，所以不能像 esc-host 那样锁死；
+# 但仍然给它划一条线：文件系统只读、不能提权、私有 /tmp、只留需要的地址族。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# 只需要 unix（docker.sock）与 inet（HTTP 监听）
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+# 允许 exec 的理由：面板会 fork `systemctl` 读取服务状态。
+# 如果后续去掉那个功能，这行可以一起删掉。
+
+[Install]
+WantedBy=multi-user.target

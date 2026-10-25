@@ -542,6 +542,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "esc-panel-auth"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "esc-plugin-panel"
 version = "0.1.0"
 dependencies = [
@@ -554,6 +566,7 @@ dependencies = [
  "esc-control-api",
  "esc-engine",
  "esc-host",
+ "esc-panel-auth",
  "serde",
  "serde_json",
  "tokio",
@@ -576,6 +589,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "esc-server-panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "esc-panel-auth",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.8+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

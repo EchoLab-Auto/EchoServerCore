@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 esc-control-api = { workspace = true }
+esc-panel-auth = { workspace = true }
 echo-plugin-sdk = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
