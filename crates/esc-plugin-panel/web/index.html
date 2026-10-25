@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --dim: #98a0b3; --accent: #4f9cf9; --ok: #35c07f;
+    --warn: #e0a33e; --err: #e8664c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 -apple-system, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  a { color: var(--accent); }
+  header {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 16px 22px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .badge {
+    font-size: 12px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
+  }
+  .badge.role { color: var(--accent); border-color: #2c4b78; background: #14243a; }
+  .badge.on { color: var(--ok); border-color: #1f5c40; background: #10261c; }
+  .badge.off { color: var(--err); border-color: #6a2f24; background: #2a1512; }
+  .spacer { flex: 1 1 auto; }
+  main { padding: 20px 22px 60px; max-width: 1280px; margin: 0 auto; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 18px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--dim); margin: 0 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px 22px; }
+  .kv .k { color: var(--dim); font-size: 12px; }
+  .kv .v { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  button {
+    font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+    padding: 6px 13px; border-radius: 7px; cursor: pointer; transition: .12s;
+  }
+  button:hover { border-color: #3a4152; background: #232833; }
+  button.primary { background: #1b4b86; border-color: #2a6dbd; }
+  button.primary:hover { background: #215a9e; }
+  button.ghost { background: transparent; }
+  button.danger:hover { border-color: #7a3527; color: #ff9d88; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { font-size: 12px; color: var(--dim); font-weight: 600; white-space: nowrap; }
+  tbody tr:hover { background: #1b1f27; }
+  td.mono { font-family: var(--mono); font-size: 12.5px; }
+  .pill { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; }
+  .pill.active { color: var(--ok); background: #10261c; border-color: #1f5c40; }
+  .pill.disabled { color: var(--dim); background: #22262f; border-color: var(--line); }
+  .pill.error { color: var(--err); background: #2a1512; border-color: #6a2f24; }
+  .pill.pending { color: var(--warn); background: #2a2313; border-color: #6a5324; }
+  .arrow { color: var(--dim); padding: 0 6px; }
+  .empty { color: var(--dim); padding: 22px 4px; text-align: center; }
+  .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 40;
+  }
+  .toast div {
+    background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    padding: 10px 14px; border-radius: 7px; max-width: 420px; font-size: 13px; box-shadow: 0 6px 20px #0008;
+  }
+  .toast div.err { border-left-color: var(--err); }
+  .toast div.ok { border-left-color: var(--ok); }
+  dialog {
+    border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+    border-radius: 12px; padding: 0; width: min(560px, 94vw);
+  }
+  dialog::backdrop { background: #000a; }
+  .dlg-head { padding: 15px 18px; border-bottom: 1px solid var(--line); font-weight: 600; }
+  .dlg-body { padding: 16px 18px; display: grid; gap: 13px; }
+  .dlg-foot { padding: 13px 18px; border-top: 1px solid var(--line); display: flex; gap: 10px; justify-content: flex-end; }
+  label { display: grid; gap: 5px; font-size: 12.5px; color: var(--dim); }
+  input[type=text], textarea, select {
+    font: inherit; color: var(--fg); background: #12151b; border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; width: 100%; font-family: var(--mono); font-size: 13px;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: #3a6db5; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+  .hint { font-size: 12px; color: var(--dim); }
+  pre.export {
+    font-family: var(--mono); font-size: 12.5px; background: #12151b; border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px; max-height: 52vh; overflow: auto; white-space: pre;
+  }
+  .stat { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  @media (max-width: 720px) {
+    .hide-sm { display: none; }
+    header { padding: 12px 14px; }
+    main { padding: 14px 12px 50px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <span class="badge role" id="role">—</span>
+  <span class="badge" id="conn">连接状态未知</span>
+  <span class="badge" id="uptime">—</span>
+  <span class="spacer"></span>
+  <button class="ghost" id="btn-refresh">刷新</button>
+  <button class="ghost" id="btn-reload" title="从磁盘重读映射表">重新加载</button>
+  <button class="ghost" id="btn-export">导出配置</button>
+  <button class="primary" id="btn-new">＋ 新建映射</button>
+</header>
+
+<main>
+  <div class="card">
+    <div class="grid" id="summary"></div>
+  </div>
+
+  <div class="card">
+    <h2>端口映射</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>服务名</th>
+          <th>公网监听</th>
+          <th class="hide-sm">转发到</th>
+          <th class="hide-sm">状态</th>
+          <th class="hide-sm">提供者</th>
+          <th class="hide-sm">连接 / 流量</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>还没有映射。点右上角「新建映射」加一条。</div>
+  </div>
+
+  <div class="card" id="spokes-card" hidden>
+    <h2>已连接的 spoke</h2>
+    <table>
+      <thead>
+        <tr><th>spoke id</th><th class="hide-sm">对端地址</th><th class="hide-sm">版本</th><th>已授���服务</th><th class="hide-sm">在线时长</th><th></th></tr>
+      </thead>
+      <tbody id="spoke-rows"></tbody>
+    </table>
+    <div class="empty" id="spoke-empty" hidden>暂无 spoke 连接。</div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<dialog id="dlg-map">
+  <form method="dialog" id="form-map">
+    <div class="dlg-head" id="dlg-title">新建映射</div>
+    <div class="dlg-body">
+      <label>服务名（hub 与 spoke 两侧必须一致）
+        <input type="text" id="f-name" placeholder="4090-8080" required />
+      </label>
+      <div class="row2">
+        <label>公网监听（hub 侧）
+          <input type="text" id="f-listen" placeholder="0.0.0.0:2222" />
+        </label>
+        <label>本地目标（spoke 侧）
+          <input type="text" id="f-local" placeholder="127.0.0.1:8080" />
+        </label>
+      </div>
+      <div class="row2">
+        <label>钉住的 spoke（可选）
+          <input type="text" id="f-spoke" placeholder="留空 = 任意 spoke" />
+        </label>
+        <label>启用
+          <select id="f-enabled"><option value="true">启用</option><option value="false">停用</option></select>
+        </label>
+      </div>
+      <label>备注
+        <input type="text" id="f-note" placeholder="给未来的自己留句话" />
+      </label>
+      <div class="hint">这一条记录同时描述两端：hub 用「公网监听」，spoke 用「本地目标」。填哪边取决于这台机器跑的角色。</div>
+    </div>
+    <div class="dlg-foot">
+      <button value="cancel" class="ghost">取消</button>
+      <button value="save" class="primary" id="btn-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-export">
+  <div class="dlg-head">导出的静态配置</div>
+  <div class="dlg-body">
+    <div class="toolbar">
+      <button class="ghost" data-role="hub">hub.toml</button>
+      <button class="ghost" data-role="spoke">spoke.toml</button>
+      <span class="spacer"></span>
+      <button class="ghost" id="btn-download">下载</button>
+    </div>
+    <pre class="export" id="export-text">加载中…</pre>
+    <div class="hint">导出的是一份快照：之后在面板里改映射，这个文件不会自动跟着变。</div>
+  </div>
+  <div class="dlg-foot"><button class="ghost" id="btn-export-close">关闭</button></div>
+</dialog>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+
+  let state = { mappings: [], status: null, editing: null, exportRole: "hub", paused: false };
+
+  function toast(msg, kind) {
+    const box = $("#toast");
+    const n = el("div", kind || "", msg);
+    box.appendChild(n);
+    setTimeout(() => n.remove(), kind === "err" ? 7000 : 3500);
+  }
+
+  async function api(path, opts) {
+    const res = await fetch(path, Object.assign({
+      headers: { "content-type": "application/json" },
+    }, opts || {}));
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.error || detail;
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  function fmtBytes(n) {
+    if (!n) return "0 B";
+    const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + " " + units[i];
+  }
+
+  function fmtUptime(s) {
+    if (s === undefined || s === null) return "—";
+    if (s < 60) return s + " 秒";
+    if (s < 3600) return Math.floor(s / 60) + " 分 " + (s % 60) + " 秒";
+    return Math.floor(s / 3600) + " 时 " + Math.floor((s % 3600) / 60) + " 分";
+  }
+
+  function kv(label, value) {
+    const box = el("div", "kv");
+    box.appendChild(el("div", "k", label));
+    box.appendChild(el("div", "v", value));
+    return box;
+  }
+
+  function pill(state) {
+    const map = {
+      active: ["active", "生效中"],
+      disabled: ["disabled", "已停用"],
+      pending: ["pending", "待生效"],
+      error: ["error", "出错"],
+    };
+    const [cls, text] = map[state] || ["disabled", state || "未知"];
+    return el("span", "pill " + cls, text);
+  }
+
+  function renderStatus(st) {
+    state.status = st;
+    $("#role").textContent = st.role === "hub" ? "hub · 公网侧" : "spoke · 内网侧";
+    const conn = $("#conn");
+    if (st.role === "hub") {
+      const n = (st.spokes || []).length;
+      conn.textContent = n > 0 ? n + " 个 spoke 在线" : "没有 spoke 连接";
+      conn.className = "badge " + (n > 0 ? "on" : "off");
+    } else {
+      const on = st.hub_connected === true;
+      conn.textContent = on ? "已连上 hub" : "未连接 hub";
+      conn.className = "badge " + (on ? "on" : "off");
+    }
+    $("#uptime").textContent = "运行 " + fmtUptime(st.uptime_secs);
+
+    const s = $("#summary");
+    s.replaceChildren();
+    s.appendChild(kv("角色", st.role === "hub" ? "hub（公网入口）" : "spoke（内网代理）"));
+    if (st.role === "hub") {
+      s.appendChild(kv("控制端口", st.control_listen || "—"));
+    } else {
+      s.appendChild(kv("hub 地址", st.hub_server || "—"));
+      s.appendChild(kv("连接", st.hub_connected ? "在线" : "离线"));
+    }
+    s.appendChild(kv("引擎版本", st.version || "—"));
+    s.appendChild(kv("运行时长", fmtUptime(st.uptime_secs)));
+    const active = state.mappings.filter((m) => m.state === "active").length;
+    s.appendChild(kv("生效映射", active + " / " + state.mappings.length));
+    for (const note of st.notices || []) s.appendChild(kv("提示", note));
+
+    renderSpokes(st);
+  }
+
+  function renderSpokes(st) {
+    const card = $("#spokes-card");
+    const spokes = st.role === "hub" ? (st.spokes || []) : [];
+    card.hidden = st.role !== "hub";
+    const body = $("#spoke-rows");
+    body.replaceChildren();
+    $("#spoke-empty").hidden = spokes.length > 0;
+    for (const sp of spokes) {
+      const tr = el("tr");
+      tr.appendChild(el("td", "mono", sp.id));
+      tr.appendChild(el("td", "mono hide-sm", sp.peer || "—"));
+      tr.appendChild(el("td", "mono hide-sm", sp.agent || "—"));
+      tr.appendChild(el("td", "mono", (sp.granted || []).join(", ") || "（无）"));
+      tr.appendChild(el("td", "hide-sm stat", fmtUptime(sp.connected_secs)));
+      const act = el("td");
+      const btn = el("button", "ghost danger", "踢下线");
+      btn.title = "断开这条连接，它通常会自动重连并重新握手";
+      btn.onclick = async () => {
+        try {
+          await api("/api/spokes/kick", { method: "POST", body: JSON.stringify({ id: sp.id }) });
+          toast("已请求断开 " + sp.id, "ok");
+          refresh();
+        } catch (e) { toast("踢下线失败：" + e.message, "err"); }
+      };
+      act.appendChild(btn);
+      tr.appendChild(act);
+      body.appendChild(tr);
+    }
+  }
+
+  function renderMappings(list) {
+    const body = $("#rows");
+    body.replaceChildren();
+    $("#empty").hidden = list.length > 0;
+    for (const m of list) {
+      const tr = el("tr");
+      if (m.state === "error") tr.title = m.error || "";
+
+      const name = el("td");
+      name.appendChild(el("div", null, m.name));
+      if (m.note) name.appendChild(el("div", "hint", m.note));
+      tr.appendChild(name);
+
+      tr.appendChild(el("td", "mono", m.listen || "—"));
+
+      const target = el("td", "mono hide-sm");
+      if (m.local) {
+        target.appendChild(document.createTextNode(m.local));
+      } else {
+        target.appendChild(el("span", "hint", "—"));
+      }
+      if (m.spoke) {
+        target.appendChild(el("div", "hint", "仅限 " + m.spoke));
+      }
+      tr.appendChild(target);
+
+      const st = el("td", "hide-sm");
+      st.appendChild(pill(m.state));
+      if (m.state === "error" && m.error) st.appendChild(el("div", "hint", m.error));
+      if (m.state === "active" && m.bound && m.bound !== m.listen) {
+        st.appendChild(el("div", "hint", "绑定 " + m.bound));
+      }
+      tr.appendChild(st);
+
+      const prov = el("td", "hide-sm stat", (m.providers || []).join(", ") || "—");
+      tr.appendChild(prov);
+
+      const stats = el("td", "hide-sm stat");
+      const s = m.stats || {};
+      stats.appendChild(el("div", null, (s.connections_total || 0) + " 次 / 当前 " + (s.connections_active || 0)));
+      stats.appendChild(el("div", null, "↑" + fmtBytes(s.bytes_up) + " ↓" + fmtBytes(s.bytes_down)));
+      tr.appendChild(stats);
+
+      const act = el("td");
+      const wrap = el("div");
+      wrap.style.display = "flex";
+      wrap.style.gap = "6px";
+
+      const toggle = el("button", "ghost", m.enabled ? "停用" : "启用");
+      toggle.onclick = async () => {
+        toggle.disabled = true;
+        try {
+          await api("/api/mappings/" + encodeURIComponent(m.id) + "/enabled", {
+            method: "POST", body: JSON.stringify({ enabled: !m.enabled }),
+          });
+          toast((m.enabled ? "已停用 " : "已启用 ") + m.name, "ok");
+          refresh();
+        } catch (e) { toast("操作失败：" + e.message, "err"); toggle.disabled = false; }
+      };
+      wrap.appendChild(toggle);
+
+      const edit = el("button", "ghost", "编辑");
+      edit.onclick = () => openEditor(m);
+      wrap.appendChild(edit);
+
+      const del = el("button", "ghost danger", "删除");
+      del.onclick = async () => {
+        if (!confirm("删除映射 " + m.name + "？对应端口会立即释放。")) return;
+        try {
+          await api("/api/mappings/" + encodeURIComponent(m.id), { method: "DELETE" });
+          toast("已删除 " + m.name, "ok");
+          refresh();
+        } catch (e) { toast("删除失败：" + e.message, "err"); }
+      };
+      wrap.appendChild(del);
+
+      act.appendChild(wrap);
+      tr.appendChild(act);
+      body.appendChild(tr);
+    }
+  }
+
+  function openEditor(m) {
+    state.editing = m || null;
+    state.paused = true;
+    $("#dlg-title").textContent = m ? "编辑映射 · " + m.name : "新建映射";
+    $("#f-name").value = m ? m.name : "";
+    $("#f-listen").value = m && m.listen ? m.listen : "";
+    $("#f-local").value = m && m.local ? m.local : "";
+    $("#f-spoke").value = m && m.spoke ? m.spoke : "";
+    $("#f-note").value = m ? (m.note || "") : "";
+    $("#f-enabled").value = m ? String(m.enabled) : "true";
+    $("#dlg-map").showModal();
+  }
+
+  async function saveEditor() {
+    const body = {
+      name: $("#f-name").value.trim(),
+      listen: $("#f-listen").value.trim() || null,
+      local: $("#f-local").value.trim() || null,
+      spoke: $("#f-spoke").value.trim() || null,
+      note: $("#f-note").value,
+      enabled: $("#f-enabled").value === "true",
+    };
+    if (!body.name) { toast("服务名不能为空", "err"); return; }
+    if (state.editing) body.id = state.editing.id;
+    try {
+      await api(state.editing ? "/api/mappings/" + encodeURIComponent(state.editing.id) : "/api/mappings", {
+        method: "POST", body: JSON.stringify(body),
+      });
+      $("#dlg-map").close();
+      state.paused = false;
+      toast("已保存", "ok");
+      refresh();
+    } catch (e) { toast("保存失败：" + e.message, "err"); }
+  }
+
+  async function loadExport(role) {
+    state.exportRole = role;
+    $("#export-text").textContent = "加载中…";
+    try {
+      const res = await api("/api/export?role=" + role);
+      $("#export-text").textContent = res.toml || "";
+    } catch (e) {
+      $("#export-text").textContent = "导出失败：" + e.message;
+    }
+  }
+
+  async function refresh() {
+    try {
+      const [st, list] = await Promise.all([api("/api/status"), api("/api/mappings")]);
+      state.mappings = list || [];
+      renderStatus(st);
+      renderMappings(state.mappings);
+    } catch (e) {
+      $("#conn").textContent = "后端不可用：" + e.message;
+      $("#conn").className = "badge off";
+    }
+  }
+
+  $("#btn-refresh").onclick = refresh;
+  $("#btn-new").onclick = () => openEditor(null);
+  $("#btn-reload").onclick = async () => {
+    try { await api("/api/reload", { method: "POST" }); toast("已重新加载映射表", "ok"); refresh(); }
+    catch (e) { toast("重新加载失败：" + e.message, "err"); }
+  };
+  $("#btn-export").onclick = () => { $("#dlg-export").showModal(); loadExport(state.status && state.status.role || "hub"); };
+  $("#btn-export-close").onclick = () => $("#dlg-export").close();
+  document.querySelectorAll("#dlg-export [data-role]")
+    .forEach((b) => (b.onclick = () => loadExport(b.dataset.role)));
+  $("#btn-download").onclick = () => {
+    const text = $("#export-text").textContent || "";
+    const blob = new Blob([text], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = state.exportRole + ".toml";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  $("#form-map").addEventListener("submit", (ev) => {
+    if (ev.submitter && ev.submitter.value === "cancel") { state.paused = false; return; }
+    ev.preventDefault();
+    saveEditor();
+  });
+  $("#dlg-map").addEventListener("close", () => { state.paused = false; refresh(); });
+
+  refresh();
+  setInterval(() => { if (!state.paused) refresh(); }, 3000);
+})();
+</script>
+</body>
+</html>

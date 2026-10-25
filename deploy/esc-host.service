@@ -1,0 +1,49 @@
+[Unit]
+Description=esc host (tunnel engine + web panel, plugin-based)
+Documentation=https://github.com/EchoLab-Auto/echo-server-core
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# 与 esc-hub 一样用专用低权限用户；面板也是这个用户跑的（它只绑回环）
+User=esc
+Group=esc
+ExecStart=/usr/local/bin/esc-host --config /etc/esc/host.toml
+Restart=always
+RestartSec=2s
+
+# ── 沙箱加固 ─────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 证书与配置只读
+ReadOnlyPaths=/etc/esc
+# 但映射表要能写（面板增删映射时持久化）
+ReadWritePaths=-/etc/esc/mappings.toml
+# 面板是宿主拉起的子进程，插件二进制必须可执行
+# （放在 /usr/local/libexec/esc/ 下，属于系统路径，ProtectSystem=strict 下只读可执行）
+
+# 引擎 + 面板子进程：常驻内存约 12 MB（hub 4 MB + 面板 8 MB）
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=esc-host
+
+[Install]
+WantedBy=multi-user.target

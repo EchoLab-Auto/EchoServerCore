@@ -2,15 +2,21 @@
 resolver = "2"
 members = [
     "crates/esc-common",
+    "crates/esc-control-api",
+    "crates/esc-engine",
     "crates/esc-hub",
     "crates/esc-spoke",
     "crates/esc-cli",
+    "crates/esc-plugin-tunnel",
+    "crates/esc-plugin-panel",
+    "crates/esc-host",
+
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/EchoLab-Auto/echo-server-core"
 description = "Reverse-tunnel port forwarding over mutually-authenticated TLS"
@@ -28,7 +34,7 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 # ── 多路复用 ─────────────────────────────────────────────────────────
 yamux = "0.14"
 futures = { version = "0.3", default-features = false, features = ["std", "io-compat"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 
 # ── 序列化 ───────────────────────────────────────────────────────────
 serde = { version = "1.0", features = ["derive"] }
@@ -43,8 +49,22 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "local-time"] }
 
+# ── Web / 插件化 ─────────────────────────────────────────────────────
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+# 插件框架：宿主 / 插件契约 / 插件侧运行时（pinned 到 main 上的具体提交）
+echo-context = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+echo-plugin = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+echo-plugin-api = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+echo-plugin-host = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", rev = "a16b3e59d661bbc537098ec70c1f7c17b80d37ee" }
+async-trait = "0.1"
+base64 = "0.22"
+
 # ── 内部 crate ───────────────────────────────────────────────────────
 esc-common = { path = "crates/esc-common" }
+esc-control-api = { path = "crates/esc-control-api" }
+esc-engine = { path = "crates/esc-engine" }
+esc-plugin-tunnel = { path = "crates/esc-plugin-tunnel" }
 esc-hub = { path = "crates/esc-hub" }
 esc-spoke = { path = "crates/esc-spoke" }
 

@@ -170,3 +170,103 @@ scp 10.10.10.250:~/.local/bin/esc ~/.local/bin/esc    # 双向校验 sha256
 systemctl --user enable --now esc-spoke
 loginctl enable-linger "$USER"
 ```
+
+## 面板化部署：把 `esc hub` 换成 `esc-host`（2026-10-25）
+
+`esc hub` 仍然是可用的（行为没变），但想要**不重启就能改映射**，改用宿主：
+
+```
+esc-host（systemd）
+  ├─ 进程内插件 esc.tunnel  → esc-engine（hub 角色，绑 :4433 与各映射端口）
+  └─ 子进程插件 esc.panel   → HTTP :8787（只绑回环）+ 单页前端
+```
+
+### 1. 装二进制
+
+```bash
+cargo build --release --bin esc --bin esc-host --bin esc-plugin-panel
+install -m755 target/release/esc             /usr/local/bin/esc
+install -m755 target/release/esc-host        /usr/local/bin/esc-host
+install -d -m755 /usr/local/libexec/esc
+install -m755 target/release/esc-plugin-panel /usr/local/libexec/esc/esc-plugin-panel
+```
+
+> 面板是宿主**拉起的子进程**，不是 systemd 服务。想升级面板就换这个文件再
+> `systemctl restart esc-host`；想只换面板不影响隧道，可以调
+> `PluginHandle::upgrade`（框架能力，目前没接 CLI）。
+
+### 2. 配置
+
+引擎配置 = 原来的 `hub.toml` 加两行（`docs/../examples/engine.toml` 有全文）：
+
+```toml
+role  = "hub"
+store = "/etc/esc/mappings.toml"
+```
+
+宿主配置 `examples/host.toml`：
+
+```toml
+[engine]
+config = "/etc/esc/engine.toml"
+
+[panel]
+enabled = true
+command = "/usr/local/libexec/esc/esc-plugin-panel"
+
+[panel.config]
+listen = "127.0.0.1:8787"
+auth   = "admin:<口令>"
+```
+
+### 3. 权限（这一步不做会 repeat 坑 #2）
+
+映射表要能写，而单元里 `ProtectSystem=strict`：
+
+```bash
+touch /etc/esc/mappings.toml
+chown esc:esc /etc/esc/mappings.toml
+chmod 600 /etc/esc/mappings.toml
+# 单元里已声明 ReadWritePaths=/etc/esc/mappings.toml，其余 /etc/esc 仍只读
+systemctl disable --now esc-hub      # 先停掉旧的静态 hub
+systemctl enable --now esc-host
+```
+
+首次启动会把 `engine.toml` 里的 `[[service]]` 播种进 `mappings.toml`，
+日志里能看到 `seeded mapping store from static config`。
+
+### 4. 验证
+
+```bash
+systemctl is-active esc-host
+ss -tlnp | grep -E ':4433|:2222|:8787'     # 控制端口 / 映射端口 / 面板
+curl -su admin:<口令> http://127.0.0.1:8787/api/status | jq
+curl -su admin:<口令> http://127.0.0.1:8787/api/mappings | jq
+
+# 运行时加一条映射，端口应立刻出现（不重启、不断已有连接）
+curl -su admin:<口令> -X POST http://127.0.0.1:8787/api/mappings \
+  -H 'content-type: application/json' \
+  -d '{"name":"try","listen":"0.0.0.0:2300","local":"127.0.0.1:8080","enabled":true}'
+ss -tlnp | grep 2300
+```
+
+外部可达性仍然要用第三方探针（见坑 #4），本机自测不算数。
+
+### 5. 从外部访问面板
+
+不要把 8787 直接开到公网。两种做法：
+
+```bash
+# 首选：SSH 隧道
+ssh -L 8787:127.0.0.1:8787 root@114.132.241.46
+
+# 或者：让 esc 自己把面板映射出来，但在前面加一层认证反代
+#（注意这会让面板成为「公网上的管理面」，请确认口令强度）
+```
+
+### 6. 回滚
+
+```bash
+systemctl disable --now esc-host
+systemctl enable --now esc-hub      # 旧的静态配置仍在，逐字节兼容
+```

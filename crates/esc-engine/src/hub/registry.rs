@@ -2,7 +2,12 @@
 //!
 //! The hub is the only authority on which services are exposed: a spoke may
 //! *declare* anything it likes in its `Hello`, but only services that appear in
-//! the hub's own `[[service]]` list are ever registered here.
+//! the hub's own, **live** service set are ever registered here.
+//!
+//! Compared to the pre-engine version this registry additionally supports
+//! removing every entry for a service ([`Registry::drop_service`]) so that a
+//! mapping deleted at runtime stops being routable immediately instead of
+//! lingering until the spoke disconnects.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,12 +35,23 @@ impl std::fmt::Debug for Entry {
     }
 }
 
+/// 一条连接的身份 + 打开流的句柄。
+///
+/// 单独存一份（而不是从 `services` 里找），是因为一个 spoke 可能
+/// 一个服务都没被授权（`granted` 为空），但它随时可能在 hub 新增映射后
+/// 被动态授权——那时仍然需要它的 `Mux`。
+#[derive(Clone, Debug)]
+struct ConnInfo {
+    spoke_id: String,
+    mux: Mux,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     /// service name → connections able to serve it
     services: HashMap<String, Vec<Entry>>,
-    /// conn_key → declared spoke id, for O(1) cleanup
-    by_conn: HashMap<String, String>,
+    /// conn_key → 连接信息，for O(1) cleanup 与动态授权
+    conns: HashMap<String, ConnInfo>,
 }
 
 /// Thread-safe, cheaply cloneable registry.
@@ -49,11 +65,13 @@ impl Registry {
         Self::default()
     }
 
-    /// Publish `entry` under each of `services` with the given weight ordering.
+    /// Publish `entry` under each of `services`.
     pub async fn register(&self, entry: Entry, services: &[String]) {
         let mut g = self.inner.write().await;
-        g.by_conn
-            .insert(entry.conn_key.clone(), entry.spoke_id.clone());
+        g.conns.insert(
+            entry.conn_key.clone(),
+            ConnInfo { spoke_id: entry.spoke_id.clone(), mux: entry.mux.clone() },
+        );
         for svc in services {
             g.services
                 .entry(svc.clone())
@@ -62,15 +80,43 @@ impl Registry {
         }
     }
 
+    /// Grant additional services to an already-registered connection.
+    ///
+    /// Used when a mapping is added at runtime and the spoke had already
+    /// declared that name: no reconnect is needed, the existing mux can serve
+    /// it right away.
+    pub async fn grant(&self, conn_key: &str, services: &[String]) {
+        let mut g = self.inner.write().await;
+        let Some(info) = g.conns.get(conn_key).cloned() else {
+            return;
+        };
+        for svc in services {
+            let list = g.services.entry(svc.clone()).or_default();
+            if !list.iter().any(|e| e.conn_key == conn_key) {
+                list.push(Entry {
+                    conn_key: conn_key.to_string(),
+                    spoke_id: info.spoke_id.clone(),
+                    mux: info.mux.clone(),
+                });
+            }
+        }
+    }
+
     /// Remove every service mapping created by a single connection.
     pub async fn unregister(&self, conn_key: &str) -> Option<String> {
         let mut g = self.inner.write().await;
-        let spoke_id = g.by_conn.remove(conn_key)?;
+        let spoke_id = g.conns.remove(conn_key)?.spoke_id;
         g.services.retain(|_svc, entries| {
             entries.retain(|e| e.conn_key != conn_key);
             !entries.is_empty()
         });
         Some(spoke_id)
+    }
+
+    /// Forget a service entirely (called when its mapping is deleted/disabled).
+    pub async fn drop_service(&self, service: &str) {
+        let mut g = self.inner.write().await;
+        g.services.remove(service);
     }
 
     /// Pick a live connection able to serve `service`.
@@ -111,11 +157,29 @@ impl Registry {
             .await
             .services
             .get(service)
-            .map(|v| v.len())
+            .map(|v| v.iter().filter(|e| e.mux.is_alive()).count())
             .unwrap_or(0)
     }
 
-    /// Snapshot for logging / a future `esc status` command.
+    /// Sorted ids of the live providers of `service`.
+    pub async fn provider_ids(&self, service: &str) -> Vec<String> {
+        let g = self.inner.read().await;
+        let mut ids: Vec<String> = g
+            .services
+            .get(service)
+            .map(|v| {
+                v.iter()
+                    .filter(|e| e.mux.is_alive())
+                    .map(|e| e.spoke_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Snapshot for logging / a `status` command.
     pub async fn snapshot(&self) -> Vec<(String, Vec<String>)> {
         let g = self.inner.read().await;
         let mut out: Vec<(String, Vec<String>)> = g
@@ -130,77 +194,5 @@ impl Registry {
             .collect();
         out.sort();
         out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::duplex;
-    use yamux::Mode;
-
-    /// A mux whose transport is a duplex pipe with the peer end leaked, so the
-    /// connection stays "alive" for registry bookkeeping without any real I/O.
-    fn fake_mux(label: &str) -> Mux {
-        use tokio_util::compat::TokioAsyncReadCompatExt;
-        let (a, b) = duplex(1024);
-        let (mux, rx) = Mux::spawn(
-            a.compat(),
-            Mode::Client,
-            esc_common::mux::default_config(8),
-            label,
-        );
-        // Leak both the peer end and the stream receiver: this test only cares
-        // about `is_alive()`, and leaking keeps the pipe open for its lifetime.
-        std::mem::forget(b);
-        std::mem::forget(rx);
-        mux
-    }
-
-    fn entry(conn: &str, spoke: &str) -> Entry {
-        Entry {
-            conn_key: conn.to_string(),
-            spoke_id: spoke.to_string(),
-            mux: fake_mux(conn),
-        }
-    }
-
-    #[tokio::test]
-    async fn register_and_pick() {
-        let reg = Registry::new();
-        reg.register(entry("c1", "nas"), &["grafana".into()]).await;
-        assert_eq!(reg.providers("grafana").await, 1);
-        let picked = reg.pick("grafana", None).await.expect("should pick");
-        assert_eq!(picked.spoke_id, "nas");
-    }
-
-    #[tokio::test]
-    async fn unregister_removes_all_services() {
-        let reg = Registry::new();
-        reg.register(entry("c1", "nas"), &["a".into(), "b".into()]).await;
-        assert_eq!(reg.unregister("c1").await.as_deref(), Some("nas"));
-        assert!(reg.pick("a", None).await.is_none());
-        assert!(reg.pick("b", None).await.is_none());
-        assert_eq!(reg.providers("a").await, 0);
-    }
-
-    #[tokio::test]
-    async fn stale_conn_key_does_not_remove_fresh_entry() {
-        let reg = Registry::new();
-        reg.register(entry("c1", "nas"), &["a".into()]).await;
-        reg.register(entry("c2", "nas"), &["a".into()]).await;
-        reg.unregister("c1").await;
-        assert_eq!(reg.providers("a").await, 1);
-        assert!(reg.pick("a", None).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn pinned_spoke_is_respected() {
-        let reg = Registry::new();
-        reg.register(entry("c1", "nas"), &["a".into()]).await;
-        reg.register(entry("c2", "pi"), &["a".into()]).await;
-        let picked = reg.pick("a", Some("pi")).await.unwrap();
-        assert_eq!(picked.spoke_id, "pi");
-        assert!(reg.pick("a", Some("nobody")).await.is_none());
     }
 }

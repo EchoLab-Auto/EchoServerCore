@@ -1,0 +1,22 @@
+[package]
+name = "esc-plugin-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tunnel runtime as an in-process plugin (engine mounted into the host's Ctx)"
+
+[dependencies]
+esc-common = { workspace = true }
+esc-control-api = { workspace = true }
+esc-engine = { workspace = true }
+echo-context = { workspace = true }
+echo-plugin = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+esc-common = { workspace = true }

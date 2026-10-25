@@ -196,3 +196,42 @@ SAN: IP Address:127.0.0.1, DNS:localhost
 
 临时偶发的 3.35 s 单次尖峰出现在与压力测试并行时，串行复测延迟稳定在
 0.026–0.036 s，判断为带宽争用而非缺陷。
+
+## 插件化改造后的测试（2026-10-25）
+
+改造引入了「运行时增删映射」这一新能力，以及两个新的进程边界。测试按
+**能证明什么** 组织，而不是按 crate 组织：
+
+| 层 | 文件 | 证明了什么 |
+|---|---|---|
+| 引擎单测 | `crates/esc-engine/src/{store,config}.rs` | 映射表 CRUD / 冲突校验 / 原子落盘；旧 hub.toml、spoke.toml 仍能解析；内联 `[[mapping]]` 优先于 `[[service]]` |
+| 引擎集成 | `crates/esc-engine/tests/runtime_mapping.rs` | **spoke 已连接时加映射 → 现有连接被立即授权**（不需要重连）→ 数据穿过隧道 → 停用后端口释放 → 删除后记录消失 |
+| 插件 | `crates/esc-plugin-tunnel/src/lib.rs` | mount 后 `Ctx` 里出现 `esc.tunnel.control`；配置非法时挂载 fail-closed；引擎启动失败时调用方拿到明确错误而不是挂住 |
+| 面板 HTTP | `crates/esc-plugin-panel/tests/http_api.rs` | 每个 REST 端点对应正确的契约方法；URL 里的 `id` 覆盖 body；Basic 认证缺失即 401 且**不会**触达后端；非回环 + 无口令被配置校验拒绝 |
+| 端到端 | `crates/esc-plugin-panel/tests/e2e_host.rs` | 真子进程面板 + 真宿主 + 真引擎 + 真 spoke：HTTP 建映射 → 端口绑定 → 字节往返；宿主退出后面板进程消失 |
+
+手工冒烟（release 二进制）：
+
+```bash
+# CLI 回归：esc hub / esc spoke 行为不变
+esc pki init --out ./certs --host 127.0.0.1 --spoke s1
+esc check -c hub.toml --role hub && esc check -c spoke.toml --role spoke
+esc hub -c hub.toml & esc spoke -c spoke.toml & curl http://127.0.0.1:<svc>/
+
+# 宿主 + 面板：运行时加映射，curl 直接穿透
+esc-host -c host.toml &
+curl -su admin:口令 -X POST http://127.0.0.1:8787/api/mappings \
+  -H 'content-type: application/json' -d '{"name":"web","listen":"127.0.0.1:PORT","enabled":true}'
+curl http://127.0.0.1:PORT/          # → 后端内容
+```
+
+实测结果（本机，release）：
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --workspace` | 38 passed / 0 failed |
+| release 二进制体积 | `esc` 3.0 MB / `esc-host` 3.0 MB / `esc-plugin-panel` 1.5 MB |
+| 运行时加映射 → 数据可达 | ✅ 200，`providers` 立即出现现有 spoke |
+| 流量计数 | ✅ 单次请求记到 78 B 上行 / 207 B 下行 |
+| 停用映射 → 端口释放 | ✅ 后续 connect 被拒 |
+| 映射表落盘 | ✅ 0600，`[[mapping]]` 结构，重载可用 |

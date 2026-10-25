@@ -1,0 +1,15 @@
+[package]
+name = "esc-control-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Control-plane contract (DTO + trait) shared by the esc engine, plugins and panel"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

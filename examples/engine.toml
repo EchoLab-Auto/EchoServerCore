@@ -1,0 +1,39 @@
+# esc 引擎配置（hub / spoke 二选一，按 `[hub]` / `[spoke]` 段落自动判断）
+#
+# 与旧的 hub.toml / spoke.toml 相比只多了两个可选键：
+#   role  —— 显式声明角色（两个段落都写时必须给）
+#   store —— 映射表路径（默认是本文件同目录下的 mappings.toml）
+#
+# 首次启动会用下面的 [[service]] 播种映射表；之后映射表就是唯一事实来源，
+# 面板（或手工编辑 + 重新加载）改的是它，本文件里的 [[service]] 不再参与。
+
+role  = "hub"
+store = "/etc/esc/mappings.toml"
+
+[hub]
+listen = "0.0.0.0:4433"
+heartbeat_secs = 30
+# true：没有 spoke 提供服务时立即关掉公网连接（默认）
+# false：给 5 秒宽限期，容忍 spoke 正在重连
+reject_when_absent = true
+
+[tls]
+ca_cert = "/etc/esc/ca.pem"
+cert    = "/etc/esc/hub.pem"
+key     = "/etc/esc/hub.key"
+
+# 初始映射（只在映射表为空时生效）
+[[service]]
+name   = "4090-8080"
+listen = "0.0.0.0:2222"
+spoke  = "evence-4090"     # 可选：钉死到某个 spoke，别人无法顶替
+
+# ── spoke 角色的写法 ───────────────────────────────────────────────────
+# role = "spoke"
+# [spoke]
+# id     = "evence-4090"
+# server = "114.132.241.46:4433"
+# [tls] …（同上，换成 spoke 自己的证书）
+# [[service]]
+# name  = "4090-8080"
+# local = "127.0.0.1:8080"

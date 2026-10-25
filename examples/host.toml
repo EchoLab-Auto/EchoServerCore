@@ -1,0 +1,22 @@
+# 宿主配置：决定挂哪些插件、面板监听在哪。
+#
+# esc-host -c /etc/esc/host.toml
+
+[engine]
+# 引擎配置的路径（也可以把 [engine] 段直接写成引擎配置的内联形式）
+config = "/etc/esc/engine.toml"
+# 可选：覆盖映射表位置（默认取引擎配置同目录下的 mappings.toml）
+# store = "/etc/esc/mappings.toml"
+
+[panel]
+# false = 纯隧道模式，没有任何管理面
+enabled = true
+# 面板插件可执行文件；相对路径按宿主可执行文件所在目录解析
+command = "/usr/local/libexec/esc/esc-plugin-panel"
+
+# 原样透传给面板插件
+[panel.config]
+# 只绑回环；绑 0.0.0.0 必须配 auth，否则面板拒绝启动
+listen = "127.0.0.1:8787"
+auth   = "admin:换成你自己的口令"
+title  = "隧道面板"

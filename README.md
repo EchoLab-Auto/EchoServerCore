@@ -21,6 +21,12 @@
                          └──────────────────────────────────────────┘
 ```
 
+也可以加一层 **Web 面板**：`esc-host` 用插件框架把隧道内核（进程内插件）和
+面板（子进程插件）接起来，从此可以在浏览器里增删端口映射、看流量、踢掉某个
+spoke，**不需要重启**。面板与内核之间只有一份 JSON 契约，没有编译期耦合——
+面板挂掉、被换掉都不影响转发。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+与 [`docs/PANEL.md`](docs/PANEL.md)。
+
 ## 设计要点
 
 | 决策 | 原因 |
@@ -140,6 +146,47 @@ name  = "grafana"
 local = "127.0.0.1:3000"
 ```
 
+## Web 面板（可选）
+
+```bash
+cargo build --release \
+  --bin esc --bin esc-host --bin esc-plugin-panel
+
+# 引擎配置：旧的 hub.toml 直接能用，加两行即可
+#   role  = "hub"
+#   store = "/etc/esc/mappings.toml"
+esc-host -c /etc/esc/host.toml
+```
+
+`/etc/esc/host.toml`：
+
+```toml
+[engine]
+config = "/etc/esc/engine.toml"
+
+[panel]
+enabled = true
+command = "/usr/local/libexec/esc/esc-plugin-panel"
+
+[panel.config]
+listen = "127.0.0.1:8787"      # 默认只绑回环
+auth   = "admin:换成你的口令"    # 绑非回环地址时必填，否则插件拒绝启动
+title  = "隧道面板"
+```
+
+打开 `http://127.0.0.1:8787/` 就能：
+
+| 能做 | 说明 |
+|---|---|
+| 增删改映射 | 公网端口**立即**绑定 / 释放，不重启、不断已有连接 |
+| 看运行状态 | 每映射的连接数、活跃连接、上下行字节；spoke 列表与已授权服务 |
+| 钉住 provider | 一条映射只能由指定 spoke 提供，防止被别的机器顶替 |
+| 踢掉某个 spoke | 断开后它按退避重连并重新握手（用于让新映射生效） |
+| 导出静态配置 | 生成可直接喂给 `esc hub` / `esc spoke` 的 TOML |
+
+安全默认：没配 `auth` 时只允许监听回环地址；映射端口才是对公网开放的东西，
+面板本身不应该直接暴露（需要外网访问请用 SSH 隧道或前置反代）。
+
 ## 部署
 
 `deploy/` 下有加固好的 systemd 单元（`NoNewPrivileges`、`ProtectSystem=strict`、
@@ -191,7 +238,15 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 | Hub 重启 → Spoke 自动重连 | ✅ 0.40s 恢复 |
 | 常驻内存 | Hub 5.4 MB / Spoke 5.3 MB |
 
-单元测试 19 个，`cargo test --workspace` 全绿。
+测试共 38 个，`cargo test --workspace` 全绿。除了原有的协议 / 配置 / PKI 单测，
+新增部分覆盖了这次改造的关键承诺：
+
+| 用例 | 断言的事 |
+|---|---|
+| `esc-engine` 集成测试 | spoke 已连接时**动态**加映射能被立即授权、数据真的穿过去、停用后端口立即释放 |
+| `esc-plugin-tunnel` 测试 | 插件 mount 后 Ctx 里出现隧道服务；配置非法时 fail-closed |
+| `esc-plugin-panel` HTTP 测试 | 每个 REST 端点映射到正确的契约方法；URL 里的 id 覆盖 body；口令缺失即 401 |
+| `esc-plugin-panel` 端到端测试 | 浏览器 API → 子进程面板 → HostCall → 宿主 → 进程内插件 → 引擎 → spoke → 回显服务，全链路真实流量 |
 
 ## 已知边界（当前版本故意不做）
 
@@ -206,11 +261,20 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 
 ```
 crates/
-  esc-common/   配置、TLS、线协议、yamux 驱动、PKI
-  esc-hub/      公网侧：控制面接入 + 每服务一个监听器 + 注册表
-  esc-spoke/    内网侧：出站连接 + 退避重连 + 本地转发
-  esc-cli/      单个二进制 esc，子命令 hub / spoke / check / pki
+  esc-common/        配置、TLS、线协议、yamux 驱动、PKI
+  esc-engine/        可编程内核：动态端口绑定 / 注册表 / 映射表 / 计数管道
+  esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
+  esc-plugin-tunnel/ 进程内插件：把引擎注册进宿主的 Ctx
+  esc-plugin-panel/  子进程插件：axum + 单文件前端，只认契约
+  esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
+  esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
+  esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）
+  esc-cli/           单个二进制 esc，子命令 hub / spoke / check / pki
+  esc-host(二进制)   esc-host，宿主入口
 ```
+
+分层原则只有一个：**依赖方向永远指向 `esc-control-api` / `esc-common`**。
+面板不 import 引擎，引擎不 import 面板，宿主两边都不 import 实现细节。
 
 ```bash
 cargo test --workspace

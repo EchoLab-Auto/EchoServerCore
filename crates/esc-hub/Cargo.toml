@@ -7,16 +7,9 @@ description = "Hub (public server) side of echo-server-core"
 
 [dependencies]
 esc-common = { workspace = true }
+esc-engine = { workspace = true }
 tokio = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-yamux = { workspace = true }
-futures = { workspace = true }
-tokio-util = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

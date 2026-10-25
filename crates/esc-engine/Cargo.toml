@@ -1,0 +1,23 @@
+[package]
+name = "esc-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Programmable hub/spoke engine for echo-server-core (runtime add/remove of port mappings)"
+
+[dependencies]
+esc-common = { workspace = true }
+esc-control-api = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+yamux = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
