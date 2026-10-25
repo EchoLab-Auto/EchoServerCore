@@ -5,6 +5,7 @@ members = [
     "crates/esc-control-api",
     "crates/esc-panel-auth",
     "crates/esc-server-panel",
+    "crates/esc-gateway",
     "crates/esc-engine",
     "crates/esc-hub",
     "crates/esc-spoke",
@@ -72,6 +73,7 @@ esc-common = { path = "crates/esc-common" }
 esc-control-api = { path = "crates/esc-control-api" }
 esc-panel-auth = { path = "crates/esc-panel-auth" }
 esc-server-panel = { path = "crates/esc-server-panel" }
+esc-gateway = { path = "crates/esc-gateway" }
 esc-engine = { path = "crates/esc-engine" }
 esc-plugin-tunnel = { path = "crates/esc-plugin-tunnel" }
 esc-hub = { path = "crates/esc-hub" }

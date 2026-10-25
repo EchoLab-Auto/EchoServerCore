@@ -1,0 +1,81 @@
+# esc 网关：面板前面的认证反向代理
+#
+# 为什么要它：面板自带的 Basic 认证有三个不足——口令每次请求都在链路上、
+# 口令以明文存在配置里、无法按端口授权（2223 只能看映射，2224 能启停容器，
+# 却是同一套凭据）。网关把认证收拢到一处。
+#
+# 启动：esc-gateway -c /etc/esc/gateway.toml
+# 生成口令哈希：esc-gateway hash-password          （从标准输入读，不回显）
+# 校验配置：    esc-gateway check -c <本文件>
+
+title = "esc 网关"
+
+# 会话存活时间（小时）。进程重启会让所有会话失效（会话表在内存里）。
+session_ttl_hours = 8
+
+# cookie 名。多个网关实例共存时可以区分。
+cookie_name = "esc_gw"
+
+# 会话表上限。达到后按「最久未使用」淘汰。
+max_sessions = 4096
+
+# 是否信任 X-Forwarded-For。**强烈建议保持 false**。
+# 只有当你确定前面还有一层自己控制的反代会覆盖这个头时才打开。
+trust_forwarded_for = false
+
+# 是否给 cookie 加 Secure。**有 TLS 终结时必须打开**，否则 cookie 会走明文。
+# 注意：打开后纯 HTTP 访问会拿不到 cookie（浏览器不存 Secure cookie 到 http://）。
+secure_cookie = false
+
+[rate_limit]
+# 同一来源允许的登录失败次数
+max_failures = 8
+# 窗口（秒）
+fail_window_secs = 60
+# 全局失败上限（跨所有来源）。只按 IP 限速挡不住换 IP 爆破。
+max_failures_global = 200
+global_window_secs = 300
+
+# ── 用户 ────────────────────────────────────────────────────────────────
+#
+# hash 必须是 argon2id。**不接受明文**——配置里写明文等于把口令写进了备份、
+# 日志与 git 历史。生成方法：
+#
+#   esc-gateway hash-password
+#
+# routes 是该用户能访问的 route 名；["*"] = 全部。
+
+[[user]]
+name = "admin"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$请替换成你自己的哈希$请替换成你自己的哈希"
+routes = ["*"]
+
+# 只读账号：只能看端口映射面板，看不到能管 Docker 的那个。
+# [[user]]
+# name = "viewer"
+# hash = "$argon2id$..."
+# routes = ["tunnel-panel"]
+
+# ── 路由 ────────────────────────────────────────────────────────────────
+#
+# 一条 route = 一个公网端口 → 一个上游。
+# 面板要退到回环（并在面板配置里去掉 auth，认证交给网关）。
+
+[[route]]
+name = "tunnel-panel"
+listen = "0.0.0.0:2223"
+upstream = "127.0.0.1:18787"
+
+# 额外来源白名单（与用户认证是**与**关系）。空 = 不限。
+# allowed_cidrs = ["203.0.113.0/24", "198.51.100.7"]
+
+# 转发前剥掉的路径前缀（上游按 / 认路径时用）
+# strip_prefix = "/panel"
+
+# 请求体上限（字节）。null / 省略 = 全局默认 10 MB。
+# max_body_bytes = 1048576
+
+[[route]]
+name = "server-panel"
+listen = "0.0.0.0:2224"
+upstream = "127.0.0.1:18788"

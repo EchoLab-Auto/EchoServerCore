@@ -1,0 +1,11 @@
+# 构建上下文只需要源码与清单。排掉这些能显著减小上下文体积、加快构建。
+target/
+.git/
+**/*.rs.bk
+docs/
+*.md
+deploy/
+examples/
+.dockerignore
+Dockerfile
+docker-compose.yml
