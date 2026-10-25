@@ -325,16 +325,16 @@ systemctl enable --now esc-hub      # 旧的静态配置仍在，逐字节兼容
 
 ## 2026-10-25 在 cloud-server-2 的实际部署记录
 
-按上文流程实做了一遍，记下真实过程与数据。
+按上文流程实做了一遍。记下真实过程、踩到的两个坑与最终数据。
 
 ### 构建（在 cloud2 上从源码构建，不传二进制）
 
-cloud2 无外网 SSH 入口，二进制没法 `scp`；而它自己有 cargo + GitHub 可达，
-所以直接在上面构建：
+cloud2 没有对外 SSH 入口，二进制没法 `scp`；而它自己有 cargo + GitHub 可达，
+所以直接在机器上构建：
 
 ```bash
 cd /opt/src/EchoServerCore
-git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main   # 见下方坑 #9
+git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main   # 见坑 #9
 git merge --ff-only FETCH_HEAD
 cargo build --release -j 2 --bin esc --bin esc-host --bin esc-plugin-panel
 ```
@@ -353,47 +353,76 @@ cloud2 的 `/root/.gitconfig` 里有：
 url.https://gh-proxy.com/https://github.com/.insteadof https://github.com/
 ```
 
-它让 `git fetch https://github.com/...` 走国内镜像，但镜像的 main **滞后**——
+它让 `git fetch https://github.com/...` 走国内镜像，而镜像的 main **滞后**：
 `git fetch` 报 `Already up to date`，实际远端已有新提交。绕过办法是让
-`insteadof` 匹配不上（加显式端口即可）：
+`insteadof` 匹配不上——加显式端口即可：
 
 ```bash
 git fetch https://github.com:443/EchoLab-Auto/EchoServerCore.git main
 ```
 
 （`https://github.com:443/` 不匹配 `https://github.com/` 前缀，于是直连 GitHub。
-cloud2 到 github.com 本身是通的，只是慢一点。）
+cloud2 到 github.com 本身通，只是慢一点。）
 
 ### 切换（带自动回滚）
-
-停 `esc-hub`、起 `esc-host`，若 20s 内 `esc-host` 没 active 或 4433 没监听就
-自动回滚：
 
 ```bash
 systemctl disable --now esc-hub
 systemctl enable  --now esc-host
-# 失败则：systemctl disable --now esc-host && systemctl enable --now esc-hub
+# 20s 内 esc-host 没 active 或 4433 没监听 → 自动回滚：
+#   systemctl disable --now esc-host && systemctl enable --now esc-hub
 ```
 
-第一次切换**真的触发了回滚**（映射表被 root 写坏，见坑 #8），生产在约 20s 内
-自动恢复。修好属主后第二次切换成功。
+第一次切换**真的触发了回滚**（映射表属主被 root 写坏，见坑 #8），生产在
+约 20s 内自动恢复，没有任何人工介入。修好后又撞上坑 #10（只读文件系统），
+第三次才完全通过。
 
-### 结果
+### 最终状态
 
 | 检查项 | 结果 |
 |---|---|
 | `esc check -c /etc/esc/engine.toml --role hub` | ✅ 旧 hub.toml 兼容（`role`/`store` 被忽略） |
-| `systemctl is-active esc-host` | ✅ active，`enabled` |
-| 监听 | `0.0.0.0:4433`（控制）、`0.0.0.0:2222`（映射）、`127.0.0.1:8787`（面板） |
-| 常驻内存 | esc-host ~10 MB + esc-plugin-panel ~9 MB |
-| 面板认证 | 无口令 401，带口令 200 |
-| 映射表播种 | ✅ 从 `[[service]]` 播成 `[[mapping]]`，属主已修正为 `esc:esc 600` |
-| 运行时增删映射 | ✅ 通过面板 API 增、停、删，端口即时绑定/释放 |
-| 端到端 | ✅ 公网 2222 → spoke → 本机 8080（EchoAgent Panel）保持可用 |
+| `systemctl is-active esc-host` / `is-enabled` | ✅ active / enabled（`esc-hub` 已 disable） |
+| 监听 | `0.0.0.0:4433` 控制、`0.0.0.0:2222` 映射、`127.0.0.1:8787` 面板 |
+| 进程与内存 | `esc-host` RSS 6.5 MB（User=esc）+ `esc-plugin-panel` RSS 4.4 MB |
+| 面板认证 | 无口令 401；带口令 200，标题 `esc 隧道面板 · cloud-server-2` |
+| 映射表 | `/var/lib/esc/mappings.toml`，`esc:esc 600`，由 `[[service]]` 播种 |
+| 运行时增删映射 | ✅ POST 200 → `127.0.0.1:2399` 立即监听 → 落盘 → 停用 100ms 内释放 → 删除 |
+| 重启韧性 | ✅ `systemctl restart esc-host` 后 2s 内面板恢复、spoke 0.5s 重连、2222 继续 200 |
+| 端到端（本机侧） | ✅ 公网 2222 → spoke → 本机 8080，HTTP 200 / 5551 B / 32~130 ms |
+| TCP 探针（check-host 6 节点） | ✅ 6/6 连通，166–288 ms |
+| HTTP 探针（check-host 5 节点） | ✅ 5/5 `HTTP 200`，0.40–0.66 s |
+| 日志 ERROR | 0 条 |
 
-回滚方式（随时可用）：
+### 客户端侧同时升级
+
+本机（`evence-4090`）的 spoke 从改造前的旧二进制升到同一版本，用户级单元
+（`systemctl --user restart esc-spoke`）重连后 `granted=["4090-8080"]`，
+端到端继续 200。
+
+顺带验证了两件事：
+
+1. **线协议向后兼容**——升级前，旧 spoke 已经连着新 `esc-host` 正常工作
+   （`agent=esc/0.1.0`、`granted=["4090-8080"]`），说明改架构没动线上格式；
+2. **升级只影响自己那侧**——先升 hub、再升 spoke，中间隧道只断了约 0.5s。
+
+### 备份与回滚
+
+| 文件 | 备份 |
+|---|---|
+| `/usr/local/bin/esc` | `/usr/local/bin/esc.bak-20261025` |
+| `~/.local/bin/esc`（本机） | `~/.local/bin/esc.bak-20261025` |
+| `/etc/esc/hub.toml` + `esc-hub.service` | 原地保留（未删未改） |
 
 ```bash
+# 回滚整条链路
 systemctl disable --now esc-host
 systemctl enable  --now esc-hub      # 旧 unit 与 /etc/esc/hub.toml 都还在
+```
+
+面板凭据存在 cloud2 的 `/root/esc-panel-credentials.txt`（600 root）。外网访问
+用 SSH 转发，不要把 8787 开到公网：
+
+```bash
+ssh -L 8787:127.0.0.1:8787 root@114.132.241.46
 ```
