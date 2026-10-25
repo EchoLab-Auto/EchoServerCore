@@ -336,6 +336,86 @@ async fn wait_for_signal() {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 命令行
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 默认配置路径。
+pub const DEFAULT_CONFIG: &str = "/etc/esc/host.toml";
+
+/// 二进制入口的三种结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    Run(std::path::PathBuf),
+    Help,
+    Version,
+}
+
+/// 帮助文本。
+pub fn usage() -> String {
+    format!(
+        "esc-host {version} —— 隧道宿主（进程内隧道插件 + 子进程 Web 面板插件）
+
+用法:
+    esc-host [-c|--config <路径>]
+
+选项:
+    -c, --config <路径>   宿主配置，默认 {DEFAULT_CONFIG}
+                          也可用环境变量 ESC_HOST_CONFIG
+    -h, --help            显示本帮助后退出
+    -V, --version         显示版本后退出
+
+配置文件示例见仓库 examples/host.toml。",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// 解析命令行参数。
+///
+/// 单独抽出来的理由：`esc-host --help` 曾经会被当成「没给参数」而直接用默认
+/// 配置启动服务——在生产上是很难受的误操作（会去抢 4433/2222 端口）。所以
+/// **任何不认识的参数都必须报错退出**，而不是静默忽略。
+pub fn parse_args<I, S>(args: I) -> Result<Invocation, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut config: Option<std::path::PathBuf> = None;
+    let mut it = args.into_iter().map(Into::into).peekable();
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Invocation::Help),
+            "-V" | "--version" => return Ok(Invocation::Version),
+            "-c" | "--config" => {
+                let value = it.next().ok_or_else(|| format!("{arg} 需要一个路径参数"))?;
+                config = Some(std::path::PathBuf::from(value));
+            }
+            other if other.starts_with("--config=") => {
+                let value = other.trim_start_matches("--config=");
+                if value.is_empty() {
+                    return Err("--config= 后面需要一个路径".to_string());
+                }
+                config = Some(std::path::PathBuf::from(value));
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("不认识的选项 {other:?}\n\n{}", usage()));
+            }
+            // 位置参数也拒绝：这个程序没有位置参数，多给了说明是误用。
+            other => {
+                return Err(format!("多余的参数 {other:?}\n\n{}", usage()));
+            }
+        }
+    }
+
+    Ok(Invocation::Run(match config {
+        Some(path) => path,
+        None => std::path::PathBuf::from(
+            std::env::var("ESC_HOST_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string()),
+        ),
+    }))
+}
+
 /// 读配置 → 起宿主 → 等信号 → 优雅退出（二进制入口用它）。
 pub async fn run_until_signal(cfg_path: &Path, panel_program: Option<PathBuf>) -> anyhow::Result<()> {
     let cfg = HostConfig::load(cfg_path)?;
@@ -345,4 +425,52 @@ pub async fn run_until_signal(cfg_path: &Path, panel_program: Option<PathBuf>) -
     info!("shutdown signal received");
     host.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(args: &[&str]) -> Invocation {
+        parse_args(args.iter().copied()).expect("应当解析成功")
+    }
+
+    #[test]
+    fn no_args_uses_default_path() {
+        std::env::remove_var("ESC_HOST_CONFIG");
+        assert_eq!(run(&[]), Invocation::Run(DEFAULT_CONFIG.into()));
+    }
+
+    #[test]
+    fn help_and_version_short_circuit() {
+        assert_eq!(run(&["--help"]), Invocation::Help);
+        assert_eq!(run(&["-h"]), Invocation::Help);
+        assert_eq!(run(&["--version"]), Invocation::Version);
+        assert_eq!(run(&["-V"]), Invocation::Version);
+        // 帮助优先：即使后面还有别的参数也不去解析它们
+        assert_eq!(run(&["-h", "-c", "/nope"]), Invocation::Help);
+    }
+
+    #[test]
+    fn config_forms_are_equivalent() {
+        assert_eq!(run(&["-c", "/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
+        assert_eq!(run(&["--config", "/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
+        assert_eq!(run(&["--config=/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
+    }
+
+    #[test]
+    fn unknown_args_are_rejected_instead_of_being_ignored() {
+        // 这条是关键：不然 `esc-host --hlep` 会用默认配置把服务拉起来。
+        assert!(parse_args(["--hlep"]).is_err());
+        assert!(parse_args(["-x"]).is_err());
+        assert!(parse_args(["/tmp/whatever"]).is_err());
+        assert!(parse_args(["-c"]).is_err(), "-c 后面缺路径应报错");
+        assert!(parse_args(["--config="]).is_err());
+    }
+
+    #[test]
+    fn error_message_points_at_the_usage() {
+        let err = parse_args(["--nope"]).unwrap_err();
+        assert!(err.contains("用法"), "错误信息应带用法：{err}");
+    }
 }
