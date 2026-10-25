@@ -20,7 +20,8 @@ esc-server-panel ── 主机指标 + Docker 管理（:2224）   ← 本文
 | 网络 | 各接口累计与瞬时速率（排除回环）、总收发 |
 | 系统 | 主机名、发行版、内核、架构、运行时长 |
 | 磁盘 | 每个真实块设备的挂载点/设备/类型/使用率，`tmpfs`/`overlay` 等伪文件系统已过滤 |
-| Docker | 容器列表（状态灯、镜像、端口映射、Compose 项目分组）、启停/重启/暂停、日志、实时资源 |
+| Docker | 容器列表（状态灯、镜像、端口映射、Compose 项目分组、整栈启停）、启停/重启/暂停、**创建**、**删除**、**详情**、**改名**、**改重启策略**、增量日志、实时资源 |
+| 镜像 | 列表（标签/ID/大小/时间）、拉取（后台任务 + 进度）、删除 |
 | 进程 | Top 20（按 CPU 降序），PID/名称/CPU%/RSS/线程/用户/命令行 |
 
 页面每 3 秒轮询一次主机指标，每 6 秒刷新一次容器列表。单文件前端，没有构建步骤。
@@ -93,7 +94,9 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
 | `max_auth_failures` | `8` | 同一来源在窗口内的失败次数上限，超出 429 |
 | `auth_fail_window_secs` | `60` | 失败计数窗口 |
 | `docker_socket` | `/var/run/docker.sock` | Docker socket 路径 |
-| `allow_actions` | `true` | `false` = 纯只读监控（连按钮都不显示） |
+| `allow_actions` | `true` | 启停 / 重启 / 暂停 / 改名 / 改重启策略 |
+| `allow_create` | `true` | 创建容器、拉镜像 |
+| `allow_delete` | `true` | 删除容器 / 镜像（不可撤销，单独一道闸） |
 
 未知键会**报错**而不是忽略——`allow_action = false` 这种拼写错误如果被静默
 忽略，会变成「我明明关了啊」的谜案。
@@ -114,6 +117,16 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
 | GET | `/api/docker/containers/{id}/stats` | 单次资源采样 |
 | GET | `/api/docker/images` | 镜像列表 |
 | POST | `/api/docker/containers/{id}/{action}` | `start` / `stop` / `restart` / `pause` / `unpause` |
+| POST | `/api/docker/containers` | 创建容器（body 见下） |
+| DELETE | `/api/docker/containers/{id}` | 删除（强制停止后删） |
+| GET | `/api/docker/containers/{id}/detail` | 结构化详情（env/挂载/网络/重启策略…） |
+| POST | `/api/docker/containers/{id}/rename` | `{"name": "..."}` |
+| POST | `/api/docker/containers/{id}/restart-policy` | `{"policy": "unless-stopped"}` |
+| GET | `/api/docker/networks` | 网络名列表（创建时选） |
+| POST | `/api/docker/images/pull` | `{"image": "nginx:alpine"}` → 立刻返回 `{"job": "..."}` |
+| DELETE | `/api/docker/images/{name}` | 删除镜像 |
+| GET | `/api/docker/jobs` | 后台任务列表 |
+| GET | `/api/docker/jobs/{id}` | 单个任务状态（`running`/`done`/`failed`） |
 
 Docker 不可用时这些端点返回 **503**（服务不可用），而不是 500——前者说
 「这个功能在此环境不存在」，后者说「我们写错了」。
@@ -428,3 +441,143 @@ grep ^Groups /proc/$(systemctl show esc-server-panel -p MainPID --value)/status
 | 面板 start | ✅ 200 |
 | **面板 stop** | ⚠️ **第一次报 504，见下** |
 | 磁盘 | `/var/lib/docker` 204 KB（两个基础镜像），换到 33% |
+
+## Docker 管理能力（2026-10-25 补齐）
+
+早期的面板只够「看」：启停、日志快照、资源采样。下面这些是日常运维真正会
+用到、而且不该逼人回去敲 CLI 的部分。
+
+### 创建容器
+
+表单覆盖日常 90% 的字段：镜像、名称、命令（覆盖 CMD）、环境变量、端口映射、
+目录挂载、网络、重启策略、是否自启。
+
+```
+镜像     nginx:alpine          ← 不存在会自动拉取（可能要等几十秒）
+名称     web
+端口     8080:80              ← 每行一条；也支持 127.0.0.1:8443:443 与 53:53/udp
+环境     TZ=Asia/Shanghai
+挂载     /srv/www:/usr/share/nginx/html:ro
+重启策略 unless-stopped
+```
+
+创建出的容器会打上 `esc.panel=1` 标签——以后想分辨「哪些是从 Web 建的」,
+`docker ps --filter label=esc.panel` 就够了。
+
+**刻意不提供的字段**：`Privileged`、`CapAdd`、`PidMode`、`NetworkMode=host`、
+`--device`。把这些摆到 Web 表单上，等于把「一条命令拿到宿主机 root」包装成
+一个下拉框。需要那些能力就用 `docker run`——它至少有 shell history 留痕。
+
+### 删除
+
+强制停止后删除。前端有二次确认，并写明后果：容器内的临时数据会丢，
+挂载的卷/目录不受影响。
+
+### 详情
+
+Docker 的 `/containers/{id}/json` 有上千个字段、层级很深。面板把它收敛成
+固定形状（`ContainerDetail`），前端直接渲染——顺带这也就成了一层 API 契约：
+Docker 改字段时只需要改一处。
+
+展示：状态/退出码/启动时间、重启策略（**`no` 会标黄并提示「机器重启后不会
+自启」**）、端口、网络与 IP、工作目录、Entrypoint/Cmd、内存与 CPU 限制、
+是否特权、挂载、环境变量。
+
+### 改重启策略
+
+运维里最常见的一种补救：容器跑得好好的，机器一重启没起来——因为当初
+`docker run` 没带 `--restart`。面板现在能直接改成 `unless-stopped`。
+
+### 增量日志
+
+`GET /api/docker/containers/{id}/logs?tail=300&since=<unix秒>`
+
+Docker 的 `since` 有两个坑，都踩到了：
+
+1. **只认 unix 秒**。文档说也接受 RFC3339，但实测 29.8.x 对非法格式**静默
+   忽略**——「只要新日志」变成「返回全部」。前端增量刷新于是越滚越长、内容
+   重复。所以后端强制数字格式，传错直接 400。
+2. **粒度只到秒，且是「包含」语义**。同一秒内的行必然重复返回。前端因此按
+   RFC3339 时间戳**逐行去重**（同精度下字典序等价于时间序）。
+
+日志面板带「自动刷新」（2 秒）与「跟随底部」两个开关，日志量大时可以关掉
+跟随，慢慢往上翻。
+
+### 镜像管理
+
+- **拉取**走后台任务：`POST /api/docker/images/pull` 立刻返回 `job` id，
+  前端轮询 `/api/docker/jobs/{id}` 显示进度。
+  同步等是有害的：大镜像要十分钟，浏览器/代理早就超时，使用者看到「失败」
+  于是重试，两个拉取并行。给 job id 就不会有这种误解。
+- **删除**镜像会提示后果（有容器在用时它们会变成悬空）。
+- 镜像页会显示 daemon 的 `registry-mirrors`。**没配加速器 + 国内网络 = 基本
+  拉不动**，而 docker 的报错只会说 `failed to do request ... i/o timeout`，
+  完全指不到这里。
+
+### 整栈启停
+
+容器列表按 Compose 项目分组，组头带「全部启动 / 全部停止」。批量操作是
+**串行**的，某个失败也继续往下（一个坏容器不该拖住整栈）。结束后汇总
+「N 个成功 / M 个失败（首个错误原因）」。
+
+### 权限分级
+
+三个独立开关，都在 `[panel]` 同级（配置文件顶层）：
+
+| 开关 | 控制 |
+|---|---|
+| `allow_actions` | 启停 / 重启 / 暂停 / 改名 / 改重启策略 |
+| `allow_create` | 创建容器、拉镜像 |
+| `allow_delete` | 删除容器 / 镜像 |
+
+全关 = 纯只读监控（页面上连按钮都不出现，顶部显示「只读」）。常见组合：
+
+```toml
+# 值班同学：只能重启，不能建也不能删
+allow_actions = true
+allow_create  = false
+allow_delete  = false
+```
+
+前端会按开关隐藏按钮，后端每个写端点也各自校验（返回 403 并说明是哪个开关
+关着）——**不能只靠前端隐藏**。
+
+## 全部 API（Docker 部分）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/docker/containers` | 列表（含已停止） |
+| POST | `/api/docker/containers` | 创建（body 见下） |
+| GET | `/api/docker/containers/{id}` | Docker 原始 inspect JSON |
+| GET | `/api/docker/containers/{id}/detail` | 结构化详情 |
+| DELETE | `/api/docker/containers/{id}` | 删除（force） |
+| GET | `/api/docker/containers/{id}/logs?tail=&since=` | 日志（增量） |
+| GET | `/api/docker/containers/{id}/stats` | 单次资源采样 |
+| POST | `/api/docker/containers/{id}/{action}` | start/stop/restart/pause/unpause |
+| POST | `/api/docker/containers/{id}/rename` | `{"name": "..."}` |
+| POST | `/api/docker/containers/{id}/restart-policy` | `{"policy": "..."}` |
+| GET | `/api/docker/images` | 镜像列表 |
+| POST | `/api/docker/images/pull` | `{"image": "..."}` → `{"job": "..."}` |
+| DELETE | `/api/docker/images/{name}` | 删除镜像 |
+| GET | `/api/docker/networks` | 网络名列表 |
+| GET | `/api/docker/jobs` · `/api/docker/jobs/{id}` | 后台任务状态 |
+
+创建容器的 body（全部字段可选，除 `image`）：
+
+```json
+{
+  "image": "nginx:alpine",
+  "name": "web",
+  "cmd": ["nginx", "-g", "daemon off;"],
+  "env": ["TZ=Asia/Shanghai"],
+  "ports": ["8080:80", "53:53/udp"],
+  "binds": ["/srv/www:/usr/share/nginx/html:ro"],
+  "restart": "unless-stopped",
+  "network": "bridge",
+  "auto_start": true
+}
+```
+
+`restart` 取值：`no` / `always` / `unless-stopped` / `on-failure[:N]`。
+写错会 400 并列出允许值——`on-failure:x` 也曾被静默当成「不限次数」接受，
+现在会报「重试次数 'x' 不是数字」。
