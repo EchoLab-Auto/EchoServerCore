@@ -2133,3 +2133,51 @@ async fn a_disabled_port_stays_down_after_a_restart() {
     gw.token.cancel();
     _u.cancel();
 }
+
+#[tokio::test]
+async fn an_upstream_pointing_back_at_the_gateway_is_rejected() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    // 指向自己另**一个**转发端口：这是很容易手滑填出来的（"我以为填的是面板端口"），
+    // 而 config 层的 `upstream == listen` 检查拦不住它。表现是莫名其妙的 401
+    // （二次认证）或者 CPU 打满。
+    let other = gw.addr_of("admin-only").port();
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&format!("127.0.0.1:{other}")),
+    );
+    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
+    assert_eq!(r.status, 200, "应回表单并报错：{}", r.body);
+    assert!(r.body.contains("自环"), "{}", r.body);
+    assert!(gw.gw.rt_store.get("fresh").is_none(), "不该落盘");
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn an_upstream_pointing_at_the_admin_port_is_rejected_too() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_gateway_with_admin(up).await;
+    let admin = gw.admin_addr();
+    let c = login_at(&gw, admin, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    // 指到管理端口：更糟——业务端口的流量会撞进管理面。
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&format!("127.0.0.1:{}", admin.port())),
+    );
+    let r = post_form(admin, "/__admin/routes", &c, &body).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("自环"), "{}", r.body);
+    assert!(gw.gw.rt_store.get("fresh").is_none());
+
+    gw.token.cancel();
+    _u.cancel();
+}

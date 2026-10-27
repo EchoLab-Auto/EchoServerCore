@@ -1219,6 +1219,23 @@ impl RouteInput {
             .map(str::to_string)
             .collect();
 
+        // 上游不能指向本网关自己的任何一个监听端口：那会形成跨端口自环
+        // （最轻的表现是"二次认证"——401，最坏是打满一个核心）。
+        //
+        // `config` 层只拦得住 `upstream == listen` 这一种，因为它看不到
+        // admin_listen，也没法在单条路由的上下文里判断"这还是我自己"。
+        if let Ok(up) = self.upstream.parse::<std::net::SocketAddr>() {
+            let mine = gw.routes.all().iter().any(|r| r.listen.port() == up.port())
+                || gw.cfg.admin_listen.map(|a| a.port()) == Some(up.port());
+            if mine {
+                return Err(format!(
+                    "上游 {} 是这个网关自己的监听端口——转发过去会形成自环\
+                     （表现是莫名其妙的 401 或者 CPU 打满）。上游应该是面板的地址。",
+                    self.upstream
+                ));
+            }
+        }
+
         Ok(crate::config::RouteConfig {
             name,
             listen: self.listen.clone(),
