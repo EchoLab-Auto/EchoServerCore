@@ -36,12 +36,12 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use esc_panel_auth::{AccessControl, AuthConfig, Denied};
 use echo_plugin_sdk::echo_plugin_api::ServiceContribution;
 use echo_plugin_sdk::{
     async_trait, serve_stdio_with, Contribution, HostClient, InvokeOutcome, InvokeRequest,
     PluginHandler, ServeOptions,
 };
+use esc_panel_auth::{AccessControl, AuthConfig, Denied};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +81,15 @@ pub struct PanelConfig {
     /// 暴露到公网时这是最有效的一道锁：只放行自己常用的出口 IP 段，
     /// 别人连认证提示都拿不到。
     pub allow_cidrs: Vec<String>,
+    /// **显式**允许「无认证 + 非回环」。
+    ///
+    /// 默认 `false` 时，`listen` 不是回环又不配 `auth` 会拒绝启动——这是对的：
+    /// 一个能增删隧道映射的管理面裸奔在公网上，等于把「谁能往公网暴露什么」
+    /// 交给任何扫到这个端口的人。
+    ///
+    /// 设成 `true` 就是明确说"我知道它会无认证地公开"。仅适用于确实需要
+    /// 免登录访问的场景（而且通常应该配合 `allow_cidrs` 收窄来源）。
+    pub allow_no_auth: bool,
 }
 
 impl Default for PanelConfig {
@@ -93,6 +102,7 @@ impl Default for PanelConfig {
             max_auth_failures: 8,
             auth_fail_window_secs: 60,
             allow_cidrs: Vec::new(),
+            allow_no_auth: false,
         }
     }
 }
@@ -113,11 +123,19 @@ impl PanelConfig {
                 .and_then(Value::as_str)
                 .unwrap_or(&d.title)
                 .to_string(),
-            behind_proxy: v.get("behind_proxy").and_then(Value::as_bool).unwrap_or(false),
+            behind_proxy: v
+                .get("behind_proxy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             // 与访问控制有关的字段统一由共享 crate 解析，避免两套规则漂移。
             max_auth_failures: shared.max_auth_failures,
             auth_fail_window_secs: shared.auth_fail_window_secs,
             allow_cidrs: shared.allow_cidrs,
+            // 显式开关，默认 false（不在配置里就等于"不许无认证公网"）
+            allow_no_auth: v
+                .get("allow_no_auth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }
     }
 
@@ -139,10 +157,20 @@ impl PanelConfig {
         if self.listen.rsplit_once(':').is_none() {
             return Err(format!("listen 需要 host:port，收到 {:?}", self.listen));
         }
-        if self.auth.is_none() && !self.is_loopback_only() {
+        // `auth = ""` 等价于"没配 auth"。不这么归一化的话，空串会变成一个
+        // **口令为空的账号**——看起来关了认证，实际是谁也进不去（静默锁死）。
+        let has_auth = self
+            .auth
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_auth && !self.is_loopback_only() && !self.allow_no_auth {
             return Err(format!(
                 "listen = {:?} 不是回环地址，但没有配置 auth；\
-                 拒绝把无认证的管理面板暴露到网络上（改成 127.0.0.1:端口，或设置 auth = \"user:pass\"）",
+                 拒绝把无认证的管理面板暴露到网络上。\
+                 三条出路：① 改成 127.0.0.1:端口（推荐，用 SSH 隧道进来）；\
+                 ② 设置 auth = \"user:pass\"；\
+                 ③ 确实要免登录公开，就显式写 allow_no_auth = true（会打 WARN）",
                 self.listen
             ));
         }
@@ -155,7 +183,12 @@ impl PanelConfig {
     /// 把本配置里与访问控制相关的字段打包给 `esc-panel-auth`。
     pub fn auth_config(&self) -> AuthConfig {
         AuthConfig {
-            auth: self.auth.clone(),
+            // 空串归一到 None，理由同上：Some("") 是"空口令账号"，不是"不认证"。
+            auth: self
+                .auth
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             allow_cidrs: self.allow_cidrs.clone(),
             max_auth_failures: self.max_auth_failures,
             auth_fail_window_secs: self.auth_fail_window_secs,
@@ -275,7 +308,10 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/reload", post(api_reload))
         .route("/api/spokes/kick", post(api_kick))
         .route("/api/export", get(api_export))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -311,10 +347,15 @@ async fn api_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError>
 }
 
 async fn api_list(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(st.backend.call(method::MAPPING_LIST, Value::Null).await?))
+    Ok(Json(
+        st.backend.call(method::MAPPING_LIST, Value::Null).await?,
+    ))
 }
 
-async fn api_create(State(st): State<AppState>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
+async fn api_create(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(st.backend.call(method::MAPPING_UPSERT, body).await?))
 }
 
@@ -330,7 +371,10 @@ async fn api_update(
     Ok(Json(st.backend.call(method::MAPPING_UPSERT, body).await?))
 }
 
-async fn api_delete(State(st): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn api_delete(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         st.backend
             .call(method::MAPPING_DELETE, json!({ "id": id }))
@@ -349,18 +393,25 @@ async fn api_set_enabled(
         .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "缺少 enabled 字段".into()))?;
     Ok(Json(
         st.backend
-            .call(method::MAPPING_SET_ENABLED, json!({ "id": id, "enabled": enabled }))
+            .call(
+                method::MAPPING_SET_ENABLED,
+                json!({ "id": id, "enabled": enabled }),
+            )
             .await?,
     ))
 }
 
 async fn api_reload(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(st.backend.call(method::ENGINE_RELOAD, Value::Null).await?))
+    Ok(Json(
+        st.backend.call(method::ENGINE_RELOAD, Value::Null).await?,
+    ))
 }
 
-async fn api_kick(State(st): State<AppState>, body: Option<Json<Value>>) -> Result<Json<Value>, ApiError> {
-    let id = body
-        .and_then(|Json(v)| v.get("id").and_then(Value::as_str).map(str::to_string));
+async fn api_kick(
+    State(st): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, ApiError> {
+    let id = body.and_then(|Json(v)| v.get("id").and_then(Value::as_str).map(str::to_string));
     Ok(Json(
         st.backend
             .call(method::SPOKES_KICK, json!({ "id": id }))
@@ -427,7 +478,20 @@ impl Panel {
             let token = shutdown.clone();
             async move { token.cancelled().await }
         };
-        if !cfg.is_loopback_only() {
+        let has_auth = cfg.auth_config().auth.is_some();
+        if !cfg.is_loopback_only() && !has_auth {
+            // 无认证 + 公网：这是最显眼的一条，必须每次启动都喊，而且要具体
+            // 说明"此刻谁能做什么"——抽象地说"不安全"没人会当回事。
+            tracing::error!(
+                listen = %cfg.listen,
+                allow_cidrs = cfg.allow_cidrs.len(),
+                "⚠ 隧道面板正在**无认证**地监听非回环地址：{}。\
+                 任何能访问这个端口的人都可以查看全部隧道映射、新增/删除/启停映射、\
+                 踢掉 spoke —— 也就是说，谁都能把内网服务暴露到公网。\
+                 如果这不是你要的，去掉 allow_no_auth（或加回 auth / allow_cidrs）。",
+                cfg.listen
+            );
+        } else if !cfg.is_loopback_only() {
             // 这一条只打一次日志，但值得显眼：面板是明文 HTTP，
             // Basic 认证的口令在链路上就是 base64，等于明文。
             tracing::warn!(
@@ -509,7 +573,10 @@ impl PluginHandler for Panel {
         }
         let cfg = self.cfg.read().await.clone();
         let backend: Arc<dyn ControlBackend> = Arc::new(HostCallBackend::new(host));
-        match self.serve(backend, cfg.clone(), self.shutdown.clone()).await {
+        match self
+            .serve(backend, cfg.clone(), self.shutdown.clone())
+            .await
+        {
             Ok(addr) => {
                 tracing::info!(addr = %addr, "panel http server listening");
             }

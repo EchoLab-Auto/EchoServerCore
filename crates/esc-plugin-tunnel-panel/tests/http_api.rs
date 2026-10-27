@@ -24,7 +24,10 @@ struct Mock {
 #[async_trait::async_trait]
 impl ControlBackend for Mock {
     async fn call(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
-        self.calls.lock().unwrap().push((method.to_string(), params.clone()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), params.clone()));
         match method {
             method::STATUS => Ok(json!({
                 "role": "hub", "running": true, "version": "1.2.3", "uptime_secs": 42,
@@ -52,7 +55,10 @@ impl ControlBackend for Mock {
                     .unwrap_or(StatusCode::BAD_GATEWAY),
                 "端口 0.0.0.0:2222 已被映射 \"other\" 占用".to_string(),
             )),
-            other => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("unexpected {other}"))),
+            other => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unexpected {other}"),
+            )),
         }
     }
 }
@@ -105,9 +111,19 @@ async fn basic_auth_is_enforced_when_configured() {
 
     let (code, _) = common::http(&r.addr, "GET", "/api/status", None, None).await;
     assert_eq!(code, 401, "没有口令应 401");
-    assert!(r.mock.calls.lock().unwrap().is_empty(), "未认证的请求不应触达后端");
+    assert!(
+        r.mock.calls.lock().unwrap().is_empty(),
+        "未认证的请求不应触达后端"
+    );
 
-    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:wrong"))).await;
+    let (code, _) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:wrong")),
+    )
+    .await;
     assert_eq!(code, 401, "错误口令应 401");
 
     // healthz 也走同一层中间件（面板被反代探测时表现一致）
@@ -174,7 +190,14 @@ async fn mapping_crud_maps_onto_contract_methods() {
     assert_eq!(code, 200);
 
     // 缺字段要 400 而不是把空对象塞给引擎
-    let (code, _) = common::http(&r.addr, "POST", "/api/mappings/m1/enabled", Some("{}"), None).await;
+    let (code, _) = common::http(
+        &r.addr,
+        "POST",
+        "/api/mappings/m1/enabled",
+        Some("{}"),
+        None,
+    )
+    .await;
     assert_eq!(code, 400);
 
     // 核对契约调用序列
@@ -203,7 +226,14 @@ async fn mapping_crud_maps_onto_contract_methods() {
 async fn kick_and_export_work() {
     let r = start(None).await;
 
-    let (code, body) = common::http(&r.addr, "POST", "/api/spokes/kick", Some(r#"{"id":"sp-1"}"#), None).await;
+    let (code, body) = common::http(
+        &r.addr,
+        "POST",
+        "/api/spokes/kick",
+        Some(r#"{"id":"sp-1"}"#),
+        None,
+    )
+    .await;
     assert_eq!(code, 200);
     assert!(body.contains('1'));
 
@@ -215,7 +245,10 @@ async fn kick_and_export_work() {
     assert_eq!(calls[0].0, method::SPOKES_KICK);
     assert_eq!(calls[0].1.get("id").and_then(Value::as_str), Some("sp-1"));
     assert_eq!(calls[1].0, method::CONFIG_EXPORT);
-    assert_eq!(calls[1].1.get("role").and_then(Value::as_str), Some("spoke"));
+    assert_eq!(
+        calls[1].1.get("role").and_then(Value::as_str),
+        Some("spoke")
+    );
 
     r.token.cancel();
 }
@@ -244,7 +277,11 @@ async fn non_loopback_without_auth_is_rejected_by_config() {
     assert!(cfg.validate().is_ok());
 
     // 回环地址无需口令
-    let loopback = PanelConfig { listen: "127.0.0.1:8787".into(), auth: None, ..Default::default() };
+    let loopback = PanelConfig {
+        listen: "127.0.0.1:8787".into(),
+        auth: None,
+        ..Default::default()
+    };
     assert!(loopback.validate().is_ok());
 }
 
@@ -323,7 +360,10 @@ async fn auth_failures_are_rate_limited_after_the_configured_budget() {
     )
     .await;
     assert_eq!(code, 429, "超出失败预算应 429，实际 {code}: {body}");
-    assert!(r.mock.calls.lock().unwrap().is_empty(), "被限速的请求不应触达后端");
+    assert!(
+        r.mock.calls.lock().unwrap().is_empty(),
+        "被限速的请求不应触达后端"
+    );
 
     r.token.cancel();
 }
@@ -338,14 +378,42 @@ async fn successful_auth_resets_the_failure_counter() {
     .await;
 
     // 先错一次，然后用正确口令进来 —— 计数应被清零。
-    let _ = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:no"))).await;
-    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    let _ = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:no")),
+    )
+    .await;
+    let (code, _) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:s3cret")),
+    )
+    .await;
     assert_eq!(code, 200);
 
     // 若计数没被清零，这里第一次错就会撞到「3 次」预算。
-    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:no"))).await;
+    let (code, _) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:no")),
+    )
+    .await;
     assert_eq!(code, 401, "成功登录后计数应重置，不该直接 429");
-    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    let (code, _) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:s3cret")),
+    )
+    .await;
     assert_eq!(code, 200);
 
     r.token.cancel();
@@ -359,7 +427,14 @@ async fn allow_cidrs_lets_matching_sources_in_and_blocks_the_rest() {
         cfg.allow_cidrs = vec!["127.0.0.0/8".into()];
     })
     .await;
-    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    let (code, _) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:s3cret")),
+    )
+    .await;
     assert_eq!(code, 200, "白名单内的来源应放行");
     r.token.cancel();
 
@@ -369,9 +444,19 @@ async fn allow_cidrs_lets_matching_sources_in_and_blocks_the_rest() {
         cfg.allow_cidrs = vec!["10.0.0.0/8".into()];
     })
     .await;
-    let (code, body) = common::http(&r.addr, "GET", "/api/status", None, Some(&common::basic("admin:s3cret"))).await;
+    let (code, body) = common::http(
+        &r.addr,
+        "GET",
+        "/api/status",
+        None,
+        Some(&common::basic("admin:s3cret")),
+    )
+    .await;
     assert_eq!(code, 403, "白名单外的来源应 403，实际 {code}: {body}");
-    assert!(r.mock.calls.lock().unwrap().is_empty(), "白名单外的请求不应触达后端");
+    assert!(
+        r.mock.calls.lock().unwrap().is_empty(),
+        "白名单外的请求不应触达后端"
+    );
     r.token.cancel();
 }
 
@@ -389,5 +474,73 @@ async fn malformed_allow_cidrs_fail_config_validation() {
     assert!(cfg.validate().is_err());
 
     cfg.allow_cidrs = vec!["10.0.0.0/8".into(), "::1".into()];
-    assert!(cfg.validate().is_ok(), "IPv4 CIDR 与 IPv6 精确地址都应被接受");
+    assert!(
+        cfg.validate().is_ok(),
+        "IPv4 CIDR 与 IPv6 精确地址都应被接受"
+    );
+}
+
+// ── 无认证暴露的开关（allow_no_auth）────────────────────────────────────────
+
+/// 非回环 + 无 auth 默认**拒绝启动**。这是安全默认，不能因为"用户想省事"就放开。
+#[tokio::test]
+async fn non_loopback_without_auth_is_refused_by_default() {
+    let cfg = PanelConfig {
+        listen: "0.0.0.0:0".into(),
+        auth: None,
+        ..Default::default()
+    };
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("不是回环地址"), "{err}");
+    assert!(err.contains("allow_no_auth"), "错误信息要给出出路：{err}");
+}
+
+/// 显式写了 `allow_no_auth = true` 才允许。
+#[tokio::test]
+async fn allow_no_auth_makes_it_explicit() {
+    let cfg = PanelConfig {
+        listen: "0.0.0.0:0".into(),
+        auth: None,
+        allow_no_auth: true,
+        ..Default::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+/// `auth = ""` 必须等价于"没配"，不能变成一个空口令账号（那会静默锁死）。
+#[tokio::test]
+async fn empty_auth_means_no_auth() {
+    let loopback = PanelConfig {
+        listen: "127.0.0.1:2223".into(),
+        auth: Some("".into()),
+        ..Default::default()
+    };
+    assert!(loopback.validate().is_ok(), "回环 + 空 auth 应允许");
+    assert!(
+        loopback.auth_config().auth.is_none(),
+        "空串不能变成「需要认证」"
+    );
+
+    // 公网 + 空 auth 仍要拒绝（除非显式 allow_no_auth）
+    let public = PanelConfig {
+        listen: "0.0.0.0:2223".into(),
+        auth: Some("  ".into()),
+        ..Default::default()
+    };
+    assert!(public.validate().is_err(), "空白串也算没配");
+}
+
+/// 真跑起来：无认证时后端能被直接调用（这就是"关掉认证"的实际效果）。
+#[tokio::test]
+async fn without_auth_requests_reach_the_backend() {
+    let r = start_with(|cfg| {
+        cfg.auth = None;
+        cfg.allow_no_auth = true;
+    })
+    .await;
+
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, None).await;
+    assert_eq!(code, 200, "无认证时不该 401");
+    assert!(!r.mock.calls.lock().unwrap().is_empty(), "请求应直达后端");
+    r.token.cancel();
 }

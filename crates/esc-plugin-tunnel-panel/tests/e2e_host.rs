@@ -60,7 +60,9 @@ async fn spawn_echo() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let mut buf = [0u8; 1024];
                 loop {
@@ -292,7 +294,14 @@ title  = "e2e 面板"
     .await;
 
     // 6) 删除
-    let (code, _) = common::http(&addr, "DELETE", &format!("/api/mappings/{id}"), None, Some(&auth)).await;
+    let (code, _) = common::http(
+        &addr,
+        "DELETE",
+        &format!("/api/mappings/{id}"),
+        None,
+        Some(&auth),
+    )
+    .await;
     assert_eq!(code, 200);
     let (_, body) = common::http(&addr, "GET", "/api/mappings", None, Some(&auth)).await;
     assert_eq!(body.trim(), "[]", "删除后列表应为空: {body}");
@@ -391,7 +400,9 @@ enabled = false
     assert_eq!(view.providers, vec!["e2e-spoke".to_string()]);
     let bound: SocketAddr = view.bound.clone().unwrap().parse().unwrap();
 
-    let got = roundtrip(bound, b"through-the-host").await.expect("隧道应能转发");
+    let got = roundtrip(bound, b"through-the-host")
+        .await
+        .expect("隧道应能转发");
     assert_eq!(got, b"through-the-host");
 
     host.shutdown().await;

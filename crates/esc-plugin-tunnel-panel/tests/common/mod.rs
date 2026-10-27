@@ -95,7 +95,11 @@ impl CertFixture {
 
         let (hub_cert, hub_key) = if server {
             let pair = ca
-                .issue_server("hub", &["127.0.0.1".to_string(), "localhost".to_string()], 1)
+                .issue_server(
+                    "hub",
+                    &["127.0.0.1".to_string(), "localhost".to_string()],
+                    1,
+                )
                 .unwrap();
             esc_common::pki::write_pair(&dir.join("hub"), "hub", &pair).unwrap()
         } else {
@@ -109,7 +113,14 @@ impl CertFixture {
             (hub_cert.clone(), hub_key.clone())
         };
 
-        Self { ca: ca_path, hub_cert, hub_key, spoke_cert, spoke_key, dir }
+        Self {
+            ca: ca_path,
+            hub_cert,
+            hub_key,
+            spoke_cert,
+            spoke_key,
+            dir,
+        }
     }
 }
 
