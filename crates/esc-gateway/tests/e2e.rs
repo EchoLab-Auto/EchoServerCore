@@ -1928,3 +1928,43 @@ upstream = "127.0.0.1:18788"
     let cfg2: esc_gateway::GatewayConfig = toml::from_str(&raw2).unwrap();
     assert!(cfg2.validate().is_err());
 }
+
+#[tokio::test]
+async fn the_routes_page_explains_the_dedicated_admin_port() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_gateway_with_admin(up).await;
+    let admin = gw.admin_addr();
+    let c = login_at(&gw, admin, "admin", "pw-123").await.unwrap();
+
+    let r = http(admin, "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    // 独立端口下不该再说"删掉这个端口会把当前连接断掉"——那是挂在业务端口上
+    // 才成立的警告，说错了会让人以为删业务端口有风险。
+    assert!(
+        r.body.contains("独立的管理端口"),
+        "该页要说明自己是独立端口：{}",
+        r.body
+    );
+    assert!(!r.body.contains("删掉它会把当前连接一起断掉"));
+
+    // 没配 admin_listen 的网关则相反
+    let (gw2, _d2) = start_admin_gateway(up).await;
+    let c2 = login(&gw2, "admin", "pw-123").await.unwrap();
+    let r = http(
+        gw2.addr(),
+        "GET",
+        "/__admin/routes",
+        &[("cookie", &c2)],
+        None,
+    )
+    .await;
+    assert!(
+        r.body.contains("删掉它会把当前连接一起断掉"),
+        "挂在业务端口上时要给出这条警告：{}",
+        r.body
+    );
+
+    gw.token.cancel();
+    gw2.token.cancel();
+    _u.cancel();
+}

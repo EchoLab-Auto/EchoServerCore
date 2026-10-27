@@ -373,9 +373,13 @@ onsubmit=\"return confirm('删除端口 {n}？它会立刻停止监听。')\">\
 <span class=\"hint\">保存即生效：先绑端口，绑不上就整体不变（不会出现改了一半）。</span></div>",
     );
     body.push_str(&format!(
-        "<p class=\"hint\">你现在是从端口 <span class=\"mono\">{}</span> 访问管理面板的。\
-删掉这个端口会把当前连接一起断掉，所以面板不允许这么做。</p>",
-        v.current_port
+        "<p class=\"hint\">你现在是从端口 <span class=\"mono\">{}</span> 访问管理面板的。{}</p>",
+        v.current_port,
+        if v.dedicated_admin {
+            "它是独立的管理端口，不参与转发——所以删业务端口不会把自己关在外面。"
+        } else {
+            "管理面板挂在这个端口上，删掉它会把当前连接一起断掉，所以面板不允许这么做。"
+        }
     ));
 
     layout(&v.title, &v.actor, v.is_admin, "routes", &body)

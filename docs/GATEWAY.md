@@ -595,7 +595,7 @@ docker inspect esc-gateway --format '{{.State.Health.Status}}'
 
 ## 测试
 
-123 个测试（81 单测 + 42 端到端）。端到端用真实 TCP + 真实上游，覆盖：
+124 个测试（81 单测 + 43 端到端）。端到端用真实 TCP + 真实上游，覆盖：
 
 - 302/401 判定（含 `Sec-Fetch-Mode` 与 Accept 的各种组合）
 - 登录 → 转发 → 登出失效的完整链路
