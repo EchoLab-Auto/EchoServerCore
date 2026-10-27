@@ -166,7 +166,7 @@ pub async fn handle(
         (false, ["routes", name]) => ctx.route_form_edit(name),
         (true, ["routes", name]) => ctx.route_update(name, req).await,
         (true, ["routes", name, "delete"]) => ctx.route_delete(name).await,
-        (true, ["routes", name, "adopt"]) => ctx.route_adopt(name),
+        (true, ["routes", name, "enable"]) => ctx.route_enable(name).await,
 
         // 会话
         (false, ["sessions"]) => ctx.sessions_page(),
@@ -568,7 +568,7 @@ impl Ctx<'_> {
                 web::RouteRow {
                     name: e.spec.name.clone(),
                     source_label: e.source.label().to_string(),
-                    editable: e.source.editable(),
+                    disabled: e.disabled,
                     listen: e.spec.listen.clone(),
                     upstream: e.spec.upstream.clone(),
                     detail: route_detail(&e.spec),
@@ -611,13 +611,16 @@ impl Ctx<'_> {
         for e in self.gw.effective_routes() {
             if e.source == crate::routes::RouteSource::StoreOverConfig {
                 v.push(Banner::warn(format!(
-                    "端口 `{}` 同时存在于路由库和 gateway.toml，当前以路由库为准。",
+                    "端口 `{}` 在 gateway.toml 里也有一条（只读文件），当前以路由库为准。",
                     e.spec.name
                 )));
             }
         }
         // 名字存在于账号 ACL 里、但端口已经不在了——这类"悬空引用"会让那个
         // 账号以为自己在用某个面板，其实已经没了，早点说出来。
+        //
+        // 已下架的端口也算"不在了"：它不监听，授权给它的人访问不到任何东西。
+        // 区分"彻底不存在"和"被下架"没意义，反正都进不去。
         let names = self.gw.route_names();
         for a in self.gw.accounts() {
             let dangling: Vec<&String> = a
@@ -655,9 +658,10 @@ impl Ctx<'_> {
             return self.not_found_route(name);
         };
         let mut banners = self.flash.banners();
-        if !e.source.editable() {
+        if e.source == crate::routes::RouteSource::Config {
             banners.push(Banner::warn(format!(
-                "端口 {name} 来自 gateway.toml，面板里改不了。保存前要先在列表里「接管」它。"
+                "端口 {name} 现在定义在 gateway.toml 里（只读文件）。\
+                 保存时会自动在路由库生成一条同名条目接管它——不用多点一步。"
             )));
         }
         self.render_route_form(RouteFormState {
@@ -687,7 +691,8 @@ impl Ctx<'_> {
             Ok(s) => s,
             Err(e) => return self.render_route_form(input.to_state(true, false, e)),
         };
-        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), true) {
+        let known = self.gw.route_names();
+        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), true, &known) {
             Ok(v) => v,
             Err(e) => return self.render_route_form(input.to_state(true, false, e)),
         };
@@ -703,13 +708,7 @@ impl Ctx<'_> {
         let Some(e) = self.route(name) else {
             return self.not_found_route(name);
         };
-        if !e.source.editable() {
-            return self.done(
-                false,
-                &format!("{PREFIX}/routes"),
-                &format!("端口 {name} 来自 gateway.toml，面板里改不了。先点「接管」。"),
-            );
-        }
+        let from_config = e.source == crate::routes::RouteSource::Config;
         let form = match read_form(req).await {
             Ok(f) => f,
             Err(e) => return text(StatusCode::BAD_REQUEST, e),
@@ -720,12 +719,24 @@ impl Ctx<'_> {
             Ok(s) => s,
             Err(e) => return self.render_route_form(input.to_state(false, true, e)),
         };
-        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), false) {
+        let known = self.gw.route_names();
+        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), false, &known) {
             Ok(v) => v,
             Err(e) => return self.render_route_form(input.to_state(false, true, e)),
         };
-        self.apply_route_change(spec, pending, action, &format!("{PREFIX}/routes"), false)
-            .await
+        let extra = if from_config {
+            "（它在 gateway.toml 里那条现在被覆盖了，面板从此管它）".to_string()
+        } else {
+            String::new()
+        };
+        self.apply_route_change(
+            spec,
+            pending,
+            format!("{action}{extra}"),
+            &format!("{PREFIX}/routes"),
+            false,
+        )
+        .await
     }
 
     async fn route_delete(&self, name: &str) -> HyperResponse<ProxyBody> {
@@ -733,13 +744,6 @@ impl Ctx<'_> {
         let Some(e) = self.route(name) else {
             return self.not_found_route(name);
         };
-        if !e.source.editable() {
-            return self.done(
-                false,
-                &back,
-                &format!("端口 {name} 来自 gateway.toml，请改配置文件删掉它"),
-            );
-        }
         // 删掉自己脚下的端口 = 立刻把自己的连接掐了，用户看到的是「页面加载失败」。
         if e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local) {
             return self.done(
@@ -752,67 +756,70 @@ impl Ctx<'_> {
                 ),
             );
         }
-        if self.gw.effective_routes().len() <= 1 {
+        // 管理面板挂在某个业务端口上时，删光业务端口会把自己关在外面。
+        // 配了独立管理端口之后这个顾虑不存在（面板还能进，可以从那里加回来）。
+        let enabled = self
+            .gw
+            .effective_routes()
+            .iter()
+            .filter(|r| !r.disabled)
+            .count();
+        if enabled <= 1 && self.gw.cfg.admin_listen.is_none() {
             return self.done(
                 false,
                 &back,
-                "这是最后一个端口，删掉之后网关什么都不转发（也包括管理面板）。先加一个新的。",
+                "这是最后一个生效的端口，删掉之后连管理面板也进不来了（它就挂在这个端口上）。\
+                 要么先加一个新的端口，要么配 admin_listen 让管理面板独占一个端口。",
             );
         }
-        let (pending, action) = match self.gw.rt_store.stage_delete(name) {
+
+        let (pending, action) = match self.gw.rt_store.stage_disable(&e.spec) {
             Ok(v) => v,
             Err(e) => return self.done(false, &back, &e),
         };
-        // 同步版：删端口不需要绑新套接字，直接写盘 + 换注册表 + 停监听。
-        if let Err(e) = self
-            .gw
-            .rt_store
-            .commit(&self.actor, pending.clone(), &action)
-        {
-            return self.done(false, &back, &e);
-        }
+        // 下架不需要绑新套接字，但**要**换注册表 + 停监听，所以还是走两阶段。
         let runtimes = match self.gw.candidate_runtimes(&pending) {
             Ok(r) => r,
-            Err(e) => {
-                // 这种情况理论上不会发生（删一条只会减少冲突），但真发生了
-                // 要能说出来，而不是留一个"文件和内存不一致"的烂摊子。
-                tracing::error!(error = %e, "删除端口后合并结果不合法");
-                return self.done(false, &back, &format!("删除后配置不合法：{e}"));
-            }
+            Err(e) => return self.done(false, &back, &format!("下架后配置不合法：{e}")),
         };
         let prepared = match self.gw.listeners.prepare(&runtimes).await {
             Ok(p) => p,
             Err(e) => return self.done(false, &back, &e),
         };
+        if let Err(e) = self.gw.rt_store.commit(&self.actor, pending, &action) {
+            // prepared 在这里被 drop：刚绑的套接字全放掉，一切照旧
+            return self.done(false, &back, &e);
+        }
         self.gw.commit_routes(runtimes, prepared);
-        tracing::info!(actor = %self.actor, target = %name, source = ?self.source, "route deleted");
-        self.done(true, &back, &format!("端口 {name} 已删除，监听已停止"))
+        tracing::info!(
+            actor = %self.actor, target = %name, source = ?self.source,
+            from_config = e.source == crate::routes::RouteSource::Config,
+            "route disabled"
+        );
+        self.done(
+            true,
+            &back,
+            &format!("端口 {name} 已下架，监听已停止。定义还留着——需要时点「恢复」。"),
+        )
     }
 
-    fn route_adopt(&self, name: &str) -> HyperResponse<ProxyBody> {
+    async fn route_enable(&self, name: &str) -> HyperResponse<ProxyBody> {
         let back = format!("{PREFIX}/routes");
-        let Some(e) = self.route(name) else {
-            return self.not_found_route(name);
+        let (pending, action) = match self.gw.rt_store.stage_enable(name) {
+            Ok(v) => v,
+            Err(e) => return self.done(false, &back, &e),
         };
-        if e.source != crate::routes::RouteSource::Config {
-            return self.done(false, &back, &format!("端口 {name} 已经在路由库里了"));
-        }
-        let (pending, action) = match self.gw.rt_store.stage_adopt(&e.spec) {
+        // 恢复要重新绑端口，走完整的两阶段
+        let (runtimes, prepared) = match self.gw.prepare_routes(&pending).await {
             Ok(v) => v,
             Err(e) => return self.done(false, &back, &e),
         };
         if let Err(e) = self.gw.rt_store.commit(&self.actor, pending, &action) {
             return self.done(false, &back, &e);
         }
-        tracing::info!(actor = %self.actor, target = %name, "config route adopted into the store");
-        self.done(
-            true,
-            &back,
-            &format!(
-                "端口 {name} 已接管进路由库，现在可以编辑了。\
-                 gateway.toml 里那条现在被覆盖——建议删掉以免混淆。"
-            ),
-        )
+        self.gw.commit_routes(runtimes, prepared);
+        tracing::info!(actor = %self.actor, target = %name, source = ?self.source, "route enabled");
+        self.done(true, &back, &format!("端口 {name} 已恢复，正在监听"))
     }
 
     /// 新建 / 修改端口：两阶段热应用。
@@ -824,7 +831,7 @@ impl Ctx<'_> {
     async fn apply_route_change(
         &self,
         spec: crate::config::RouteConfig,
-        pending: std::collections::BTreeMap<String, crate::config::RouteConfig>,
+        pending: crate::routes::Pending,
         action: String,
         back: &str,
         creating: bool,

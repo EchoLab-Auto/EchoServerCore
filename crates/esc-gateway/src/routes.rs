@@ -48,6 +48,10 @@ pub enum RouteSource {
     Config,
     Store,
     StoreOverConfig,
+    /// 来自配置文件的端口，被面板下架了。
+    ConfigDisabled,
+    /// 来自路由库的端口，被面板下架了。
+    StoreDisabled,
 }
 
 impl RouteSource {
@@ -56,10 +60,13 @@ impl RouteSource {
             Self::Config => "配置文件（只读）",
             Self::Store => "路由库",
             Self::StoreOverConfig => "路由库（覆盖了配置文件）",
+            Self::ConfigDisabled => "配置文件（已下架）",
+            Self::StoreDisabled => "路由库（已下架）",
         }
     }
+    /// 现在能不能编辑。**都能**——面板会隐式接管，不需要用户先点「接管」。
     pub fn editable(self) -> bool {
-        !matches!(self, Self::Config)
+        true
     }
 }
 
@@ -68,6 +75,8 @@ impl RouteSource {
 pub struct EffectiveRoute {
     pub spec: RouteConfig,
     pub source: RouteSource,
+    /// 已下架：不监听，但列在面板里可恢复。
+    pub disabled: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,11 +88,30 @@ pub struct EffectiveRoute {
 struct StoreFile {
     #[serde(default)]
     route: Vec<RouteConfig>,
+    /// 被面板**下架**的端口。存的是下架那一刻的完整定义，所以能一键恢复。
+    ///
+    /// 为什么需要它：配置文件里的端口面板删不掉（文件是只读的、也不该被程序
+    /// 改写）。没有墓碑的话，"删除"会变成"删掉路由库里那条覆盖项，然后配置
+    /// 里那条又冒出来"。墓碑让"下架"成为一个可表达的稳定状态。
+    #[serde(default)]
+    disabled: Vec<RouteConfig>,
+}
+
+/// 一次改动的候选状态：生效的 + 已下架的。
+///
+/// 两者必须一起进两阶段流程。漏掉 `disabled` 就会出现"文件里下架了、内存里还在
+/// 监听"，或者反过来——两种都是要人命的（端口占着却管不着）。
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub routes: BTreeMap<String, RouteConfig>,
+    pub disabled: BTreeMap<String, RouteConfig>,
 }
 
 #[derive(Debug)]
 struct State {
     routes: BTreeMap<String, RouteConfig>,
+    /// 已下架的端口（下架时的快照）。它们不监听，但列在面板里可以恢复。
+    disabled: BTreeMap<String, RouteConfig>,
     writable: bool,
     note: Option<String>,
     rejected: Vec<String>,
@@ -102,6 +130,7 @@ impl RouteStore {
     pub fn load(path: Option<&Path>) -> Self {
         let mut st = State {
             routes: BTreeMap::new(),
+            disabled: BTreeMap::new(),
             writable: false,
             note: None,
             rejected: Vec::new(),
@@ -130,6 +159,16 @@ impl RouteStore {
                                     }
                                 }
                                 Err(e) => st.rejected.push(e),
+                            }
+                        }
+                        for r in file.disabled {
+                            // 下架的条目也要求能解析——解析不了说明配置写坏了，
+                            // 静默忽略会让人以为"恢复"按钮丢了。
+                            match r.to_runtime() {
+                                Ok(_) => {
+                                    st.disabled.insert(r.name.clone(), r);
+                                }
+                                Err(e) => st.rejected.push(format!("（已下架）{e}")),
                             }
                         }
                     }
@@ -189,104 +228,84 @@ impl RouteStore {
     pub fn all(&self) -> Vec<RouteConfig> {
         self.lock().routes.values().cloned().collect()
     }
+    /// 已下架的端口（下架时的快照）。
+    pub fn all_disabled(&self) -> Vec<RouteConfig> {
+        self.lock().disabled.values().cloned().collect()
+    }
+    pub fn disabled_count(&self) -> usize {
+        self.lock().disabled.len()
+    }
     pub fn recent(&self) -> Vec<Audit> {
         self.lock().recent.iter().cloned().collect()
     }
 
-    /// 新建或替换一条路由（**只改内存候选**，写盘由 [`Self::commit`] 负责）。
+    /// 写入一条路由的候选状态（新建或覆盖）。
     ///
-    /// 这里刻意不判断"能不能绑上"——那是 [`ListenerSet::prepare`] 的事。
-    /// 两阶段的意义就是把"能不能"和"写不写"分开。
+    /// **不再要求「先接管」**：面板改一条来自 `gateway.toml` 的端口时，直接在这里
+    /// 生成一条同名的库内条目——效果就是隐式接管。用户不必先理解两个文件的关系
+    /// 才能编辑；显式的「接管」按钮因此去掉了。
+    ///
+    /// 只拦一种情况：**新建**时名字已被占用（库里或配置里）。同名新增会覆盖掉一个
+    /// 正在服务的端口，而用户以为自己只是加了一个。
+    ///
+    /// 这里刻意不判断"能不能绑上"——那是 [`ListenerSet::prepare`] 的事。两阶段的
+    /// 意义就是把"能不能"和"写不写"分开。
     pub fn stage(
         &self,
         spec: RouteConfig,
         creating: bool,
-    ) -> Result<(BTreeMap<String, RouteConfig>, String), String> {
-        let st = self.lock();
-        if !st.writable {
-            return Err(format!(
-                "路由库是只读的，改动无法保存{}",
-                st.note
-                    .as_ref()
-                    .map(|n| format!("（{n}）"))
-                    .unwrap_or_default()
-            ));
+        known_names: &[String],
+    ) -> Result<(Pending, String), String> {
+        let st = self.readonly_check()?;
+        if creating && known_names.iter().any(|n| n == &spec.name) {
+            return Err(format!("端口名 {} 已经存在（换一个名字）", spec.name));
         }
-        if creating && st.routes.contains_key(&spec.name) {
-            return Err(format!("路由 {:?} 在路由库里已存在", spec.name));
-        }
-        if !creating && !st.routes.contains_key(&spec.name) {
-            return Err(format!(
-                "路由 {:?} 不在路由库里（可能来自 gateway.toml，需要先「接管」）",
-                spec.name
-            ));
-        }
-        let mut pending = st.routes.clone();
-        pending.insert(spec.name.clone(), spec.clone());
-
+        let mut p = st.pending();
+        // 从"已下架"里编辑 = 顺手恢复它。否则改完还是不生效，很费解。
+        p.disabled.remove(&spec.name);
+        p.routes.insert(spec.name.clone(), spec.clone());
         let verb = if creating {
             "新建端口"
         } else {
             "修改端口"
         };
-        // 记账推迟到 commit：写盘失败时不该留下一条"已修改"的假记录。
-        Ok((pending, format!("{verb} {}", spec.name)))
+        Ok((p, format!("{verb} {}", spec.name)))
     }
 
-    /// 删掉一条（内存候选）。
-    pub fn stage_delete(
-        &self,
-        name: &str,
-    ) -> Result<(BTreeMap<String, RouteConfig>, String), String> {
-        let st = self.lock();
-        if !st.writable {
-            return Err(format!(
-                "路由库是只读的，改动无法保存{}",
-                st.note
-                    .as_ref()
-                    .map(|n| format!("（{n}）"))
-                    .unwrap_or_default()
-            ));
-        }
-        let mut pending = st.routes.clone();
-        if pending.remove(name).is_none() {
-            return Err(format!(
-                "路由 {name:?} 不在路由库里（如果它来自 gateway.toml，请改配置文件）"
-            ));
-        }
-        Ok((pending, format!("删除端口 {name}")))
+    /// 下架一条路由（内存候选）。
+    ///
+    /// 不下架的话，来自配置文件的端口"删不掉"——它是只读文件里的一条，
+    /// 删掉库里的覆盖项只会让它又冒出来。所以下架 = 在 `disabled` 里留一个墓碑
+    /// （带完整定义），恢复时原样搬回来。
+    pub fn stage_disable(&self, spec: &RouteConfig) -> Result<(Pending, String), String> {
+        let st = self.readonly_check()?;
+        let mut p = st.pending();
+        p.routes.remove(&spec.name);
+        p.disabled.insert(spec.name.clone(), spec.clone());
+        Ok((p, format!("下架端口 {}", spec.name)))
     }
 
-    /// 把 `gateway.toml` 里的路由接管进路由库（内存候选）。
-    pub fn stage_adopt(
-        &self,
-        spec: &RouteConfig,
-    ) -> Result<(BTreeMap<String, RouteConfig>, String), String> {
-        let st = self.lock();
-        if !st.writable {
-            return Err("路由库是只读的，无法接管".into());
-        }
-        if st.routes.contains_key(&spec.name) {
-            return Err(format!("路由 {:?} 已在路由库里", spec.name));
-        }
-        let mut pending = st.routes.clone();
-        pending.insert(spec.name.clone(), spec.clone());
-        Ok((pending, format!("接管配置文件端口 {}", spec.name)))
+    /// 恢复一个已下架的端口（内存候选）。
+    pub fn stage_enable(&self, name: &str) -> Result<(Pending, String), String> {
+        let st = self.readonly_check()?;
+        let Some(spec) = st.disabled.get(name).cloned() else {
+            return Err(format!("端口 {name:?} 不在已下架列表里"));
+        };
+        let mut p = st.pending();
+        p.disabled.remove(name);
+        p.routes.insert(name.to_string(), spec);
+        Ok((p, format!("恢复端口 {name}")))
     }
 
     /// 写盘成功后再换内存。顺序不能反。
-    pub fn commit(
-        &self,
-        actor: &str,
-        pending: BTreeMap<String, RouteConfig>,
-        action: &str,
-    ) -> Result<(), String> {
+    pub fn commit(&self, actor: &str, pending: Pending, action: &str) -> Result<(), String> {
         let mut st = self.lock();
         let Some(path) = &self.path else {
             return Err("未配置 routes_file，无法保存".into());
         };
         persist(path, &pending)?;
-        st.routes = pending;
+        st.routes = pending.routes;
+        st.disabled = pending.disabled;
         st.recent.push_front(Audit {
             at: std::time::Instant::now(),
             actor: actor.to_string(),
@@ -297,6 +316,33 @@ impl RouteStore {
             st.recent.pop_back();
         }
         Ok(())
+    }
+}
+
+impl State {
+    fn pending(&self) -> Pending {
+        Pending {
+            routes: self.routes.clone(),
+            disabled: self.disabled.clone(),
+        }
+    }
+}
+
+/// 只读检查。抽出来是因为每个 stage_* 都要先说同一句话。
+impl RouteStore {
+    fn readonly_check(&self) -> Result<std::sync::MutexGuard<'_, State>, String> {
+        let st = self.lock();
+        if st.writable {
+            Ok(st)
+        } else {
+            Err(format!(
+                "路由库是只读的，改动无法保存{}",
+                st.note
+                    .as_ref()
+                    .map(|n| format!("（{n}）"))
+                    .unwrap_or_default()
+            ))
+        }
     }
 }
 
@@ -319,13 +365,14 @@ fn sibling_tmp(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-fn persist(path: &Path, routes: &BTreeMap<String, RouteConfig>) -> Result<(), String> {
-    let body = if routes.is_empty() {
+fn persist(path: &Path, pending: &Pending) -> Result<(), String> {
+    let file = StoreFile {
+        route: pending.routes.values().cloned().collect(),
+        disabled: pending.disabled.values().cloned().collect(),
+    };
+    let body = if pending.routes.is_empty() && pending.disabled.is_empty() {
         String::new()
     } else {
-        let file = StoreFile {
-            route: routes.values().cloned().collect(),
-        };
         toml::to_string_pretty(&file).map_err(|e| format!("序列化路由库失败：{e}"))?
     };
     let text = format!(
@@ -334,13 +381,16 @@ fn persist(path: &Path, routes: &BTreeMap<String, RouteConfig>) -> Result<(), St
          # 改完**立即生效**（面板保存时会现绑监听套接字，失败就整体不动）。\n\
          # 手工改这个文件要重启网关才生效。\n\
          #\n\
-         # 同名路由会覆盖网关配置文件里的定义；把这里的一条删掉，配置文件里的\n\
-         # 同名端口就会重新生效。配置文件里的路由在面板里是只读的。\n\
+         # 同名端口会覆盖网关配置文件里的定义。想让配置文件里那条重新生效，\n\
+         # 把这里同名的删掉（或把它挪进 [[disabled]] 之外的区域——面板上的\n\
+         # 「恢复」按钮做的就是这件事的反向操作）。\n\
          #\n\
          # listen   对外监听地址，如 \"0.0.0.0:2224\"\n\
          # upstream 上游地址，如 \"127.0.0.1:18788\"\n\
          #\n\
-         # 一个端口都绑不上时就没人能访问面板了，所以删最后一条路由前先想清楚。\n\n{body}"
+         # [[disabled]] 是**已下架**的端口：不监听，但定义留着。\n\
+         # 配置文件里的端口没法从面板里真正删掉（那是只读文件），所以「删除」\n\
+         # 写在这里，恢复时原样搬回上面。\n\n{body}"
     );
 
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -595,7 +645,7 @@ mod tests {
     fn a_disabled_store_refuses_writes_with_a_reason() {
         let s = RouteStore::load(None);
         assert!(!s.writable());
-        let e = s.stage(spec("a", "0.0.0.0:2224", "127.0.0.1:18788"), true);
+        let e = s.stage(spec("a", "0.0.0.0:2224", "127.0.0.1:18788"), true, &[]);
         assert!(e.unwrap_err().contains("只读"));
     }
 
@@ -607,7 +657,7 @@ mod tests {
         assert!(s.writable(), "{:?}", s.note());
 
         let (pending, action) = s
-            .stage(spec("p1", "0.0.0.0:2224", "127.0.0.1:18788"), true)
+            .stage(spec("p1", "0.0.0.0:2224", "127.0.0.1:18788"), true, &[])
             .unwrap();
         s.commit("admin", pending, &action).unwrap();
 
@@ -628,7 +678,7 @@ mod tests {
             let path = dir.join("gateway-routes.toml");
             let s = RouteStore::load(Some(&path));
             let (p, a) = s
-                .stage(spec("p1", "0.0.0.0:2224", "127.0.0.1:18788"), true)
+                .stage(spec("p1", "0.0.0.0:2224", "127.0.0.1:18788"), true, &[])
                 .unwrap();
             s.commit("admin", p, &a).unwrap();
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -637,35 +687,94 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_create_is_rejected() {
-        let dir = tmpdir("dup");
+    fn editing_a_route_that_only_exists_in_the_config_just_works() {
+        // 以前这里要求先「接管」，现在隐式接管：面板改一条配置文件里的端口，
+        // 直接在库里生成同名条目。
+        let dir = tmpdir("upsert");
         let s = RouteStore::load(Some(&dir.join("gateway-routes.toml")));
-        let (p, a) = s
-            .stage(spec("p1", "0.0.0.0:2224", "127.0.0.1:18788"), true)
+        let (p, action) = s
+            .stage(
+                spec("from-config", "0.0.0.0:2226", "127.0.0.1:18789"),
+                false,
+                &[],
+            )
             .unwrap();
-        s.commit("admin", p, &a).unwrap();
-        let e = s
-            .stage(spec("p1", "0.0.0.0:2225", "127.0.0.1:18788"), true)
-            .unwrap_err();
-        assert!(e.contains("已存在"), "{e}");
+        s.commit("admin", p, &action).unwrap();
+        let got = s.get("from-config").expect("应已写进路由库");
+        assert_eq!(got.listen, "0.0.0.0:2226");
     }
 
     #[test]
-    fn editing_an_unknown_route_points_at_adopt() {
-        let dir = tmpdir("unknown");
+    fn creating_with_a_name_that_already_exists_is_rejected() {
+        // 新建撞名字会覆盖掉一个正在服务的端口，而用户以为自己只是加了一个
+        let dir = tmpdir("dupname");
         let s = RouteStore::load(Some(&dir.join("gateway-routes.toml")));
+        let known = vec!["server-panel".to_string()];
         let e = s
-            .stage(spec("ghost", "0.0.0.0:2224", "127.0.0.1:18788"), false)
+            .stage(
+                spec("server-panel", "0.0.0.0:2226", "127.0.0.1:1"),
+                true,
+                &known,
+            )
             .unwrap_err();
-        assert!(e.contains("接管"), "错误信息要指出下一步：{e}");
+        assert!(e.contains("已经存在"), "{e}");
     }
 
     #[test]
-    fn deleting_a_config_route_is_refused() {
+    fn disabling_keeps_the_definition_for_restore() {
+        let dir = tmpdir("disable");
+        let path = dir.join("gateway-routes.toml");
+        let s = RouteStore::load(Some(&path));
+        let spec_a = spec("a", "0.0.0.0:2224", "127.0.0.1:18788");
+        let (p, act) = s.stage(spec_a.clone(), true, &[]).unwrap();
+        s.commit("admin", p, &act).unwrap();
+
+        let (p, act) = s.stage_disable(&spec_a).unwrap();
+        s.commit("admin", p, &act).unwrap();
+        assert!(s.get("a").is_none(), "下架后不该还在生效列表里");
+        assert_eq!(s.disabled_count(), 1);
+        // 定义留着，才有得恢复
+        assert_eq!(s.all_disabled()[0].upstream, "127.0.0.1:18788");
+
+        let (p, act) = s.stage_enable("a").unwrap();
+        s.commit("admin", p, &act).unwrap();
+        assert_eq!(s.get("a").unwrap().listen, "0.0.0.0:2224");
+        assert_eq!(s.disabled_count(), 0);
+    }
+
+    #[test]
+    fn disabled_survives_a_reload() {
+        let dir = tmpdir("disable-persist");
+        let path = dir.join("gateway-routes.toml");
+        let s = RouteStore::load(Some(&path));
+        let spec_a = spec("a", "0.0.0.0:2224", "127.0.0.1:18788");
+        let (p, act) = s.stage_disable(&spec_a).unwrap();
+        s.commit("admin", p, &act).unwrap();
+
+        // 重启后墓碑还在——否则配置文件里那条会悄悄复活
+        let s2 = RouteStore::load(Some(&path));
+        assert_eq!(s2.disabled_count(), 1, "下架状态必须写进文件");
+        assert_eq!(s2.all_disabled()[0].name, "a");
+    }
+
+    #[test]
+    fn enabling_something_that_is_not_disabled_is_an_error() {
+        let dir = tmpdir("norestore");
+        let s = RouteStore::load(Some(&dir.join("gateway-routes.toml")));
+        let e = s.stage_enable("ghost").unwrap_err();
+        assert!(e.contains("不在已下架列表"), "{e}");
+    }
+
+    #[test]
+    fn deleting_a_config_route_leaves_a_tombstone() {
+        // 没有墓碑的话，"删除配置文件里的端口"等于删掉库里的覆盖项，
+        // 而配置里那条马上又冒出来——用户会觉得删除按钮坏了。
         let dir = tmpdir("delcfg");
         let s = RouteStore::load(Some(&dir.join("gateway-routes.toml")));
-        let e = s.stage_delete("from-config").unwrap_err();
-        assert!(e.contains("gateway.toml"), "{e}");
+        let cfg_only = spec("from-config", "0.0.0.0:2225", "127.0.0.1:18788");
+        let (p, act) = s.stage_disable(&cfg_only).unwrap();
+        s.commit("admin", p, &act).unwrap();
+        assert_eq!(s.disabled_count(), 1);
     }
 
     #[test]

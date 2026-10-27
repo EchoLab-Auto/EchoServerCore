@@ -259,7 +259,8 @@ pub fn home_page(v: &HomeView) -> String {
 pub struct RouteRow {
     pub name: String,
     pub source_label: String,
-    pub editable: bool,
+    /// 已下架：不监听，只列出来供恢复。
+    pub disabled: bool,
     pub listen: String,
     pub upstream: String,
     /// 剥前缀 / 白名单 / 体积上限，拼成一句话。
@@ -308,38 +309,39 @@ pub fn routes_page(v: &RoutesView) -> String {
             } else {
                 ""
             };
-            let ro = if r.editable {
-                String::new()
+            let off = if r.disabled {
+                "<span class=\"badge ro\">已下架</span>"
             } else {
-                "<span class=\"badge ro\">只读</span>".to_string()
+                ""
             };
-            let dead = if r.live {
+            // 「未监听」只在生效的端口上才有意义：下架了本来就不该在听
+            let dead = if r.live || r.disabled {
                 String::new()
             } else {
                 "<span class=\"badge ro\" title=\"注册表里找不到这个端口\">未监听</span>"
                     .to_string()
             };
             let mut actions = String::new();
-            if r.editable {
+            if r.disabled {
+                actions.push_str(&format!(
+                    "<form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/enable\">\
+<button class=\"btn pri\" type=\"submit\">恢复</button></form>",
+                    n = urlencode_attr(&r.name)
+                ));
+            } else {
                 actions.push_str(&format!(
                     "<a class=\"btn\" href=\"/__admin/routes/{n}\">编辑</a>",
                     n = urlencode_attr(&r.name)
                 ));
                 actions.push_str(&format!(
                     " <form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/delete\" \
-onsubmit=\"return confirm('删除端口 {n}？它会立刻停止监听。')\">\
-<button class=\"btn danger\" type=\"submit\">删除</button></form>",
-                    n = urlencode_attr(&r.name)
-                ));
-            } else {
-                actions.push_str(&format!(
-                    "<form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/adopt\">\
-<button class=\"btn\" type=\"submit\">接管</button></form>",
+onsubmit=\"return confirm('下架端口 {n}？它会立刻停止监听，定义会保留，随时可以恢复。')\">\
+<button class=\"btn danger\" type=\"submit\">下架</button></form>",
                     n = urlencode_attr(&r.name)
                 ));
             }
             body.push_str(&format!(
-                "<tr><td><span class=\"mono\">{name}</span>{here}{dead}{ro}\
+                "<tr><td><span class=\"mono\">{name}</span>{here}{dead}{off}\
 <div class=\"hint\">{src}</div></td>\
 <td class=\"mono\">{listen}</td><td class=\"mono dim\">{upstream}</td>\
 <td class=\"hint\">{detail}</td>\

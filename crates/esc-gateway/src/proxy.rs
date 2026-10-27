@@ -239,7 +239,9 @@ impl Gateway {
 
     // ── 路由 ──────────────────────────────────────────────────────────────
 
-    /// 生效路由全集（配置文件 ∪ 路由库），按名字排序。面板用。
+    /// 面板看到的**全部**端口：生效的 + 已下架的，按名字排序。
+    ///
+    /// 已下架的也要列出来，否则「恢复」按钮无处可点——用户会以为端口彻底丢了。
     pub fn effective_routes(&self) -> Vec<EffectiveRoute> {
         let stored: std::collections::BTreeMap<String, crate::config::RouteConfig> = self
             .rt_store
@@ -247,21 +249,44 @@ impl Gateway {
             .into_iter()
             .map(|r| (r.name.clone(), r))
             .collect();
+        let disabled: std::collections::BTreeMap<String, crate::config::RouteConfig> = self
+            .rt_store
+            .all_disabled()
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
 
         let mut out: Vec<EffectiveRoute> = Vec::new();
-        for (name, spec) in &stored {
-            let source = if self.cfg.routes.contains_key(name) {
-                RouteSource::StoreOverConfig
-            } else {
-                RouteSource::Store
-            };
+
+        // 已下架的优先：它们不再监听，也不该被配置文件的同名条目"复活"
+        for (name, spec) in &disabled {
             out.push(EffectiveRoute {
                 spec: spec.clone(),
-                source,
+                source: if self.cfg.routes.contains_key(name) {
+                    RouteSource::ConfigDisabled
+                } else {
+                    RouteSource::StoreDisabled
+                },
+                disabled: true,
+            });
+        }
+
+        for (name, spec) in &stored {
+            if disabled.contains_key(name) {
+                continue;
+            }
+            out.push(EffectiveRoute {
+                spec: spec.clone(),
+                source: if self.cfg.routes.contains_key(name) {
+                    RouteSource::StoreOverConfig
+                } else {
+                    RouteSource::Store
+                },
+                disabled: false,
             });
         }
         for (name, rt) in &self.cfg.routes {
-            if stored.contains_key(name) {
+            if stored.contains_key(name) || disabled.contains_key(name) {
                 continue;
             }
             out.push(EffectiveRoute {
@@ -274,6 +299,7 @@ impl Gateway {
                     max_body_bytes: Some(rt.max_body_bytes),
                 },
                 source: RouteSource::Config,
+                disabled: false,
             });
         }
         out.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
@@ -285,20 +311,32 @@ impl Gateway {
         self.routes.names()
     }
 
-    /// 用一份候选路由集合去算"合并后的完整列表"。
+    /// 用一份候选状态去算"合并后的完整列表"。
     ///
-    /// 纯函数：不写盘、不绑端口，只回答"如果路由库变成这样，最终会监听哪些
-    /// 端口、会不会冲突"。两阶段热应用的第一步就是它。
+    /// 纯函数：不写盘、不绑端口，只回答"如果路由库变成这样，最终会监听哪些端口、
+    /// 会不会冲突"。两阶段热应用的第一步就是它。
+    ///
+    /// 下架的端口要**排除掉**——包括配置里同名的那些，否则它们会绕过墓碑继续监听。
     pub fn candidate_runtimes(
         &self,
-        pending: &std::collections::BTreeMap<String, crate::config::RouteConfig>,
+        pending: &crate::routes::Pending,
     ) -> Result<Vec<crate::config::RouteRuntime>, String> {
         let specs: Vec<crate::config::RouteConfig> = self
-            .effective_routes()
-            .into_iter()
-            .filter(|r| !pending.contains_key(&r.spec.name))
-            .map(|r| r.spec)
-            .chain(pending.values().cloned())
+            .cfg
+            .routes
+            .values()
+            .filter(|rt| {
+                !pending.routes.contains_key(&rt.name) && !pending.disabled.contains_key(&rt.name)
+            })
+            .map(|rt| crate::config::RouteConfig {
+                name: rt.name.clone(),
+                listen: rt.listen.to_string(),
+                upstream: rt.upstream.to_string(),
+                allowed_cidrs: rt.allowed_cidrs_raw.clone(),
+                strip_prefix: rt.strip_prefix.clone(),
+                max_body_bytes: Some(rt.max_body_bytes),
+            })
+            .chain(pending.routes.values().cloned())
             .collect();
         crate::config::validate_route_list(&specs)
     }
@@ -308,7 +346,7 @@ impl Gateway {
     /// 纯失败无副作用：算不通或绑不上，返回 `Err`，旧监听一个都不动。
     pub async fn prepare_routes(
         &self,
-        pending: &std::collections::BTreeMap<String, crate::config::RouteConfig>,
+        pending: &crate::routes::Pending,
     ) -> Result<(Vec<crate::config::RouteRuntime>, crate::routes::Prepared), String> {
         let runtimes = self.candidate_runtimes(pending)?;
         let prepared = self.listeners.prepare(&runtimes).await?;

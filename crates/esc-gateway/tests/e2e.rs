@@ -1711,13 +1711,8 @@ async fn deleting_a_port_stops_the_listener_and_refuses_to_break_the_current_one
         302
     );
 
-    // 先接管 panel，让它变成"可编辑"，才能走到"删自己"那道闸
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/panel/adopt", &c, "")
-            .await
-            .status,
-        302
-    );
+    // 「删自己脚下的端口」这道闸对配置文件来的端口同样生效——不需要先接管
+    // 什么东西，面板已经把每一行都当成可操作的了。
     // 删掉「自己正在用的那个端口」要被拒绝
     let r = post_form(gw.addr(), "/__admin/routes/panel/delete", &c, "").await;
     assert_eq!(r.status, 302);
@@ -1999,5 +1994,142 @@ async fn the_routes_page_explains_the_dedicated_admin_port() {
 
     gw.token.cancel();
     gw2.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn editing_a_config_route_works_without_adopting_first() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // panel 来自 gateway.toml。直接编辑它，不需要先点「接管」。
+    let port = gw.addr_of("panel").port();
+    let body = format!(
+        "listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    let r = post_form(gw.addr(), "/__admin/routes/panel", &c, &body).await;
+    assert_eq!(r.status, 302, "{}", r.body);
+
+    // 落在了路由库里 —— 这就是隐式接管
+    let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
+    let raw = std::fs::read_to_string(&routes_file).unwrap();
+    assert!(raw.contains("name = \"panel\""), "{raw}");
+
+    // 列表页把它标成"覆盖了配置文件"，并且仍然可以继续编辑/下架
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert!(page.body.contains("覆盖了配置文件"), "{}", page.body);
+    assert!(
+        page.body.contains("/__admin/routes/panel"),
+        "应有编辑入口：{}",
+        page.body
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_config_route_can_be_disabled_and_restored_without_touching_the_config_file() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 加一个新的路由库端口，我们从它上面操作（panel 是自己脚下的那个，不能删）
+    let port = free_port().await;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+    assert_eq!(
+        http(addr, "GET", "/", &[("cookie", &c), ("accept", "*/*")], None)
+            .await
+            .status,
+        200
+    );
+
+    // 下架：监听停，但条目还在列表里
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "")
+            .await
+            .status,
+        302
+    );
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "下架后不该再接受连接"
+    );
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert!(page.body.contains("已下架"), "{}", page.body);
+    assert!(
+        page.body.contains("/__admin/routes/fresh/enable"),
+        "要给出恢复入口：{}",
+        page.body
+    );
+    assert!(!page.body.contains("未监听"), "下架的端口不该标成未监听");
+
+    // 恢复：又能听了
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/fresh/enable", &c, "")
+            .await
+            .status,
+        302
+    );
+    assert_eq!(
+        http(addr, "GET", "/", &[("cookie", &c), ("accept", "*/*")], None)
+            .await
+            .status,
+        200,
+        "恢复后应立刻可用"
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_disabled_port_stays_down_after_a_restart() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "")
+            .await
+            .status,
+        302
+    );
+
+    // 重载路由库：墓碑必须在文件里，否则重启后端口会"自己回来"，
+    // 而下架本该是一个持久决定。
+    let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
+    let reloaded = esc_gateway::RouteStore::load(Some(&routes_file));
+    assert!(reloaded.get("fresh").is_none());
+    assert_eq!(reloaded.disabled_count(), 1);
+    assert!(reloaded.all_disabled().iter().any(|r| r.name == "fresh"));
+
+    gw.token.cancel();
     _u.cancel();
 }
