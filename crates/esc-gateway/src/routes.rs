@@ -285,6 +285,25 @@ impl RouteStore {
         Ok((p, format!("下架端口 {}", spec.name)))
     }
 
+    /// **真删除**一条路由（内存候选）：从库里抹掉，不留墓碑。
+    ///
+    /// 和下架的区别是"以后还要不要它"：下架留着定义以便恢复，删除是"这个端口
+    /// 我以后不再需要"。
+    ///
+    /// 只对**路由库自己拥有**的条目有意义。配置文件里的端口删不掉（只读文件），
+    /// 墓碑也删不得（删了配置里那条就会复活）——这两种情况由调用方拦在前面，
+    /// 因为这里看不到配置文件。
+    pub fn stage_delete(&self, name: &str) -> Result<(Pending, String), String> {
+        let st = self.readonly_check()?;
+        let mut p = st.pending();
+        let was_enabled = p.routes.remove(name).is_some();
+        let was_disabled = p.disabled.remove(name).is_some();
+        if !was_enabled && !was_disabled {
+            return Err(format!("端口 {name:?} 不在路由库里"));
+        }
+        Ok((p, format!("删除端口 {name}")))
+    }
+
     /// 恢复一个已下架的端口（内存候选）。
     pub fn stage_enable(&self, name: &str) -> Result<(Pending, String), String> {
         let st = self.readonly_check()?;
@@ -755,6 +774,41 @@ mod tests {
         let s2 = RouteStore::load(Some(&path));
         assert_eq!(s2.disabled_count(), 1, "下架状态必须写进文件");
         assert_eq!(s2.all_disabled()[0].name, "a");
+    }
+
+    #[test]
+    fn deleting_removes_it_completely_including_the_tombstone() {
+        let dir = tmpdir("delete");
+        let path = dir.join("gateway-routes.toml");
+        let s = RouteStore::load(Some(&path));
+        let a = spec("a", "0.0.0.0:2224", "127.0.0.1:18788");
+        let (p, act) = s.stage(a.clone(), true, &[]).unwrap();
+        s.commit("admin", p, &act).unwrap();
+
+        // 下架后是墓碑
+        let (p, act) = s.stage_disable(&a).unwrap();
+        s.commit("admin", p, &act).unwrap();
+        assert_eq!(s.disabled_count(), 1);
+
+        // 删除：连墓碑一起没了，重启也不会回来
+        let (p, act) = s.stage_delete("a").unwrap();
+        s.commit("admin", p, &act).unwrap();
+        assert_eq!(s.count(), 0);
+        assert_eq!(
+            s.disabled_count(),
+            0,
+            "墓碑也要一起删掉，否则它会一直占着名字"
+        );
+        let reloaded = RouteStore::load(Some(&path));
+        assert_eq!(reloaded.count(), 0);
+        assert_eq!(reloaded.disabled_count(), 0);
+    }
+
+    #[test]
+    fn deleting_something_absent_is_an_error() {
+        let dir = tmpdir("delabsent");
+        let s = RouteStore::load(Some(&dir.join("gateway-routes.toml")));
+        assert!(s.stage_delete("ghost").unwrap_err().contains("不在路由库"));
     }
 
     #[test]

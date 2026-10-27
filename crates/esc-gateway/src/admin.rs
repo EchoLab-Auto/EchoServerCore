@@ -166,6 +166,7 @@ pub async fn handle(
         (false, ["routes", name]) => ctx.route_form_edit(name),
         (true, ["routes", name]) => ctx.route_update(name, req).await,
         (true, ["routes", name, "delete"]) => ctx.route_delete(name).await,
+        (true, ["routes", name, "disable"]) => ctx.route_disable(name).await,
         (true, ["routes", name, "enable"]) => ctx.route_enable(name).await,
 
         // 会话
@@ -569,6 +570,10 @@ impl Ctx<'_> {
                     name: e.spec.name.clone(),
                     source_label: e.source.label().to_string(),
                     disabled: e.disabled,
+                    // 只有路由库拥有、且配置文件里没有同名条目的才能真删除
+                    deletable: (e.source == crate::routes::RouteSource::Store
+                        || e.source == crate::routes::RouteSource::StoreDisabled)
+                        && !gw.cfg.routes.contains_key(&e.spec.name),
                     listen: e.spec.listen.clone(),
                     upstream: e.spec.upstream.clone(),
                     detail: route_detail(&e.spec),
@@ -739,7 +744,108 @@ impl Ctx<'_> {
         .await
     }
 
+    /// **真删除**：从路由库抹掉，不留墓碑。
+    ///
+    /// 和下架的分工很明确：
+    /// * 下架 = 别再听了，但定义留着（可能还要恢复，或者它来自只读的配置文件）
+    /// * 删除 = 我不再需要这个端口了
+    ///
+    /// 只有"路由库自己拥有"的条目能被删除。两种情况必须拒绝，因为它们的
+    /// **结果和用户想要的正相反**：
+    ///
+    /// 1. `gateway.toml` 里也有同名条目 → 删掉库里那条，配置那条立刻复活，
+    ///    端口又开起来了。用户以为删了，其实什么都没变（甚至更糟：定义换了一份）。
+    /// 2. 条目根本不在库里（只在配置文件里）→ 无从删起。
     async fn route_delete(&self, name: &str) -> HyperResponse<ProxyBody> {
+        let back = format!("{PREFIX}/routes");
+        let Some(e) = self.route(name) else {
+            return self.not_found_route(name);
+        };
+        // 自己脚下的端口：先拦，错误信息最具体
+        if e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local) {
+            return self.done(
+                false,
+                &back,
+                &format!(
+                    "端口 {name} 就是你现在访问管理面板用的这个（{}）。\
+                     删它会把当前连接一起断掉——请从别的端口（或独立管理端口）进来删。",
+                    self.local
+                ),
+            );
+        }
+        // 配置里也有同名的？删不得（会复活），指向「下架」
+        if self.gw.cfg.routes.contains_key(name) {
+            return self.done(
+                false,
+                &back,
+                &format!(
+                    "端口 {name} 在 gateway.toml 里也有一条（那是只读文件，面板改不了）。\
+                     删掉路由库这条只会让它按配置文件里的定义复活，端口照样在听。\
+                     想让它停掉请用「下架」；想彻底删掉请编辑 /etc/esc/gateway.toml 里那条。"
+                ),
+            );
+        }
+        // 库里没有它（只在配置文件里）→ 无从删起
+        let in_store = self.gw.rt_store.get(name).is_some()
+            || self
+                .gw
+                .rt_store
+                .all_disabled()
+                .iter()
+                .any(|r| r.name == name);
+        if !in_store {
+            return self.done(
+                false,
+                &back,
+                &format!(
+                    "端口 {name} 只定义在 gateway.toml 里（只读文件），面板删不掉。\
+                     要用「下架」让它停止监听，或者直接编辑那个文件。"
+                ),
+            );
+        }
+
+        // 删到零个业务端口：管理面板挂在业务端口上时会把自己关在外面
+        let enabled = self
+            .gw
+            .effective_routes()
+            .iter()
+            .filter(|r| !r.disabled)
+            .count();
+        if !e.disabled && enabled <= 1 && self.gw.cfg.admin_listen.is_none() {
+            return self.done(
+                false,
+                &back,
+                "这是最后一个生效的端口，删掉之后连管理面板也进不来了（它就挂在这个端口上）。\
+                 先加一个新的，或者配 admin_listen 让管理面板独占一个端口。",
+            );
+        }
+
+        let (pending, action) = match self.gw.rt_store.stage_delete(name) {
+            Ok(v) => v,
+            Err(e) => return self.done(false, &back, &e),
+        };
+        let runtimes = match self.gw.candidate_runtimes(&pending) {
+            Ok(r) => r,
+            Err(e) => return self.done(false, &back, &format!("删除后配置不合法：{e}")),
+        };
+        let prepared = match self.gw.listeners.prepare(&runtimes).await {
+            Ok(p) => p,
+            Err(e) => return self.done(false, &back, &e),
+        };
+        if let Err(e) = self.gw.rt_store.commit(&self.actor, pending, &action) {
+            return self.done(false, &back, &e);
+        }
+        self.gw.commit_routes(runtimes, prepared);
+        tracing::info!(actor = %self.actor, target = %name, source = ?self.source, "route deleted");
+        self.done(
+            true,
+            &back,
+            &format!("端口 {name} 已删除（定义也删了，重启不会回来）"),
+        )
+    }
+
+    /// 下架：停止监听，但定义留着（可「恢复」）。
+    async fn route_disable(&self, name: &str) -> HyperResponse<ProxyBody> {
         let back = format!("{PREFIX}/routes");
         let Some(e) = self.route(name) else {
             return self.not_found_route(name);

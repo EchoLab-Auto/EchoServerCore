@@ -261,6 +261,9 @@ pub struct RouteRow {
     pub source_label: String,
     /// 已下架：不监听，只列出来供恢复。
     pub disabled: bool,
+    /// 能不能**真删除**（只有路由库自己拥有的条目可以；配置里也有同名的就不行，
+    /// 因为删掉之后配置那条会复活）。
+    pub deletable: bool,
     pub listen: String,
     pub upstream: String,
     /// 剥前缀 / 白名单 / 体积上限，拼成一句话。
@@ -296,61 +299,35 @@ pub fn routes_page(v: &RoutesView) -> String {
         esc(&v.store_line)
     ));
 
-    if v.rows.is_empty() {
+    // 生效的排在前面，已下架的放后面单独一段：一个是"正在服务的",
+    // 一个是"停掉的"，混在一张表里会让人以为下架的还在跑。
+    let mut rows: Vec<&RouteRow> = v.rows.iter().filter(|r| !r.disabled).collect();
+    let off_rows: Vec<&RouteRow> = v.rows.iter().filter(|r| r.disabled).collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if rows.is_empty() {
         body.push_str("<div class=\"empty\">一个端口都没有——网关现在什么都不转发</div>");
     } else {
         body.push_str(
             "<table><thead><tr><th>端口名</th><th>监听</th><th>上游</th><th>其他</th><th></th></tr></thead><tbody>",
         );
-        for r in &v.rows {
-            let name = esc(&r.name);
-            let here = if r.here {
-                "<span class=\"badge adm\">你在这里</span>"
-            } else {
-                ""
-            };
-            let off = if r.disabled {
-                "<span class=\"badge ro\">已下架</span>"
-            } else {
-                ""
-            };
-            // 「未监听」只在生效的端口上才有意义：下架了本来就不该在听
-            let dead = if r.live || r.disabled {
-                String::new()
-            } else {
-                "<span class=\"badge ro\" title=\"注册表里找不到这个端口\">未监听</span>"
-                    .to_string()
-            };
-            let mut actions = String::new();
-            if r.disabled {
-                actions.push_str(&format!(
-                    "<form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/enable\">\
-<button class=\"btn pri\" type=\"submit\">恢复</button></form>",
-                    n = urlencode_attr(&r.name)
-                ));
-            } else {
-                actions.push_str(&format!(
-                    "<a class=\"btn\" href=\"/__admin/routes/{n}\">编辑</a>",
-                    n = urlencode_attr(&r.name)
-                ));
-                actions.push_str(&format!(
-                    " <form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/delete\" \
-onsubmit=\"return confirm('下架端口 {n}？它会立刻停止监听，定义会保留，随时可以恢复。')\">\
-<button class=\"btn danger\" type=\"submit\">下架</button></form>",
-                    n = urlencode_attr(&r.name)
-                ));
-            }
-            body.push_str(&format!(
-                "<tr><td><span class=\"mono\">{name}</span>{here}{dead}{off}\
-<div class=\"hint\">{src}</div></td>\
-<td class=\"mono\">{listen}</td><td class=\"mono dim\">{upstream}</td>\
-<td class=\"hint\">{detail}</td>\
-<td><div class=\"row\" style=\"justify-content:flex-end\">{actions}</div></td></tr>",
-                src = esc(&r.source_label),
-                listen = esc(&r.listen),
-                upstream = esc(&r.upstream),
-                detail = esc(&r.detail),
-            ));
+        for r in &rows {
+            body.push_str(&route_row_html(r));
+        }
+        body.push_str("</tbody></table>");
+    }
+
+    if !off_rows.is_empty() {
+        body.push_str("<h2>已下架</h2>");
+        body.push_str(
+            "<p class=\"hint\" style=\"margin-bottom:10px\">这些端口不监听，但定义还留着。\
+点「恢复」重新开始监听；不再需要就「删除」把定义也抹掉。</p>",
+        );
+        body.push_str(
+            "<table><thead><tr><th>端口名</th><th>监听</th><th>上游</th><th>其他</th><th></th></tr></thead><tbody>",
+        );
+        for r in &off_rows {
+            body.push_str(&route_row_html(r));
         }
         body.push_str("</tbody></table>");
     }
@@ -360,6 +337,7 @@ onsubmit=\"return confirm('下架端口 {n}？它会立刻停止监听，定义�
 <a class=\"btn pri\" href=\"/__admin/routes/new\">新增端口</a>\
 <span class=\"hint\">保存即生效：先绑端口，绑不上就整体不变（不会出现改了一半）。</span></div>",
     );
+
     body.push_str(&format!(
         "<p class=\"hint\">你现在是从端口 <span class=\"mono\">{}</span> 访问管理面板的。{}</p>",
         v.current_port,
@@ -371,6 +349,72 @@ onsubmit=\"return confirm('下架端口 {n}？它会立刻停止监听，定义�
     ));
 
     layout(&v.title, &v.actor, v.is_admin, "routes", &body)
+}
+
+/// 端口列表里的一行。
+///
+/// 提成函数是因为要渲染两张表（生效的、已下架的）——复制两遍那种事，
+/// 改一处忘另一处是必然的。
+fn route_row_html(r: &RouteRow) -> String {
+    let name = esc(&r.name);
+    let here = if r.here {
+        "<span class=\"badge adm\">你在这里</span>"
+    } else {
+        ""
+    };
+    // 「外部定义」不是错误，只是"想彻底删掉得改配置文件"
+    let off = if !r.deletable && !r.disabled {
+        "<span class=\"badge\" title=\"gateway.toml 是只读文件，面板删不掉它；\
+点「下架」可以让它停止监听\">外部定义</span>"
+    } else {
+        ""
+    };
+    // 「未监听」只在生效的端口上才有意义：下架了本来就不该在听
+    let dead = if r.live || r.disabled {
+        String::new()
+    } else {
+        "<span class=\"badge ro\" title=\"注册表里找不到这个端口\">未监听</span>".to_string()
+    };
+
+    let n = urlencode_attr(&r.name);
+    let n_lit = esc(&r.name);
+    let mut actions = String::new();
+    if r.disabled {
+        actions.push_str(&format!(
+            "<form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/enable\">\
+<button class=\"btn pri\" type=\"submit\">恢复</button></form>"
+        ));
+    } else {
+        actions.push_str(&format!(
+            "<a class=\"btn\" href=\"/__admin/routes/{n}\">编辑</a>"
+        ));
+        actions.push_str(&format!(
+            " <form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/disable\" \
+onsubmit=\"return confirm('下架端口 {n_lit}？它立刻停止监听，定义保留，随时可以恢复。')\">\
+<button class=\"btn\" type=\"submit\">下架</button></form>"
+        ));
+    }
+    // 真删除只在"路由库自己拥有"时给。配置里也有同名条目时不给——
+    // 删掉库里那条会让配置那条复活，那是和用户意图相反的结果。
+    if r.deletable {
+        actions.push_str(&format!(
+            " <form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/delete\" \
+onsubmit=\"return confirm('彻底删除端口 {n_lit}？定义也会被删掉，重启不会回来。')\">\
+<button class=\"btn danger\" type=\"submit\">删除</button></form>"
+        ));
+    }
+
+    format!(
+        "<tr><td><span class=\"mono\">{name}</span>{here}{dead}{off}\
+<div class=\"hint\">{src}</div></td>\
+<td class=\"mono\">{listen}</td><td class=\"mono dim\">{upstream}</td>\
+<td class=\"hint\">{detail}</td>\
+<td><div class=\"row\" style=\"justify-content:flex-end\">{actions}</div></td></tr>",
+        src = esc(&r.source_label),
+        listen = esc(&r.listen),
+        upstream = esc(&r.upstream),
+        detail = esc(&r.detail),
+    )
 }
 
 /// 新建 / 编辑端口的表单。

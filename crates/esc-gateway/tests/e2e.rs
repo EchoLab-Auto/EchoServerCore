@@ -2060,7 +2060,7 @@ async fn a_config_route_can_be_disabled_and_restored_without_touching_the_config
 
     // 下架：监听停，但条目还在列表里
     assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "")
+        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
             .await
             .status,
         302
@@ -2116,7 +2116,7 @@ async fn a_disabled_port_stays_down_after_a_restart() {
         302
     );
     assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "")
+        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
             .await
             .status,
         302
@@ -2176,6 +2176,172 @@ async fn an_upstream_pointing_at_the_admin_port_is_rejected_too() {
     let r = post_form(admin, "/__admin/routes", &c, &body).await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("自环"), "{}", r.body);
+    assert!(gw.gw.rt_store.get("fresh").is_none());
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 删除 vs 下架
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_store_route_can_be_deleted_for_real() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+
+    // 删除（不是下架）：连定义一起没了
+    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
+    assert_eq!(r.status, 302, "{}", r.body);
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "删除后不该再接受连接"
+    );
+    // 库里没有、墓碑也没有 —— 重启也不会回来
+    assert!(gw.gw.rt_store.get("fresh").is_none());
+    assert_eq!(gw.gw.rt_store.disabled_count(), 0, "真删除不该留墓碑");
+    // 列表里彻底消失（不像下架那样留在「已下架」段里）。
+    // 注意别用裸 "fresh" 判断：成功横幅里就有端口名。看的是「有没有这一行」。
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert!(
+        !page.body.contains("/__admin/routes/fresh"),
+        "不该再有它的行：{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("已下架"),
+        "也该没有墓碑段：{}",
+        page.body
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_route_that_also_lives_in_the_config_cannot_be_deleted() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 先编辑 panel（走隐式接管），让它在库里也有一条
+    let port = gw.addr_of("panel").port();
+    let other = gw.addr_of("admin-only").port();
+    let up_s = up.to_string();
+    let body = format!(
+        "listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up_s)
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/panel", &c, &body)
+            .await
+            .status,
+        302
+    );
+
+    // 现在「删除」必须被拒：删掉库里那条会让 gateway.toml 里那条复活，
+    // 端口照样在听 —— 那是和用户意图相反的结果。
+    let r = post_form(gw.addr(), "/__admin/routes/panel/delete", &c, "").await;
+    assert_eq!(r.status, 302);
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert!(
+        page.body.contains("在 gateway.toml 里也有一条"),
+        "要说清为什么删不掉：{}",
+        page.body
+    );
+    assert!(gw.gw.rt_store.get("panel").is_some(), "不该被删");
+    // 端口还在服务
+    assert_eq!(
+        http(
+            gw.addr(),
+            "GET",
+            "/",
+            &[("cookie", &c), ("accept", "*/*")],
+            None
+        )
+        .await
+        .status,
+        200
+    );
+    let _ = other;
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_config_only_route_offers_disable_but_not_delete() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    // panel 只在 gateway.toml 里：有「下架」，没有「删除」
+    assert!(
+        page.body.contains("/__admin/routes/panel/disable"),
+        "{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("/__admin/routes/panel/delete"),
+        "只定义在配置文件里的端口不该给删除按钮：{}",
+        page.body
+    );
+    // 并且标成「外部定义」，让人知道为什么
+    assert!(page.body.contains("外部定义"), "{}", page.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_store_route_deleted_from_the_disabled_section_is_gone_for_good() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+    // 下架 → 墓碑
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
+            .await
+            .status,
+        302
+    );
+    assert_eq!(gw.gw.rt_store.disabled_count(), 1);
+
+    // 在「已下架」段里也能删除，连墓碑一起清掉
+    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
+    assert_eq!(r.status, 302, "{}", r.body);
+    assert_eq!(gw.gw.rt_store.disabled_count(), 0);
     assert!(gw.gw.rt_store.get("fresh").is_none());
 
     gw.token.cancel();
