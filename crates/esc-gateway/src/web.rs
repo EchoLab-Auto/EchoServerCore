@@ -151,32 +151,6 @@ pub fn error_page(title: &str, heading: &str, detail_html: &str) -> String {
     )
 }
 
-/// 「管理面板在另一个端口」的说明页。
-///
-/// 出现在**普通转发端口**上（配了 `admin_listen` 之后）。它不自动跳转：
-/// 跳转目标要用 `Host` 拼，而 `Host` 是客户端给的。
-pub fn admin_elsewhere_page(title: &str, href: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>管理面板不在这个端口 · {title_esc}</title><style>{STYLE}</style></head>
-<body><div class="card">
-  <h1>管理面板不在这个端口</h1>
-  <p class="sub">这个端口只转发面板，不提供账号管理。</p>
-  <div class="detail">管理面板（含登录页）在一个独立端口上：
-    <p><a href="{href}">{href}</a></p>
-    这样管理面和业务面不共用同一个公网端口，少一处暴露面。
-  </div>
-  <div class="foot">这是 {title_esc}</div>
-</div></body></html>"#,
-        title_esc = esc(title),
-        href = esc(href),
-        STYLE = STYLE,
-    )
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 网关首页
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +171,8 @@ pub struct HomeView {
     pub routes: Vec<HomeLink>,
     /// 当前是从哪个端口进来的，标一下。
     pub current_route: String,
+    /// 管理链接的前缀：`""` 表示同源，`"//host:port"` 表示别的端口。
+    pub admin_base: String,
 }
 
 pub fn home_page(v: &HomeView) -> String {
@@ -235,10 +211,20 @@ pub fn home_page(v: &HomeView) -> String {
 
     // 账号相关
     body.push_str("<h2>账号</h2><div class=\"row\">");
-    body.push_str("<a class=\"btn\" href=\"/__admin/me\">我的账号 / 改口令</a>");
+    let a = |path: &str| format!("{}{path}", v.admin_base);
+    body.push_str(&format!(
+        "<a class=\"btn\" href=\"{}\">我的账号 / 改口令</a>",
+        esc(&a("/__admin/me"))
+    ));
     if v.admin {
-        body.push_str("<a class=\"btn pri\" href=\"/__admin/\">管理账号</a>");
-        body.push_str("<a class=\"btn\" href=\"/__admin/sessions\">在线会话</a>");
+        body.push_str(&format!(
+            "<a class=\"btn pri\" href=\"{}\">管理账号</a>",
+            esc(&a("/__admin/"))
+        ));
+        body.push_str(&format!(
+            "<a class=\"btn\" href=\"{}\">在线会话</a>",
+            esc(&a("/__admin/sessions"))
+        ));
     }
     body.push_str("<a class=\"btn\" href=\"/__auth/logout\">退出登录</a></div>");
 

@@ -339,32 +339,17 @@ impl Gateway {
     }
 }
 
-/// 管理端口的链接：`//<当前主机名>:<管理端口>/__admin/`。
+/// 管理端口的地址前缀：`""`（就是这个端口）或 `"//host:port"`。
 ///
 /// 主机名取请求的 `Host`（去端口）而不是配置里的 IP：配置里通常写
 /// `127.0.0.1` 或 `0.0.0.0`，前者对远程浏览器没意义、后者不能访问。
 ///
-/// 用协议相对的 `//host:port/`，这样前面挂 TLS 也不用改。**不自动跳转**，
-/// 只给链接：`Host` 是客户端给的，拿它拼 302 的 Location 等于把跳转目标
-/// 交出去（Host 头注入）。多一次点击换掉这个面，值得。
-fn admin_href(admin: SocketAddr, req: &HyperRequest<Incoming>) -> String {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches('[')
-        .split(']')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
+/// 用协议相对的 `//host:port`，这样前面挂 TLS 也不用改。
+fn admin_base(admin: SocketAddr, host: &str) -> String {
     if host.is_empty() {
-        format!(":{}/__admin/", admin.port())
+        format!(":{}", admin.port())
     } else {
-        format!("//{host}:{}/__admin/", admin.port())
+        format!("//{host}:{}", admin.port())
     }
 }
 
@@ -542,16 +527,13 @@ async fn handle(
     // ②b 管理面板。它要自己判登录态（普通用户也能进「我的账号」），
     //     所以不能走下面的通用认证流程。
     //
-    //     配了 `admin_listen` 之后，管理面板**只**在那个端口提供：这里换成
-    //     一页"管理面板在别处"的说明。不是 404——用户是照着旧记忆敲的，
-    //     给个明确指路比让他以为网关坏了要好。
-    if path == "/__admin" || path.starts_with("/__admin/") {
-        if let Some(admin_addr) = gw.cfg.admin_listen {
-            return html(
-                StatusCode::OK,
-                web::admin_elsewhere_page(&gw.cfg.title, &admin_href(admin_addr, &req)),
-            );
-        }
+    //     配了 `admin_listen` 之后这个路径**不再由网关占用**：它就是一个普通
+    //     路径，照常认证后转发给上游（上游没有它，于是 404）。
+    //
+    //     为什么不再给一页「管理面板在别处」+ 链接：那等于在每个公网端口上
+    //     公开管理入口的位置。用户本来就是从业务端口敲过来的，指路的价值远
+    //     不如"别告诉任何人管理面在哪"。
+    if gw.cfg.admin_listen.is_none() && (path == "/__admin" || path.starts_with("/__admin/")) {
         return crate::admin::handle(&gw, source, local, req).await;
     }
 
@@ -669,6 +651,13 @@ fn home(
         admin: session.admin,
         routes,
         current_route: route.map(|r| r.name.clone()).unwrap_or_default(),
+        // 配了独立管理端口时，首页上的管理链接要指到那个端口去；
+        // 否则在业务端口点「管理账号」会被当普通路径转发 → 上游 404。
+        admin_base: gw
+            .cfg
+            .admin_listen
+            .map(|a| admin_base(a, &host))
+            .unwrap_or_default(),
     };
     html(StatusCode::OK, web::home_page(&view))
 }

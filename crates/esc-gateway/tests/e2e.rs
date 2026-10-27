@@ -1826,16 +1826,49 @@ async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
     );
     assert!(r.body.contains("你可以访问"), "应是网关首页：{}", r.body);
 
-    // ③ 转发端口上的 /__admin/ 变成「在别处」的说明，而不是管理面板
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("管理面板不在这个端口"), "{}", r.body);
+    // ③ 转发端口上的 /__admin/ **不再被网关占用**：它就是普通路径，
+    //    认证后照常转发给上游（上游没有它，于是 404）。不再给「管理面板在
+    //    别处」的指路页——那等于在每个公网端口上公开管理入口的位置。
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "应转发给上游：{}", r.body);
     assert!(
-        r.body.contains(&format!(":{}", admin.port())),
-        "要给出管理端口的链接：{}",
+        r.body.contains("\"uri\":\"/__admin/\""),
+        "应是上游收到的请求，而不是网关自己的页面：{}",
         r.body
     );
-    assert!(!r.body.contains("最近操作"), "不该泄露管理面板内容");
+    assert!(
+        !r.body.contains("管理面板"),
+        "不该再暴露管理入口：{}",
+        r.body
+    );
+
+    // 未登录时它和任何路径一样：脚本拿 401，浏览器跳登录页。
+    // 都不透露"管理面板在哪"。
+    let r = http(gw.addr(), "GET", "/__admin/", &[("accept", "*/*")], None).await;
+    assert_eq!(r.status, 401);
+    assert!(
+        !r.body.contains(&admin.port().to_string()),
+        "未登录时更不该泄露管理端口：{}",
+        r.body
+    );
+
+    // ③b 但网关首页上的「管理账号」要指到管理端口去，否则在业务端口点它
+    //     会被当普通路径转发 → 上游 404。
+    let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.body
+            .contains(&format!("//127.0.0.1:{}/__admin/", admin.port())),
+        "首页的管理链接应指向管理端口：{}",
+        r.body
+    );
 
     // ④ 但转发端口照旧工作
     let r = http(
