@@ -209,6 +209,25 @@ async fn main() -> anyhow::Result<()> {
                 println!("  要启用账号管理：给某个 [[user]] 加 admin = true。");
             }
 
+            match &rt.routes_file {
+                Some(p) => {
+                    let st = esc_gateway::RouteStore::load(Some(p));
+                    let state = if st.writable() {
+                        format!("可写，{} 条", st.count())
+                    } else {
+                        format!("只读（{}）", st.note().unwrap_or_else(|| "原因未知".into()))
+                    };
+                    println!("    routes_file  : {} —— {state}", p.display());
+                    for r in st.all() {
+                        println!("      - {:<16} {} → {}", r.name, r.listen, r.upstream);
+                    }
+                    for r in st.rejected() {
+                        println!("      ! 被拒绝的条目：{r}");
+                    }
+                }
+                None => println!("    routes_file  : 未配置 —— 端口只能在配置文件里改"),
+            }
+
             println!("    routes       : {}", rt.routes.len());
             for r in rt.routes.values() {
                 println!(

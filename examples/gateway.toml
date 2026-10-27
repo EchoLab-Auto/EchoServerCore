@@ -40,6 +40,11 @@ secure_cookie = false
 # 目录不可写时面板自动降级为只读，并在页面上说明原因。
 # users_file = "/var/lib/esc-gateway/gateway-users.toml"
 
+# 端口（代理目标）也存在一个可写的库文件里，同名端口以它为准。
+# 不写这一行 = 自动取配置文件同目录的 gateway-routes.toml。
+# 面板改端口**立即生效**（现绑监听套接字，绑不上就整体不变），不用重启。
+# routes_file = "/var/lib/esc-gateway/gateway-routes.toml"
+
 # 只允许这些来源访问管理面板（空 = 不限）。和账号认证是「与」关系。
 # 面板就挂在公网端口上，想「只从内网/VPN 改账号」填这里即可，不必多开端口。
 # admin_allowed_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]

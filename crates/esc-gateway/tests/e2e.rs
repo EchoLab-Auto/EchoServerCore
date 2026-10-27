@@ -154,6 +154,10 @@ impl Gw {
 /// 起网关。给定上游地址与两点自定义：额外 route、限速放宽。
 async fn start_gateway(upstream: SocketAddr, tweak: impl FnOnce(&mut GatewayConfig)) -> Gw {
     let hash = esc_gateway::config::hash_password("pw-123").unwrap();
+    // 配置里必须写**真实端口**：热应用会拿配置里的 listen 去 bind，
+    // 占位值（:0 / :1）会让"改路由"变成"给 1 号端口提权失败"。
+    let panel_port = pick_port();
+    let other_port = pick_port();
     let mut cfg: GatewayConfig = toml::from_str(&format!(
         r#"
 title = "测试网关"
@@ -178,12 +182,12 @@ routes = ["panel"]
 
 [[route]]
 name = "panel"
-listen = "127.0.0.1:0"
+listen = "127.0.0.1:{panel_port}"
 upstream = "{upstream}"
 
 [[route]]
 name = "admin-only"
-listen = "127.0.0.1:1"
+listen = "127.0.0.1:{other_port}"
 upstream = "{upstream}"
 "#
     ))
@@ -194,20 +198,31 @@ upstream = "{upstream}"
     let gw = Arc::new(Gateway::new(Arc::new(rt)));
     let token = CancellationToken::new();
 
-    // 手动绑定（listen 写的是 :0，需要真实的端口）
-    let mut listens = Vec::new();
-    for r in gw.cfg.routes.values() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut r2 = r.clone();
-        r2.listen = l.local_addr().unwrap();
-        listens.push((r2, l));
-    }
+    // 手工绑定配置里的端口，并**登记进 ListenerSet**：这样管理面板做热应用时
+    // 会认为这些端口"已经在听"，不会重复 bind，删除时也能正确停掉。
     let mut addrs = std::collections::HashMap::new();
-    for (r, l) in listens {
-        addrs.insert(r.name.clone(), r.listen);
+    for r in gw.cfg.routes.values() {
+        let l = tokio::net::TcpListener::bind(r.listen)
+            .await
+            .unwrap_or_else(|e| panic!("绑定 {} 失败: {e}", r.listen));
+        let addr = l.local_addr().unwrap();
+        addrs.insert(r.name.clone(), addr);
+        let mut r2 = r.clone();
+        r2.listen = addr;
+        gw.routes.replace_route(r2.clone());
+
+        let tok = gw.listeners.adopt(addr);
         let gw = gw.clone();
         let shut = token.clone();
-        tokio::spawn(async move { esc_gateway::proxy::serve_route(gw, r, l, shut).await });
+        tokio::spawn(async move {
+            // 让 route 的取消令牌与测试的 token 联动
+            let t = tok.clone();
+            tokio::spawn(async move {
+                shut.cancelled().await;
+                t.cancel();
+            });
+            esc_gateway::proxy::serve_route(gw, Arc::new(r2), l, tok).await;
+        });
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
     Gw { addrs, gw, token }
@@ -872,8 +887,10 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 async fn start_admin_gateway(upstream: SocketAddr) -> (Gw, std::path::PathBuf) {
     let dir = tmpdir("panel");
     let path = dir.join("gateway-users.toml");
+    let routes = dir.join("gateway-routes.toml");
     let gw = start_gateway(upstream, |c| {
         c.users_file = Some(path.clone());
+        c.routes_file = Some(routes);
         for u in &mut c.user {
             if u.name == "admin" {
                 u.admin = true;
@@ -882,6 +899,31 @@ async fn start_admin_gateway(upstream: SocketAddr) -> (Gw, std::path::PathBuf) {
     })
     .await;
     (gw, path)
+}
+
+/// 同步版：挑一个空闲端口（配置文本里要用，所以不能 await）。
+fn pick_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// 找一个当前空闲的 TCP 端口。
+///
+/// bind 完立刻释放：这里有个天然的竞态（释放到再次 bind 之间别人可能抢走），
+/// 但测试里没有别的竞争者，实际稳定。
+async fn free_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+fn form_escape(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('&', "%26")
+        .replace('=', "%3D")
+        .replace('+', "%2B")
+        .replace(' ', "%20")
+        .replace('\n', "%0A")
+        .replace(':', "%3A")
 }
 
 /// 带 cookie 的 POST（表单）。
@@ -1440,6 +1482,260 @@ async fn gateway_home_links_carry_the_port_and_keep_the_scheme() {
     assert!(
         !r.body.contains("href=\"http://"),
         "不该写死 scheme——前面挂 TLS 后就会跳回明文"
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 代理端口的管理面板（热应用）
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_port_added_from_the_panel_starts_listening_immediately() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 列表页能看到现有的两个端口
+    let r = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("panel") && r.body.contains("admin-only"));
+    assert!(r.body.contains("配置文件"), "要标出端口来源");
+
+    let port = free_port().await;
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
+    assert_eq!(r.status, 302, "{}", r.body);
+
+    // 真的开始听了：新端口上未登录访问会被要求登录（= 网关在服务）
+    let new_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let r = http(new_addr, "GET", "/api/x", &[("accept", "*/*")], None).await;
+    assert_eq!(r.status, 401, "新端口应已被网关接管: {}", r.body);
+
+    // 带上凭据就能拿到上游内容（admin 的 routes 是 *）
+    let r = http(
+        new_addr,
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("\"uri\":\"/\""), "{}", r.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_port_added_from_the_panel_is_written_to_disk() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}&allowed_cidrs={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string()),
+        form_escape("10.0.0.0/8\n192.168.0.0/16"),
+    );
+    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
+    assert_eq!(r.status, 302);
+
+    let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
+    let raw = std::fs::read_to_string(&routes_file).unwrap();
+    assert!(raw.contains("name = \"fresh\""), "{raw}");
+    assert!(raw.contains(&port.to_string()), "{raw}");
+    assert!(raw.contains("10.0.0.0/8"), "白名单要落盘: {raw}");
+
+    // 落盘的东西能被重新读出来（下次启动不会丢）
+    let reloaded = esc_gateway::RouteStore::load(Some(&routes_file));
+    let spec = reloaded.get("fresh").expect("重载后应有 fresh");
+    assert_eq!(spec.allowed_cidrs.len(), 2);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn changing_the_upstream_takes_effect_on_the_next_request() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+    let new_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+    // 先确认通
+    let r = http(
+        new_addr,
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    // 把上游改成一个没人听的端口：不改监听，只改转发目标
+    let body = format!(
+        "name=&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape("127.0.0.1:1"),
+    );
+    let r = post_form(gw.addr(), "/__admin/routes/fresh", &c, &body).await;
+    assert_eq!(r.status, 302, "{}", r.body);
+
+    // 同一个地址、下一个请求，就该 502 了 —— 证明每个请求都重读了路由定义
+    let r = http(
+        new_addr,
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 502, "改上游后应立刻生效: {}", r.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn a_port_that_cannot_be_bound_changes_nothing() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 占住一个端口，然后让面板去监听它
+    let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = squatter.local_addr().unwrap();
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&busy.to_string()),
+        form_escape(&up.to_string())
+    );
+    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
+    // 错误回填到表单（200），而不是重定向
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("无法监听"), "{}", r.body);
+    // 表单里的值要还在，不然重填一遍很烦
+    assert!(r.body.contains(&busy.to_string()), "{}", r.body);
+
+    // 什么都没写进库
+    let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
+    let raw = std::fs::read_to_string(&routes_file).unwrap_or_default();
+    assert!(
+        !raw.contains("name = \"fresh\""),
+        "失败的改动不该落盘: {raw}"
+    );
+    assert!(gw.gw.rt_store.get("fresh").is_none());
+    // 原有端口照旧工作
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
+    drop(squatter);
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn deleting_a_port_stops_the_listener_and_refuses_to_break_the_current_one() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+    let new_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let body = format!(
+        "name=fresh&listen={}&upstream={}",
+        form_escape(&format!("127.0.0.1:{port}")),
+        form_escape(&up.to_string())
+    );
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes", &c, &body)
+            .await
+            .status,
+        302
+    );
+
+    // 先接管 panel，让它变成"可编辑"，才能走到"删自己"那道闸
+    assert_eq!(
+        post_form(gw.addr(), "/__admin/routes/panel/adopt", &c, "")
+            .await
+            .status,
+        302
+    );
+    // 删掉「自己正在用的那个端口」要被拒绝
+    let r = post_form(gw.addr(), "/__admin/routes/panel/delete", &c, "").await;
+    assert_eq!(r.status, 302);
+    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    assert!(
+        page.body.contains("就是你现在访问管理面板用的这个"),
+        "{}",
+        page.body
+    );
+    // 它还在、还在听
+    assert!(gw.gw.routes.get("panel").is_some());
+    assert_eq!(
+        http(
+            gw.addr(),
+            "GET",
+            "/",
+            &[("cookie", &c), ("accept", "*/*")],
+            None
+        )
+        .await
+        .status,
+        200
+    );
+
+    // 删掉刚建的那个：监听要停
+    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
+    assert_eq!(r.status, 302);
+    // 监听真的停了：连都连不上（不是 401、不是 502，是 connection refused）
+    assert!(
+        tokio::net::TcpStream::connect(new_addr).await.is_err(),
+        "删掉的端口不该再接受连接"
+    );
+    // 而面板自己那个端口照旧
+    assert_eq!(
+        http(
+            gw.addr(),
+            "GET",
+            "/",
+            &[("cookie", &c), ("accept", "*/*")],
+            None
+        )
+        .await
+        .status,
+        200
     );
 
     gw.token.cancel();

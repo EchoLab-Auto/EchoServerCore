@@ -239,6 +239,224 @@ pub fn home_page(v: &HomeView) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 代理（端口 → 上游）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 端口列表里的一行。
+#[derive(Debug, Clone)]
+pub struct RouteRow {
+    pub name: String,
+    pub source_label: String,
+    pub editable: bool,
+    pub listen: String,
+    pub upstream: String,
+    /// 剥前缀 / 白名单 / 体积上限，拼成一句话。
+    pub detail: String,
+    /// 端口是否真的在听（注册表里有它）。理论上总能对上，对不上就是真出事了。
+    pub live: bool,
+    /// 是不是你现在正用的这个端口。
+    pub here: bool,
+    pub port: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutesView {
+    pub title: String,
+    pub actor: String,
+    pub is_admin: bool,
+    pub rows: Vec<RouteRow>,
+    pub store_line: String,
+    pub banners: Vec<Banner>,
+    pub current_port: u16,
+}
+
+pub fn routes_page(v: &RoutesView) -> String {
+    let mut body = String::new();
+    body.push_str("<h2>代理端口</h2>");
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+    body.push_str(&format!(
+        "<p class=\"hint\" style=\"margin-bottom:14px\">路由库：{}</p>",
+        esc(&v.store_line)
+    ));
+
+    if v.rows.is_empty() {
+        body.push_str("<div class=\"empty\">一个端口都没有——网关现在什么都不转发</div>");
+    } else {
+        body.push_str(
+            "<table><thead><tr><th>端口名</th><th>监听</th><th>上游</th><th>其他</th><th></th></tr></thead><tbody>",
+        );
+        for r in &v.rows {
+            let name = esc(&r.name);
+            let here = if r.here {
+                "<span class=\"badge adm\">你在这里</span>"
+            } else {
+                ""
+            };
+            let ro = if r.editable {
+                String::new()
+            } else {
+                "<span class=\"badge ro\">只读</span>".to_string()
+            };
+            let dead = if r.live {
+                String::new()
+            } else {
+                "<span class=\"badge ro\" title=\"注册表里找不到这个端口\">未监听</span>"
+                    .to_string()
+            };
+            let mut actions = String::new();
+            if r.editable {
+                actions.push_str(&format!(
+                    "<a class=\"btn\" href=\"/__admin/routes/{n}\">编辑</a>",
+                    n = urlencode_attr(&r.name)
+                ));
+                actions.push_str(&format!(
+                    " <form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/delete\" \
+onsubmit=\"return confirm('删除端口 {n}？它会立刻停止监听。')\">\
+<button class=\"btn danger\" type=\"submit\">删除</button></form>",
+                    n = urlencode_attr(&r.name)
+                ));
+            } else {
+                actions.push_str(&format!(
+                    "<form class=\"inline\" method=\"post\" action=\"/__admin/routes/{n}/adopt\">\
+<button class=\"btn\" type=\"submit\">接管</button></form>",
+                    n = urlencode_attr(&r.name)
+                ));
+            }
+            body.push_str(&format!(
+                "<tr><td><span class=\"mono\">{name}</span>{here}{dead}{ro}\
+<div class=\"hint\">{src}</div></td>\
+<td class=\"mono\">{listen}</td><td class=\"mono dim\">{upstream}</td>\
+<td class=\"hint\">{detail}</td>\
+<td><div class=\"row\" style=\"justify-content:flex-end\">{actions}</div></td></tr>",
+                src = esc(&r.source_label),
+                listen = esc(&r.listen),
+                upstream = esc(&r.upstream),
+                detail = esc(&r.detail),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+
+    body.push_str(
+        "<div class=\"row\" style=\"margin-top:16px\">\
+<a class=\"btn pri\" href=\"/__admin/routes/new\">新增端口</a>\
+<span class=\"hint\">保存即生效：先绑端口，绑不上就整体不变（不会出现改了一半）。</span></div>",
+    );
+    body.push_str(&format!(
+        "<p class=\"hint\">你现在是从端口 <span class=\"mono\">{}</span> 访问管理面板的。\
+删掉这个端口会把当前连接一起断掉，所以面板不允许这么做。</p>",
+        v.current_port
+    ));
+
+    layout(&v.title, &v.actor, v.is_admin, "routes", &body)
+}
+
+/// 新建 / 编辑端口的表单。
+#[derive(Debug, Clone)]
+pub struct RouteFormView {
+    pub title: String,
+    pub actor: String,
+    pub is_admin: bool,
+    pub name: String,
+    pub is_new: bool,
+    pub name_locked: bool,
+    pub listen: String,
+    pub upstream: String,
+    pub strip_prefix: String,
+    pub max_body_bytes: String,
+    pub allowed_cidrs: String,
+    pub writable: bool,
+    pub banners: Vec<Banner>,
+}
+
+pub fn route_form_page(v: &RouteFormView) -> String {
+    let mut body = String::new();
+    let heading = if v.is_new {
+        "新增端口".to_string()
+    } else {
+        format!("编辑端口 {}", v.name)
+    };
+    body.push_str(&format!("<h2>{}</h2>", esc(&heading)));
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+
+    let action = if v.is_new {
+        "/__admin/routes".to_string()
+    } else {
+        format!("/__admin/routes/{}", urlencode_attr(&v.name))
+    };
+    body.push_str(&format!("<form method=\"post\" action=\"{action}\">"));
+
+    // 名字
+    if v.name_locked {
+        body.push_str(&format!(
+            "<div class=\"field\"><label>端口名</label><div class=\"mono\">{}</div>\
+<p class=\"hint\">端口名不可修改——账号的授权是按名字引用的，改名等于换一个端口。\
+要改就新建一个再删掉这个。</p></div>",
+            esc(&v.name)
+        ));
+    } else {
+        body.push_str(
+            "<div class=\"field\"><label for=\"n\">端口名</label>\
+<input id=\"n\" name=\"name\" autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" required \
+placeholder=\"例如 server-panel\">\
+<p class=\"hint\">只用来标识和授权，不会出现在 URL 里。字母、数字、<code>.</code> <code>-</code> <code>_</code>。</p></div>",
+        );
+    }
+
+    // 监听 → 上游
+    body.push_str(&format!(
+        "<div class=\"grid2\">\
+<div class=\"field\"><label for=\"l\">对外监听</label>\
+<input id=\"l\" name=\"listen\" required placeholder=\"0.0.0.0:2224\" value=\"{listen}\">\
+<p class=\"hint\">浏览器连的地址。<code>0.0.0.0</code> = 所有网卡。</p></div>\
+<div class=\"field\"><label for=\"u\">上游</label>\
+<input id=\"u\" name=\"upstream\" required placeholder=\"127.0.0.1:18788\" value=\"{upstream}\">\
+<p class=\"hint\">转发到哪。上游应当只听回环——认证由网关独占。</p></div></div>",
+        listen = esc(&v.listen),
+        upstream = esc(&v.upstream),
+    ));
+
+    // 可选三项
+    body.push_str("<fieldset><legend>可选（留空即默认）</legend>");
+    body.push_str(&format!(
+        "<div class=\"grid2\">\
+<div class=\"field\"><label for=\"sp\">剥掉路径前缀</label>\
+<input id=\"sp\" name=\"strip_prefix\" placeholder=\"/panel\" value=\"{sp}\">\
+<p class=\"hint\">上游按 <code>/</code> 认路径时用。必须以 <code>/</code> 开头。</p></div>\
+<div class=\"field\"><label for=\"mb\">请求体上限（字节）</label>\
+<input id=\"mb\" name=\"max_body_bytes\" inputmode=\"numeric\" placeholder=\"10485760\" value=\"{mb}\">\
+<p class=\"hint\">留空 = 10 MB。只读面板其实用不到大体积上传。</p></div></div>",
+        sp = esc(&v.strip_prefix),
+        mb = esc(&v.max_body_bytes),
+    ));
+    body.push_str(&format!(
+        "<div class=\"field\"><label for=\"cidrs\">来源白名单（一行一个，留空 = 不限）</label>\
+<textarea id=\"cidrs\" name=\"allowed_cidrs\" rows=\"3\" placeholder=\"203.0.113.0/24\" \
+style=\"width:100%;font:inherit;background:#0a0d12;color:var(--fg);border:1px solid var(--line);\
+border-radius:7px;padding:9px 11px;font-family:var(--mono);font-size:12.5px\">{cidrs}</textarea>\
+<p class=\"hint\">和登录认证是<strong>与</strong>关系：既要有权限，也要来自这些网段。</p></div>",
+        cidrs = esc(&v.allowed_cidrs),
+    ));
+    body.push_str("</fieldset>");
+
+    body.push_str(&format!(
+        "<div class=\"banner warn\" style=\"margin:0 0 14px\">保存会立刻生效：网关先试着绑上这个端口，\
+绑不上就什么都不改（旧端口继续正常工作）。\
+要监听 1024 以下的端口，非 root 运行需要额外权限（容器里是 <code>NET_BIND_SERVICE</code>）。</div>\
+<div class=\"row\"><button class=\"btn pri\" type=\"submit\"{}>{}</button>\
+<a class=\"btn\" href=\"/__admin/routes\">取消</a></div></form>",
+        if v.writable { "" } else { " disabled" },
+        if v.is_new { "添加并开始监听" } else { "保存并生效" }
+    ));
+
+    layout(&v.title, &v.actor, v.is_admin, "routes", &body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 管理面板
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -319,6 +537,7 @@ fn layout(title: &str, actor: &str, is_admin: bool, active: &str, body: &str) ->
     };
     let mut nav = item("/__admin/", "账号", "users");
     if is_admin {
+        nav.push_str(&item("/__admin/routes", "代理", "routes"));
         nav.push_str(&item("/__admin/sessions", "会话", "sessions"));
     }
     nav.push_str(&item("/__admin/me", "我的账号", "me"));

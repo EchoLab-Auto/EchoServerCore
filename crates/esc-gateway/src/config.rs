@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use esc_panel_auth::AllowRule;
 
@@ -54,6 +54,14 @@ pub struct GatewayConfig {
     /// 同名账号以账号库为准——这样配置文件永远是一条可用的救援通道。
     #[serde(default)]
     pub users_file: Option<PathBuf>,
+
+    /// 路由库文件（管理面板管理的端口 → 上游）。
+    ///
+    /// 不设则默认取配置文件同目录的 `gateway-routes.toml`。
+    /// 同名路由以路由库为准——配置文件因此永远是救援通道：路由库坏了，
+    /// 里面的端口照样有人听，包括管理面板自己那个。
+    #[serde(default)]
+    pub routes_file: Option<PathBuf>,
 
     /// 允许访问管理面板的来源白名单（空 = 不限）。和账号认证是**与**关系。
     ///
@@ -120,7 +128,9 @@ pub struct UserConfig {
     pub admin: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 一条路由的**配置形态**。既可反序列化（gateway.toml / 路由库），
+/// 也可序列化（面板改完写回路由库）。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub name: String,
@@ -139,6 +149,111 @@ pub struct RouteConfig {
     pub max_body_bytes: Option<u64>,
 }
 
+impl RouteConfig {
+    /// 校验单条路由并转成运行时形态。
+    pub fn to_runtime(&self) -> Result<RouteRuntime, String> {
+        if !valid_name(&self.name) {
+            return Err(format!(
+                "route 名 {:?} 不合法：只能用字母、数字、`.` `-` `_`，长度 1..=64",
+                self.name
+            ));
+        }
+        let addr: SocketAddr = self.listen.parse().map_err(|_| {
+            format!(
+                "route {:?} 的 listen 不是合法地址: {:?}（需要 host:port，如 0.0.0.0:2224）",
+                self.name, self.listen
+            )
+        })?;
+        let up: SocketAddr = self.upstream.parse().map_err(|_| {
+            format!(
+                "route {:?} 的 upstream 不是合法地址: {:?}（需要 host:port，如 127.0.0.1:18788）",
+                self.name, self.upstream
+            )
+        })?;
+        // 上游指回自己 = 无限循环。这类错误一旦上线就是 CPU 100% 且难以定位。
+        if up == addr {
+            return Err(format!(
+                "route {:?} 的 upstream 与 listen 相同（{up}），会形成转发环路",
+                self.name
+            ));
+        }
+        if let Some(p) = &self.strip_prefix {
+            if !p.starts_with('/') {
+                return Err(format!(
+                    "route {:?} 的 strip_prefix 必须以 / 开头",
+                    self.name
+                ));
+            }
+            if p.contains(['?', '#']) || p.chars().any(|c| c.is_control()) {
+                return Err(format!(
+                    "route {:?} 的 strip_prefix 不能包含 ? # 或控制字符",
+                    self.name
+                ));
+            }
+        }
+        if self.max_body_bytes == Some(0) {
+            return Err(format!(
+                "route {:?} 的 max_body_bytes 不能是 0（留空表示默认 10 MB）",
+                self.name
+            ));
+        }
+        if let Some(n) = self.max_body_bytes {
+            if n > 1024 * 1024 * 1024 {
+                return Err(format!(
+                    "route {:?} 的 max_body_bytes 过大（上限 1 GiB）",
+                    self.name
+                ));
+            }
+        }
+        let mut allow = Vec::new();
+        for c in &self.allowed_cidrs {
+            allow.push(
+                AllowRule::parse(c)
+                    .map_err(|e| format!("route {:?} 的 allowed_cidrs: {e}", self.name))?,
+            );
+        }
+        Ok(RouteRuntime {
+            name: self.name.clone(),
+            listen: addr,
+            upstream: up,
+            allow,
+            allowed_cidrs_raw: self.allowed_cidrs.clone(),
+            strip_prefix: self.strip_prefix.clone(),
+            max_body_bytes: self.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
+        })
+    }
+}
+
+/// 两个监听地址会不会抢同一个端口。
+///
+/// 只看 `SocketAddr` 是否相等是不够的：`0.0.0.0:2224` 和 `127.0.0.1:2224`
+/// 在 bind 的时候是实打实的冲突（后者会 EADDRINUSE），但在结构体上不相等。
+pub fn listeners_conflict(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// 校验一组路由（可能是"配置文件 ∪ 路由库"的合并结果）。
+pub fn validate_route_list(routes: &[RouteConfig]) -> Result<Vec<RouteRuntime>, String> {
+    let mut names = HashSet::new();
+    let mut out: Vec<RouteRuntime> = Vec::with_capacity(routes.len());
+    for r in routes {
+        let rt = r.to_runtime()?;
+        if !names.insert(rt.name.clone()) {
+            return Err(format!("route 名 {:?} 重复", rt.name));
+        }
+        if let Some(other) = out.iter().find(|o| listeners_conflict(o.listen, rt.listen)) {
+            return Err(format!(
+                "{} 与 {} 想监听同一个端口 {}，请改成不同端口",
+                other.name,
+                rt.name,
+                rt.listen.port()
+            ));
+        }
+        out.push(rt);
+    }
+    Ok(out)
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -152,6 +267,7 @@ impl Default for GatewayConfig {
             user: Vec::new(),
             route: Vec::new(),
             users_file: None,
+            routes_file: None,
             admin_allowed_cidrs: Vec::new(),
         }
     }
@@ -169,6 +285,11 @@ fn default_cookie() -> String {
 fn default_max_sessions() -> usize {
     4096
 }
+/// 路由库的默认位置：配置文件同目录的 `gateway-routes.toml`。
+pub fn default_routes_file(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("gateway-routes.toml")
+}
+
 /// 账号库的默认位置：配置文件同目录的 `gateway-users.toml`。
 pub fn default_users_file(config_path: &Path) -> PathBuf {
     config_path.with_file_name("gateway-users.toml")
@@ -180,6 +301,11 @@ pub fn default_users_file(config_path: &Path) -> PathBuf {
 /// 表单值和 HTML 里。三者各自有转义规则，允许任意字符就等于要求三处都不能
 /// 出错。限定成 ASCII 标识符后，这三个上下文里都是原样安全的。
 pub fn valid_user_name(name: &str) -> bool {
+    valid_name(name)
+}
+
+/// 账号名与路由名共用同一套字符集：它们都会进 URL 路径、表单值和 HTML。
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -214,6 +340,9 @@ impl GatewayConfig {
         // 管理面板」成立，而不至于因为漏配一个字段就得到一个只读面板。
         if cfg.users_file.is_none() {
             cfg.users_file = Some(default_users_file(path));
+        }
+        if cfg.routes_file.is_none() {
+            cfg.routes_file = Some(default_routes_file(path));
         }
         cfg.validate()
             .map_err(|e| anyhow::anyhow!("配置无效: {e}"))?;
@@ -274,45 +403,23 @@ impl GatewayConfig {
 
         // ── 路由 ──
         let mut rnames = HashSet::new();
-        let mut listens = HashSet::new();
         for r in &self.route {
+            r.to_runtime()?;
             if !rnames.insert(r.name.as_str()) {
                 return Err(format!("route 名 {:?} 重复", r.name));
             }
-            let addr: SocketAddr = r.listen.parse().map_err(|_| {
-                format!("route {:?} 的 listen 不是合法地址: {:?}", r.name, r.listen)
-            })?;
-            if !listens.insert(addr) {
-                return Err(format!("有多个 route 监听同一地址 {addr}，请改成不同端口"));
-            }
-            let up: SocketAddr = r.upstream.parse().map_err(|_| {
-                format!(
-                    "route {:?} 的 upstream 不是合法地址: {:?}（需要 host:port）",
-                    r.name, r.upstream
-                )
-            })?;
-            // 上游指回自己 = 无限循环。这类错误一旦上线就是 CPU 100% 且难以定位。
-            if up == addr {
+        }
+        // 端口冲突要按"全部生效的路由"判，所以走单独一遍。
+        let mut seen: Vec<SocketAddr> = Vec::new();
+        for r in &self.route {
+            let rt = r.to_runtime()?;
+            if seen.iter().any(|a| listeners_conflict(*a, rt.listen)) {
                 return Err(format!(
-                    "route {:?} 的 upstream 与 listen 相同（{up}），会形成转发环路",
-                    r.name
+                    "有多个 route 监听同一个端口 {}，请改成不同端口",
+                    rt.listen.port()
                 ));
             }
-            for c in &r.allowed_cidrs {
-                AllowRule::parse(c)
-                    .map_err(|e| format!("route {:?} 的 allowed_cidrs: {e}", r.name))?;
-            }
-            if let Some(p) = &r.strip_prefix {
-                if !p.starts_with('/') {
-                    return Err(format!("route {:?} 的 strip_prefix 必须以 / 开头", r.name));
-                }
-            }
-            if r.max_body_bytes == Some(0) {
-                return Err(format!(
-                    "route {:?} 的 max_body_bytes 不能是 0（用 null 表示默认）",
-                    r.name
-                ));
-            }
+            seen.push(rt.listen);
         }
 
         // ── 用户引用的 route 必须存在 ──
@@ -342,31 +449,12 @@ impl GatewayConfig {
     /// 预先解析好的运行时视图（避免每请求都 parse 字符串）。
     pub fn build(&self) -> Result<RuntimeConfig, String> {
         self.validate()?;
+        let runtimes = validate_route_list(&self.route)?;
         let mut routes = HashMap::new();
         let mut listens = Vec::new();
-        for r in &self.route {
-            let addr: SocketAddr = r.listen.parse().map_err(|e| format!("{}: {e}", r.listen))?;
-            let upstream: SocketAddr = r
-                .upstream
-                .parse()
-                .map_err(|e| format!("{}: {e}", r.upstream))?;
-            let allow: Vec<AllowRule> = r
-                .allowed_cidrs
-                .iter()
-                .filter_map(|c| AllowRule::parse(c).ok())
-                .collect();
-            listens.push(addr);
-            routes.insert(
-                r.name.clone(),
-                RouteRuntime {
-                    name: r.name.clone(),
-                    listen: addr,
-                    upstream,
-                    allow,
-                    strip_prefix: r.strip_prefix.clone(),
-                    max_body_bytes: r.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
-                },
-            );
+        for rt in runtimes {
+            listens.push(rt.listen);
+            routes.insert(rt.name.clone(), rt);
         }
         let users = self
             .user
@@ -397,6 +485,7 @@ impl GatewayConfig {
             routes,
             listens,
             users_file: self.users_file.clone(),
+            routes_file: self.routes_file.clone(),
             admin_allow: self
                 .admin_allowed_cidrs
                 .iter()
@@ -430,6 +519,9 @@ pub struct RouteRuntime {
     pub listen: SocketAddr,
     pub upstream: SocketAddr,
     pub allow: Vec<AllowRule>,
+    /// 解析后的 `allow` 对应的原文。面板要显示、要回填编辑框，靠结构体反推
+    /// 字符串既不可靠（规范化之后和用户写的不一样），也没必要。
+    pub allowed_cidrs_raw: Vec<String>,
     pub strip_prefix: Option<String>,
     pub max_body_bytes: u64,
 }
@@ -465,6 +557,8 @@ pub struct RuntimeConfig {
     pub listens: Vec<SocketAddr>,
     /// 账号库路径。`None` = 面板只读（只用配置文件里的账号）。
     pub users_file: Option<PathBuf>,
+    /// 路由库路径。`None` = 端口只能在配置文件里改。
+    pub routes_file: Option<PathBuf>,
     /// 管理面板的来源白名单（空 = 不限）。
     pub admin_allow: Vec<AllowRule>,
 }
@@ -485,8 +579,8 @@ impl RuntimeConfig {
         }
     }
 
-    /// 可授权的 route 名（面板里画成复选框）。
-    pub fn route_names(&self) -> Vec<String> {
+    /// **配置文件里**的 route 名。合并视图见 `Gateway::route_names`。
+    pub fn config_route_names(&self) -> Vec<String> {
         let mut v: Vec<String> = self.routes.keys().cloned().collect();
         v.sort();
         v
@@ -589,7 +683,10 @@ upstream = "127.0.0.1:18787"
             strip_prefix: None,
             max_body_bytes: None,
         });
-        assert!(c.validate().unwrap_err().contains("同一地址"));
+        assert!(
+            c.validate().unwrap_err().contains("同一个端口"),
+            "冲突信息要指出端口"
+        );
 
         let mut c = minimal();
         c.route.push(RouteConfig {

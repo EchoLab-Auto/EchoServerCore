@@ -29,7 +29,7 @@
 //! （把哈希复制进账号库，从此以账号库为准）。这一下点击换来的是：运维手改
 //! 配置文件不会被面板悄悄覆盖，而且配置文件始终留作救援通道。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Limited};
@@ -52,8 +52,9 @@ const PREFIX: &str = "/__admin";
 const MAX_FORM_BYTES: usize = 8 * 1024;
 
 pub async fn handle(
-    gw: &Gateway,
+    gw: &std::sync::Arc<Gateway>,
     source: Option<IpAddr>,
+    local: SocketAddr,
     req: HyperRequest<Incoming>,
 ) -> HyperResponse<ProxyBody> {
     let path = req.uri().path().to_string();
@@ -143,6 +144,7 @@ pub async fn handle(
         admin: session.admin,
         sid,
         source,
+        local,
         flash,
     };
 
@@ -156,6 +158,15 @@ pub async fn handle(
         (true, ["users", name, "delete"]) => ctx.user_delete(name),
         (true, ["users", name, "adopt"]) => ctx.user_adopt(name),
         (true, ["users", name, "revoke"]) => ctx.user_revoke_sessions(name),
+
+        // 代理（端口 → 上游）
+        (false, ["routes"]) => ctx.routes_page(),
+        (false, ["routes", "new"]) => ctx.route_form_new(),
+        (true, ["routes"]) => ctx.route_create(req).await,
+        (false, ["routes", name]) => ctx.route_form_edit(name),
+        (true, ["routes", name]) => ctx.route_update(name, req).await,
+        (true, ["routes", name, "delete"]) => ctx.route_delete(name).await,
+        (true, ["routes", name, "adopt"]) => ctx.route_adopt(name),
 
         // 会话
         (false, ["sessions"]) => ctx.sessions_page(),
@@ -171,11 +182,13 @@ pub async fn handle(
 
 /// 一次请求的上下文，省得每个处理函数都拖一长串参数。
 struct Ctx<'a> {
-    gw: &'a Gateway,
+    gw: &'a std::sync::Arc<Gateway>,
     actor: String,
     admin: bool,
     sid: String,
     source: Option<IpAddr>,
+    /// 这个请求是从哪个监听端口进来的。删路由时要靠它认出"我自己"。
+    local: SocketAddr,
     flash: Flash,
 }
 
@@ -539,6 +552,313 @@ impl Ctx<'_> {
         self.done(true, &format!("{PREFIX}/"), &msg)
     }
 
+    // ── 代理（端口 → 上游） ─────────────────────────────────────────────
+
+    fn routes_page(&self) -> HyperResponse<ProxyBody> {
+        let gw = self.gw;
+        let mut banners = self.flash.banners();
+        banners.extend(self.route_store_banners());
+
+        let rows: Vec<web::RouteRow> = gw
+            .effective_routes()
+            .into_iter()
+            .map(|e| {
+                let port = e.spec.listen.rsplit(':').next().unwrap_or("").to_string();
+                let here = e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local);
+                web::RouteRow {
+                    name: e.spec.name.clone(),
+                    source_label: e.source.label().to_string(),
+                    editable: e.source.editable(),
+                    listen: e.spec.listen.clone(),
+                    upstream: e.spec.upstream.clone(),
+                    detail: route_detail(&e.spec),
+                    live: gw.routes.get(&e.spec.name).is_some(),
+                    here,
+                    port,
+                }
+            })
+            .collect();
+
+        if rows.len() <= 1 {
+            banners.push(Banner::warn(
+                "现在只有 1 个端口在转发。把最后一条也删掉，就连这个管理面板也进不来了——\
+                 删之前先加好新的。",
+            ));
+        }
+
+        let view = web::RoutesView {
+            title: gw.title().to_string(),
+            actor: self.actor.clone(),
+            is_admin: true,
+            rows,
+            store_line: route_store_line(gw),
+            banners,
+            current_port: self.local.port(),
+        };
+        page(StatusCode::OK, web::routes_page(&view))
+    }
+
+    fn route_store_banners(&self) -> Vec<Banner> {
+        let store = &self.gw.rt_store;
+        let mut v = Vec::new();
+        if let Some(note) = store.note() {
+            v.push(Banner::warn(note));
+        }
+        for r in store.rejected() {
+            v.push(Banner::err(format!("路由库里有条目被拒绝（已跳过）：{r}")));
+        }
+        for e in self.gw.effective_routes() {
+            if e.source == crate::routes::RouteSource::StoreOverConfig {
+                v.push(Banner::warn(format!(
+                    "端口 `{}` 同时存在于路由库和 gateway.toml，当前以路由库为准。",
+                    e.spec.name
+                )));
+            }
+        }
+        // 名字存在于账号 ACL 里、但端口已经不在了——这类"悬空引用"会让那个
+        // 账号以为自己在用某个面板，其实已经没了，早点说出来。
+        let names = self.gw.route_names();
+        for a in self.gw.accounts() {
+            let dangling: Vec<&String> = a
+                .user
+                .routes
+                .iter()
+                .filter(|r| **r != "*" && !names.iter().any(|n| n == *r))
+                .collect();
+            if !dangling.is_empty() {
+                v.push(Banner::warn(format!(
+                    "账号 `{}` 被授权访问已不存在的端口：{}",
+                    a.user.name,
+                    dangling
+                        .iter()
+                        .map(|s| format!("`{s}`"))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )));
+            }
+        }
+        v
+    }
+
+    fn route_form_new(&self) -> HyperResponse<ProxyBody> {
+        self.render_route_form(RouteFormState {
+            is_new: true,
+            name_locked: false,
+            banners: self.flash.banners(),
+            ..Default::default()
+        })
+    }
+
+    fn route_form_edit(&self, name: &str) -> HyperResponse<ProxyBody> {
+        let Some(e) = self.route(name) else {
+            return self.not_found_route(name);
+        };
+        let mut banners = self.flash.banners();
+        if !e.source.editable() {
+            banners.push(Banner::warn(format!(
+                "端口 {name} 来自 gateway.toml，面板里改不了。保存前要先在列表里「接管」它。"
+            )));
+        }
+        self.render_route_form(RouteFormState {
+            is_new: false,
+            name_locked: true,
+            name: e.spec.name.clone(),
+            listen: e.spec.listen.clone(),
+            upstream: e.spec.upstream.clone(),
+            strip_prefix: e.spec.strip_prefix.clone().unwrap_or_default(),
+            max_body_bytes: e
+                .spec
+                .max_body_bytes
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            allowed_cidrs: e.spec.allowed_cidrs.join("\n"),
+            banners,
+        })
+    }
+
+    async fn route_create(&self, req: HyperRequest<Incoming>) -> HyperResponse<ProxyBody> {
+        let form = match read_form(req).await {
+            Ok(f) => f,
+            Err(e) => return text(StatusCode::BAD_REQUEST, e),
+        };
+        let input = RouteInput::from_form(&form);
+        let spec = match input.validate(self.gw, true, None) {
+            Ok(s) => s,
+            Err(e) => return self.render_route_form(input.to_state(true, false, e)),
+        };
+        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), true) {
+            Ok(v) => v,
+            Err(e) => return self.render_route_form(input.to_state(true, false, e)),
+        };
+        self.apply_route_change(spec, pending, action, &format!("{PREFIX}/routes"), true)
+            .await
+    }
+
+    async fn route_update(
+        &self,
+        name: &str,
+        req: HyperRequest<Incoming>,
+    ) -> HyperResponse<ProxyBody> {
+        let Some(e) = self.route(name) else {
+            return self.not_found_route(name);
+        };
+        if !e.source.editable() {
+            return self.done(
+                false,
+                &format!("{PREFIX}/routes"),
+                &format!("端口 {name} 来自 gateway.toml，面板里改不了。先点「接管」。"),
+            );
+        }
+        let form = match read_form(req).await {
+            Ok(f) => f,
+            Err(e) => return text(StatusCode::BAD_REQUEST, e),
+        };
+        let input = RouteInput::from_form(&form);
+        // 端口名来自 URL，表单里不提交，所以这里用它兜底
+        let spec = match input.validate(self.gw, false, Some(name)) {
+            Ok(s) => s,
+            Err(e) => return self.render_route_form(input.to_state(false, true, e)),
+        };
+        let (pending, action) = match self.gw.rt_store.stage(spec.clone(), false) {
+            Ok(v) => v,
+            Err(e) => return self.render_route_form(input.to_state(false, true, e)),
+        };
+        self.apply_route_change(spec, pending, action, &format!("{PREFIX}/routes"), false)
+            .await
+    }
+
+    async fn route_delete(&self, name: &str) -> HyperResponse<ProxyBody> {
+        let back = format!("{PREFIX}/routes");
+        let Some(e) = self.route(name) else {
+            return self.not_found_route(name);
+        };
+        if !e.source.editable() {
+            return self.done(
+                false,
+                &back,
+                &format!("端口 {name} 来自 gateway.toml，请改配置文件删掉它"),
+            );
+        }
+        // 删掉自己脚下的端口 = 立刻把自己的连接掐了，用户看到的是「页面加载失败」。
+        if e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local) {
+            return self.done(
+                false,
+                &back,
+                &format!(
+                    "端口 {name} 就是你现在访问管理面板用的这个（{}）。\
+                     删它会把当前连接一起断掉——请从别的端口进来删。",
+                    self.local
+                ),
+            );
+        }
+        if self.gw.effective_routes().len() <= 1 {
+            return self.done(
+                false,
+                &back,
+                "这是最后一个端口，删掉之后网关什么都不转发（也包括管理面板）。先加一个新的。",
+            );
+        }
+        let (pending, action) = match self.gw.rt_store.stage_delete(name) {
+            Ok(v) => v,
+            Err(e) => return self.done(false, &back, &e),
+        };
+        // 同步版：删端口不需要绑新套接字，直接写盘 + 换注册表 + 停监听。
+        if let Err(e) = self
+            .gw
+            .rt_store
+            .commit(&self.actor, pending.clone(), &action)
+        {
+            return self.done(false, &back, &e);
+        }
+        let runtimes = match self.gw.candidate_runtimes(&pending) {
+            Ok(r) => r,
+            Err(e) => {
+                // 这种情况理论上不会发生（删一条只会减少冲突），但真发生了
+                // 要能说出来，而不是留一个"文件和内存不一致"的烂摊子。
+                tracing::error!(error = %e, "删除端口后合并结果不合法");
+                return self.done(false, &back, &format!("删除后配置不合法：{e}"));
+            }
+        };
+        let prepared = match self.gw.listeners.prepare(&runtimes).await {
+            Ok(p) => p,
+            Err(e) => return self.done(false, &back, &e),
+        };
+        self.gw.commit_routes(runtimes, prepared);
+        tracing::info!(actor = %self.actor, target = %name, source = ?self.source, "route deleted");
+        self.done(true, &back, &format!("端口 {name} 已删除，监听已停止"))
+    }
+
+    fn route_adopt(&self, name: &str) -> HyperResponse<ProxyBody> {
+        let back = format!("{PREFIX}/routes");
+        let Some(e) = self.route(name) else {
+            return self.not_found_route(name);
+        };
+        if e.source != crate::routes::RouteSource::Config {
+            return self.done(false, &back, &format!("端口 {name} 已经在路由库里了"));
+        }
+        let (pending, action) = match self.gw.rt_store.stage_adopt(&e.spec) {
+            Ok(v) => v,
+            Err(e) => return self.done(false, &back, &e),
+        };
+        if let Err(e) = self.gw.rt_store.commit(&self.actor, pending, &action) {
+            return self.done(false, &back, &e);
+        }
+        tracing::info!(actor = %self.actor, target = %name, "config route adopted into the store");
+        self.done(
+            true,
+            &back,
+            &format!(
+                "端口 {name} 已接管进路由库，现在可以编辑了。\
+                 gateway.toml 里那条现在被覆盖——建议删掉以免混淆。"
+            ),
+        )
+    }
+
+    /// 新建 / 修改端口：两阶段热应用。
+    ///
+    /// 顺序不能变：**先绑新端口 → 再写盘 → 最后换内存**。
+    ///   * 先绑：绑不上就整体放弃，等于什么都没改（而不是写进文件后才发现端口占用）
+    ///   * 再写盘：写失败就丢掉刚绑的套接字，内存不动
+    ///   * 最后换内存：此时磁盘和内存一致，重启也不会回退
+    async fn apply_route_change(
+        &self,
+        spec: crate::config::RouteConfig,
+        pending: std::collections::BTreeMap<String, crate::config::RouteConfig>,
+        action: String,
+        back: &str,
+        creating: bool,
+    ) -> HyperResponse<ProxyBody> {
+        let prep = match self.gw.prepare_routes(&pending).await {
+            Ok(v) => v,
+            Err(e) => {
+                // 回填表单比弹一条 302 有用：刚填的东西不该丢，尤其是改错了
+                // 一个字符的时候——重填一遍端口和上游地址很烦。
+                return self.render_route_form(RouteFormState {
+                    is_new: creating,
+                    name_locked: !creating,
+                    name: spec.name,
+                    listen: spec.listen,
+                    upstream: spec.upstream,
+                    strip_prefix: spec.strip_prefix.unwrap_or_default(),
+                    max_body_bytes: spec
+                        .max_body_bytes
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    allowed_cidrs: spec.allowed_cidrs.join("\n"),
+                    banners: vec![Banner::err(e)],
+                });
+            }
+        };
+        let (runtimes, prepared) = prep;
+        if let Err(e) = self.gw.rt_store.commit(&self.actor, pending, &action) {
+            // prepared 在这里被 drop：刚绑的套接字全部释放，一切照旧
+            return self.done(false, back, &e);
+        }
+        self.gw.commit_routes(runtimes, prepared);
+        tracing::info!(actor = %self.actor, source = ?self.source, action = %action, "route applied");
+        self.done(true, back, &format!("{action}——已生效"))
+    }
+
     // ── 会话 ──
 
     fn sessions_page(&self) -> HyperResponse<ProxyBody> {
@@ -728,6 +1048,40 @@ impl Ctx<'_> {
 
     // ── 小工具 ──
 
+    fn route(&self, name: &str) -> Option<crate::routes::EffectiveRoute> {
+        self.gw
+            .effective_routes()
+            .into_iter()
+            .find(|r| r.spec.name == name)
+    }
+
+    fn not_found_route(&self, name: &str) -> HyperResponse<ProxyBody> {
+        self.done(
+            false,
+            &format!("{PREFIX}/routes"),
+            &format!("端口 {name} 不存在"),
+        )
+    }
+
+    fn render_route_form(&self, st: RouteFormState) -> HyperResponse<ProxyBody> {
+        let view = web::RouteFormView {
+            title: self.gw.title().to_string(),
+            actor: self.actor.clone(),
+            is_admin: self.admin,
+            name: st.name,
+            is_new: st.is_new,
+            name_locked: st.name_locked,
+            listen: st.listen,
+            upstream: st.upstream,
+            strip_prefix: st.strip_prefix,
+            max_body_bytes: st.max_body_bytes,
+            allowed_cidrs: st.allowed_cidrs,
+            writable: self.gw.rt_store.writable(),
+            banners: st.banners,
+        };
+        page(StatusCode::OK, web::route_form_page(&view))
+    }
+
     fn account(&self, name: &str) -> Option<Account> {
         self.gw.accounts().into_iter().find(|a| a.user.name == name)
     }
@@ -755,12 +1109,169 @@ impl Ctx<'_> {
             name_locked: st.name_locked,
             admin: st.admin,
             routes: st.routes,
-            available: self.gw.cfg.route_names(),
+            available: self.gw.route_names(),
             writable: self.gw.store.writable(),
             banners: st.banners,
         };
         page(StatusCode::OK, web::user_form_page(&view))
     }
+}
+
+/// 新建 / 编辑端口表单的初始值。
+#[derive(Default)]
+struct RouteFormState {
+    is_new: bool,
+    name_locked: bool,
+    name: String,
+    listen: String,
+    upstream: String,
+    strip_prefix: String,
+    max_body_bytes: String,
+    allowed_cidrs: String,
+    banners: Vec<Banner>,
+}
+
+/// 提交上来的端口表单。
+struct RouteInput {
+    name: String,
+    listen: String,
+    upstream: String,
+    strip_prefix: String,
+    max_body_bytes: String,
+    allowed_cidrs: String,
+}
+
+impl RouteInput {
+    fn from_form(f: &Form) -> Self {
+        Self {
+            name: f.get("name").unwrap_or("").trim().to_string(),
+            listen: f.get("listen").unwrap_or("").trim().to_string(),
+            upstream: f.get("upstream").unwrap_or("").trim().to_string(),
+            strip_prefix: f.get("strip_prefix").unwrap_or("").trim().to_string(),
+            max_body_bytes: f.get("max_body_bytes").unwrap_or("").trim().to_string(),
+            allowed_cidrs: f.get("allowed_cidrs").unwrap_or("").trim().to_string(),
+        }
+    }
+
+    fn to_state(&self, is_new: bool, name_locked: bool, err: String) -> RouteFormState {
+        RouteFormState {
+            is_new,
+            name_locked,
+            name: self.name.clone(),
+            listen: self.listen.clone(),
+            upstream: self.upstream.clone(),
+            strip_prefix: self.strip_prefix.clone(),
+            max_body_bytes: self.max_body_bytes.clone(),
+            allowed_cidrs: self.allowed_cidrs.clone(),
+            banners: vec![Banner::err(err)],
+        }
+    }
+
+    /// 校验并组装。表单层面的检查在这里，语义层面的（端口冲突、自环）交给
+    /// `config::validate_route_list`——那一套启动时也在用，不该有两份。
+    fn validate(
+        &self,
+        gw: &Gateway,
+        is_new: bool,
+        existing: Option<&str>,
+    ) -> Result<crate::config::RouteConfig, String> {
+        let name = if is_new {
+            if !crate::config::valid_name(&self.name) {
+                return Err("端口名不合法：只能用字母、数字、. - _，长度 1..=64".into());
+            }
+            if gw.route_names().iter().any(|n| n == &self.name) {
+                return Err(format!("端口名 {} 已经存在", self.name));
+            }
+            self.name.clone()
+        } else {
+            existing.unwrap_or("").to_string()
+        };
+
+        // 只在"新建"时允许留空上限；编辑时留空 = 回到默认 10 MB
+        let max_body_bytes = if self.max_body_bytes.is_empty() {
+            None
+        } else {
+            match self.max_body_bytes.parse::<u64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    return Err(format!(
+                        "请求体上限 {:?} 不是数字（单位是字节，留空 = 默认 10 MB）",
+                        self.max_body_bytes
+                    ))
+                }
+            }
+        };
+
+        // 白名单：一行一个，逗号也行——两种都有人写，认两种比报错友好。
+        let allowed_cidrs: Vec<String> = self
+            .allowed_cidrs
+            .split(['\n', ',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        Ok(crate::config::RouteConfig {
+            name,
+            listen: self.listen.clone(),
+            upstream: self.upstream.clone(),
+            allowed_cidrs,
+            strip_prefix: if self.strip_prefix.is_empty() {
+                None
+            } else {
+                Some(self.strip_prefix.clone())
+            },
+            max_body_bytes,
+        })
+    }
+}
+
+/// 一条路由的附加说明（前缀 / 白名单 / 体积上限），列表里显示成一列。
+fn route_detail(spec: &crate::config::RouteConfig) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = &spec.strip_prefix {
+        parts.push(format!("剥前缀 {p}"));
+    }
+    if !spec.allowed_cidrs.is_empty() {
+        parts.push(format!("来源白名单 {} 条", spec.allowed_cidrs.len()));
+    }
+    if let Some(n) = spec.max_body_bytes {
+        parts.push(format!("体积上限 {}", human_bytes(n)));
+    }
+    if parts.is_empty() {
+        "—".into()
+    } else {
+        parts.join("，")
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB && n.is_multiple_of(GB) {
+        format!("{} GB", n / GB)
+    } else if n >= MB && n.is_multiple_of(MB) {
+        format!("{} MB", n / MB)
+    } else if n >= KB {
+        format!("{} KB", n / KB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn route_store_line(gw: &Gateway) -> String {
+    let store = &gw.rt_store;
+    let path = store
+        .path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "（未配置 routes_file）".into());
+    let state = if store.writable() {
+        format!("可写，{} 条", store.count())
+    } else {
+        "只读".to_string()
+    };
+    format!("{path} —— {state}。同名端口以路由库为准；保存时立即生效，端口绑不上就整体不生效。")
 }
 
 struct FormState {
@@ -853,7 +1364,7 @@ impl UserInput {
         if self.routes.is_empty() {
             return Err("至少要勾一个端口（或勾「全部端口」），否则这个账号什么也访问不了".into());
         }
-        let known = gw.cfg.route_names();
+        let known = gw.route_names();
         let mut picked = Vec::new();
         for r in &self.routes {
             if r == "*" {

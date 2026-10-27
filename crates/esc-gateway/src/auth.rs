@@ -448,6 +448,7 @@ mod tests {
             routes: HashMap::new(),
             listens: vec![],
             users_file: None,
+            routes_file: None,
             admin_allow: vec![],
         }
     }

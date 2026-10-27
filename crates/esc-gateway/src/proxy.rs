@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, AuthState, Denied};
 use crate::config::{RouteRuntime, RuntimeConfig, UserRuntime};
+use crate::routes::{EffectiveRoute, ListenerSet, RouteRegistry, RouteSource, RouteStore};
 use crate::store::AccountStore;
 use crate::web;
 
@@ -60,6 +61,12 @@ pub struct Gateway {
     pub auth: Arc<AuthState>,
     /// 面板管理的账号（叠加在 `cfg.users` 之上）。
     pub store: Arc<AccountStore>,
+    /// 面板管理的路由（叠加在 `cfg.routes` 之上）。
+    pub rt_store: Arc<RouteStore>,
+    /// **当前生效**的路由。每个请求都从这里读一次，所以改上游不用重启。
+    pub routes: RouteRegistry,
+    /// 正在监听的端口，支持热插拔。
+    pub listeners: ListenerSet,
 }
 
 /// 账号是从哪来的。面板上必须标出来——「这条改了不生效」全靠它解释。
@@ -130,7 +137,56 @@ impl Gateway {
                 );
             }
         }
-        Self { cfg, auth, store }
+        let rt_store = Arc::new(RouteStore::load(cfg.routes_file.as_deref()));
+        match (rt_store.path(), rt_store.writable()) {
+            (Some(p), true) => tracing::info!(
+                target: "esc_gateway",
+                "路由库：{}（可写，{} 条）", p.display(), rt_store.count()
+            ),
+            (Some(p), false) => tracing::warn!(
+                target: "esc_gateway",
+                "路由库：{}（只读，{} 条）", p.display(), rt_store.count()
+            ),
+            (None, _) => tracing::info!(
+                target: "esc_gateway",
+                "未配置 routes_file：端口只能在配置文件里改"
+            ),
+        }
+        if let Some(note) = rt_store.note() {
+            tracing::warn!(target: "esc_gateway", "{note}");
+        }
+        for r in rt_store.rejected() {
+            tracing::error!(target: "esc_gateway", "路由库里的条目被拒绝：{r}");
+        }
+        for r in rt_store.all() {
+            if cfg.routes.contains_key(&r.name) {
+                tracing::warn!(
+                    target: "esc_gateway",
+                    route = %r.name,
+                    "路由库里有同名路由，已覆盖 gateway.toml 中的定义"
+                );
+            }
+        }
+
+        // 初始注册表 = 配置文件 ∪ 路由库。合并结果必须整体合法（端口冲突、
+        // 名字重复、自环都在这里一次性暴露），否则启动就报错而不是等到访问。
+        let mut initial: Vec<_> = cfg.routes.values().cloned().collect();
+        for r in rt_store.all() {
+            initial.retain(|x| x.name != r.name);
+            if let Ok(rt) = r.to_runtime() {
+                initial.push(rt);
+            }
+        }
+        let registry = RouteRegistry::new(initial);
+
+        Self {
+            cfg,
+            auth,
+            store,
+            rt_store,
+            routes: registry,
+            listeners: ListenerSet::new(),
+        }
     }
 
     pub fn title(&self) -> &str {
@@ -181,6 +237,102 @@ impl Gateway {
         out
     }
 
+    // ── 路由 ──────────────────────────────────────────────────────────────
+
+    /// 生效路由全集（配置文件 ∪ 路由库），按名字排序。面板用。
+    pub fn effective_routes(&self) -> Vec<EffectiveRoute> {
+        let stored: std::collections::BTreeMap<String, crate::config::RouteConfig> = self
+            .rt_store
+            .all()
+            .into_iter()
+            .map(|r| (r.name.clone(), r))
+            .collect();
+
+        let mut out: Vec<EffectiveRoute> = Vec::new();
+        for (name, spec) in &stored {
+            let source = if self.cfg.routes.contains_key(name) {
+                RouteSource::StoreOverConfig
+            } else {
+                RouteSource::Store
+            };
+            out.push(EffectiveRoute {
+                spec: spec.clone(),
+                source,
+            });
+        }
+        for (name, rt) in &self.cfg.routes {
+            if stored.contains_key(name) {
+                continue;
+            }
+            out.push(EffectiveRoute {
+                spec: crate::config::RouteConfig {
+                    name: rt.name.clone(),
+                    listen: rt.listen.to_string(),
+                    upstream: rt.upstream.to_string(),
+                    allowed_cidrs: rt.allowed_cidrs_raw.clone(),
+                    strip_prefix: rt.strip_prefix.clone(),
+                    max_body_bytes: Some(rt.max_body_bytes),
+                },
+                source: RouteSource::Config,
+            });
+        }
+        out.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+        out
+    }
+
+    /// 生效的路由名（面板里画成复选框、校验引用时用）。
+    pub fn route_names(&self) -> Vec<String> {
+        self.routes.names()
+    }
+
+    /// 用一份候选路由集合去算"合并后的完整列表"。
+    ///
+    /// 纯函数：不写盘、不绑端口，只回答"如果路由库变成这样，最终会监听哪些
+    /// 端口、会不会冲突"。两阶段热应用的第一步就是它。
+    pub fn candidate_runtimes(
+        &self,
+        pending: &std::collections::BTreeMap<String, crate::config::RouteConfig>,
+    ) -> Result<Vec<crate::config::RouteRuntime>, String> {
+        let specs: Vec<crate::config::RouteConfig> = self
+            .effective_routes()
+            .into_iter()
+            .filter(|r| !pending.contains_key(&r.spec.name))
+            .map(|r| r.spec)
+            .chain(pending.values().cloned())
+            .collect();
+        crate::config::validate_route_list(&specs)
+    }
+
+    /// 热应用第一步：算合并结果 + **现绑新端口**。
+    ///
+    /// 纯失败无副作用：算不通或绑不上，返回 `Err`，旧监听一个都不动。
+    pub async fn prepare_routes(
+        &self,
+        pending: &std::collections::BTreeMap<String, crate::config::RouteConfig>,
+    ) -> Result<(Vec<crate::config::RouteRuntime>, crate::routes::Prepared), String> {
+        let runtimes = self.candidate_runtimes(pending)?;
+        let prepared = self.listeners.prepare(&runtimes).await?;
+        Ok((runtimes, prepared))
+    }
+
+    /// 热应用第二步：换注册表（上游 / 前缀 / 白名单立刻生效）并起新监听、停旧监听。
+    ///
+    /// 调用它之前必须先成功写盘——否则会出现"内存里改了、文件里没有"，
+    /// 下次重启就静默回退。
+    pub fn commit_routes(
+        self: &Arc<Self>,
+        runtimes: Vec<crate::config::RouteRuntime>,
+        prepared: crate::routes::Prepared,
+    ) {
+        self.routes.replace_all(runtimes);
+        self.listeners.commit(self, prepared);
+    }
+
+    /// 生效端口数（首页与面板都用）。
+    pub fn route_count(&self) -> usize {
+        self.routes.count()
+    }
+
     /// 生效账号里的管理员数量。删账号 / 降权限前必须看这个。
     pub fn admin_count(&self) -> usize {
         self.accounts().iter().filter(|a| a.user.admin).count()
@@ -188,9 +340,13 @@ impl Gateway {
 }
 
 /// 在某个监听地址上起 accept loop。
+///
+/// `route` 只是**起监听那一刻**的快照，用来打日志和兜底：真正的定义在每个
+/// 请求里按 `local_addr` 从注册表重读一次（见 [`handle`]），所以改了上游、
+/// 前缀、白名单不需要重连，下一个请求就生效。
 pub async fn serve_route(
     gw: Arc<Gateway>,
-    route: RouteRuntime,
+    route: Arc<RouteRuntime>,
     listener: tokio::net::TcpListener,
     shutdown: CancellationToken,
 ) {
@@ -205,7 +361,6 @@ pub async fn serve_route(
         "route listening"
     );
 
-    let route = Arc::new(route);
     loop {
         let (stream, peer) = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -229,7 +384,9 @@ pub async fn serve_route(
             let service = service_fn(move |req: HyperRequest<Incoming>| {
                 let gw = gw2.clone();
                 let route = route2.clone();
-                async move { Ok::<_, std::convert::Infallible>(handle(gw, route, peer, req).await) }
+                async move {
+                    Ok::<_, std::convert::Infallible>(handle(gw, route, local, peer, req).await)
+                }
             });
             let conn = hyper::server::conn::http1::Builder::new()
                 .keep_alive(true)
@@ -255,10 +412,18 @@ pub async fn serve_route(
 
 async fn handle(
     gw: Arc<Gateway>,
-    route: Arc<RouteRuntime>,
+    snapshot: Arc<RouteRuntime>,
+    local: SocketAddr,
     peer: SocketAddr,
     req: HyperRequest<Incoming>,
 ) -> HyperResponse<ProxyBody> {
+    // 每个请求重读一次路由定义：改上游 / 前缀 / 白名单不用重启、不用重连。
+    // 按 `local_addr` 查而不是按名字：路由改名之后老连接也能立刻用上新定义。
+    let Some(route) = gw.routes.at(local) else {
+        // 这个端口已经被删掉了。连接可能还没被 cancel 打断，所以自己收尾。
+        return text(StatusCode::SERVICE_UNAVAILABLE, "这个端口已被移除");
+    };
+    let _ = &snapshot;
     let source = resolve_source(&gw, &req, peer);
 
     // ① 来源白名单（route 级）。放在认证之前：白名单外的人连登录页都看不到。
@@ -280,7 +445,7 @@ async fn handle(
     // ②b 管理面板。它要自己判登录态（普通用户也能进「我的账号」），
     //     所以不能走下面的通用认证流程。
     if path == "/__admin" || path.starts_with("/__admin/") {
-        return crate::admin::handle(&gw, source, req).await;
+        return crate::admin::handle(&gw, source, local, req).await;
     }
 
     // ③ 登录态 + 权限
@@ -355,9 +520,9 @@ fn home(
     // 只列这个会话**有权访问**的端口。理由和别处一致：没权限的东西连名字都
     // 不该出现——否则「这台机器开了哪些面板」就成了公开信息。
     let mut links: Vec<(String, u16)> = gw
-        .cfg
         .routes
-        .values()
+        .all()
+        .into_iter()
         .filter(|r| session.can_access(&r.name))
         .map(|r| (r.name.clone(), r.listen.port()))
         .collect();

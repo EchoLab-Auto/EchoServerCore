@@ -29,6 +29,7 @@ pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod proxy;
+pub mod routes;
 pub mod store;
 pub mod web;
 
@@ -38,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::{GatewayConfig, RuntimeConfig};
 pub use proxy::Gateway;
+pub use routes::RouteStore;
 pub use store::AccountStore;
 
 /// 起网关：按配置里的每个 route 各起一个监听，等 `shutdown` 后一起退出。
@@ -45,40 +47,35 @@ pub use store::AccountStore;
 /// 任何一个端口绑不上都返回 `Err`——**不做"部分启动"**。一个认证网关只起来了
 /// 一半，比完全没起来更危险：你以为 2224 被保护着，其实它在裸跑。
 pub async fn run(cfg: RuntimeConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
-    // 先全部绑定，全部成功才开始服务。这样端口冲突会在启动时暴露，
-    // 而不是等到某个用户访问那个端口才发现。
-    let mut listeners = Vec::new();
-    for r in cfg.routes.values() {
-        let addr = r.listen;
-        let l = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("route {:?} 绑定 {addr} 失败: {e}", r.name))?;
-        listeners.push((r.clone(), l));
-    }
-
     let gw = Arc::new(Gateway::new(Arc::new(cfg)));
 
+    // 先全部绑定，全部成功才开始服务。这样端口冲突会在启动时暴露，
+    // 而不是等到某个用户访问那个端口才发现——一个认证网关只起来了一半，
+    // 比完全没起来更危险：你以为 2224 被保护着，其实它在裸跑。
+    let wanted: Vec<config::RouteRuntime> = gw.routes.all().iter().map(|r| (**r).clone()).collect();
+    let prepared = gw
+        .listeners
+        .prepare(&wanted)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     tracing::info!(
-        routes = listeners.len(),
+        routes = gw.route_count(),
         users = gw.cfg.users.len(),
         http_only = !gw.cfg.secure_cookie,
         "gateway starting"
     );
 
-    let mut tasks = Vec::new();
-    for (route, listener) in listeners {
-        let gw = gw.clone();
-        let shut = shutdown.clone();
-        tasks.push(tokio::spawn(async move {
-            proxy::serve_route(gw, route, listener, shut).await
-        }));
-    }
+    // 启动时没有"旧端口"要停，prepare 只绑新的；commit 把任务起起来。
+    gw.listeners.commit(&gw, prepared);
 
-    // 任一任务结束就收尾（正常情况下只有 shutdown 能让它们结束）
     shutdown.cancelled().await;
-    for t in tasks {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
+    // 关掉所有监听（cancel 会让 accept loop 退出、连接进入收尾）
+    for addr in gw.listeners.addrs() {
+        gw.listeners.cancel(addr);
     }
+    // 给在途请求一点时间收尾，但别无限等
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     tracing::info!("gateway stopped");
     Ok(())
 }
