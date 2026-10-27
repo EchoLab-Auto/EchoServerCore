@@ -170,8 +170,25 @@ impl Gateway {
 
         // 初始注册表 = 配置文件 ∪ 路由库。合并结果必须整体合法（端口冲突、
         // 名字重复、自环都在这里一次性暴露），否则启动就报错而不是等到访问。
-        let mut initial: Vec<_> = cfg.routes.values().cloned().collect();
+        //
+        // **已下架的必须先摘掉**：它们既不能来自配置文件（否则下架只管到这次
+        // 重启），也不能来自路由库。漏了这一步就会出现「下架的端口重启后又自己
+        // 回来了」——而那是最容易让人不信任面板的一种 bug。
+        let disabled: std::collections::HashSet<String> = rt_store
+            .all_disabled()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        let mut initial: Vec<_> = cfg
+            .routes
+            .values()
+            .filter(|rt| !disabled.contains(&rt.name))
+            .cloned()
+            .collect();
         for r in rt_store.all() {
+            if disabled.contains(&r.name) {
+                continue;
+            }
             initial.retain(|x| x.name != r.name);
             if let Ok(rt) = r.to_runtime() {
                 initial.push(rt);
@@ -1397,5 +1414,76 @@ mod tests {
         assert_eq!(html_escape("<script>"), "&lt;script&gt;");
         assert_eq!(html_escape("a&b"), "a&amp;b");
         assert_eq!(html_escape("\"'"), "&quot;&#39;");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use crate::config::GatewayConfig;
+
+    fn cfg(extra_route: &str) -> GatewayConfig {
+        let raw = format!(
+            r#"
+[[user]]
+name = "a"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$11111111111111111111111111111111"
+routes = ["*"]
+
+[[route]]
+name = "keep"
+listen = "127.0.0.1:2224"
+upstream = "127.0.0.1:18788"
+{extra_route}
+"#
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    /// **启动时也要认墓碑。**
+    ///
+    /// 这是被现场发现的：面板上「下架」一个来自 gateway.toml 的端口，当次运行
+    /// 确实停了，但重启之后它又回来了——因为初始注册表只减掉了路由库里"生效"
+    /// 的那些，没看 `[[disabled]]`。下架不持久 = 用户根本不信任这个按钮。
+    #[test]
+    fn a_disabled_route_is_not_in_the_startup_registry() {
+        let dir = std::env::temp_dir().join(format!(
+            "esc-gw-reg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let routes = dir.join("gateway-routes.toml");
+        // 墓碑指向配置里也有的那条
+        std::fs::write(
+            &routes,
+            r#"
+[[disabled]]
+name = "gone"
+listen = "127.0.0.1:2225"
+upstream = "127.0.0.1:18789"
+allowed_cidrs = []
+"#,
+        )
+        .unwrap();
+
+        let mut c = cfg(r#"
+[[route]]
+name = "gone"
+listen = "127.0.0.1:2225"
+upstream = "127.0.0.1:18789"
+"#);
+        c.routes_file = Some(routes.clone());
+        let rt = c.build().unwrap();
+        assert_eq!(rt.routes.len(), 2, "配置本身有两条");
+
+        let gw = Gateway::new(Arc::new(rt));
+        // 生效的只剩 keep —— gone 被墓碑挡住，重启后不会自己回来
+        assert_eq!(gw.route_count(), 1, "清单: {:?}", gw.route_names());
+        assert_eq!(gw.route_names(), vec!["keep".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
