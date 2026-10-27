@@ -73,7 +73,12 @@ fn default_true() -> bool {
 impl Config {
     fn auth_config(&self) -> AuthConfig {
         AuthConfig {
-            auth: self.auth.clone(),
+            // 归一化，别把 `Some("")` 原样传下去：那不是「不认证」，
+            // 而是一个口令为空的账号——结果是**谁也进不去**。
+            auth: self.auth.clone().and_then(|s| {
+                let s = s.trim().to_string();
+                (!s.is_empty()).then_some(s)
+            }),
             allow_cidrs: self.allow_cidrs.clone(),
             max_auth_failures: self.max_auth_failures,
             auth_fail_window_secs: self.auth_fail_window_secs,
@@ -94,7 +99,24 @@ impl Config {
         if self.listen.rsplit_once(':').is_none() {
             return Err(format!("listen 需要 host:port，收到 {:?}", self.listen));
         }
-        if self.auth.is_none() && !self.is_loopback_only() {
+        // 写了 auth 但格式不对（没有冒号）就是配错了。既不能当成「不认证」
+        // （那会把面板敞开），也不能当成一个空口令账号（那是静默锁死）。
+        if let Some(raw) = self.auth.as_deref() {
+            let raw = raw.trim();
+            if !raw.is_empty() && !raw.contains(':') {
+                return Err(format!(
+                    "auth = {raw:?} 缺少冒号，应为 \"user:password\"；\
+                     想关掉面板自带的认证请整行删除（只在回环地址上允许）"
+                ));
+            }
+        }
+        // `auth = ""` 视为「没配」，于是下面的回环检查对它同样生效。
+        let has_auth = self
+            .auth
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_auth && !self.is_loopback_only() {
             return Err(format!(
                 "listen = {:?} 不是回环地址，但没有配置 auth；\
                  拒绝把无认证的管理面板暴露到网络上",
@@ -267,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         addr = %addr,
-        auth = cfg.auth.is_some(),
+        auth = cfg.auth_config().auth.is_some(),
         docker = %cfg.docker_socket,
         "server panel listening"
     );
@@ -322,6 +344,36 @@ allow_create = false
         let cfg: Config = toml::from_str(r#"listen = "0.0.0.0:2224""#).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("auth"), "错误信息应指出缺 auth：{err}");
+    }
+
+    #[test]
+    fn empty_auth_means_no_auth_not_a_lockout() {
+        // 曾经踩过的坑：`auth = ""` 被当成 Some("")，于是预期的凭据变成一个
+        // **空口令账号**——看起来「关了认证」，实际是谁也进不去（静默锁死）。
+        // 现在它应当等价于「没配 auth」，于是回环检查照旧生效。
+        let loopback: Config =
+            toml::from_str("listen = \"127.0.0.1:18788\"\nauth = \"\"").unwrap();
+        assert!(loopback.validate().is_ok(), "回环 + 空 auth 应允许");
+        assert!(
+            loopback.auth_config().auth.is_none(),
+            "空 auth 不能变成「需要认证」"
+        );
+
+        let public: Config = toml::from_str("listen = \"0.0.0.0:2224\"\nauth = \"\"").unwrap();
+        let err = public.validate().unwrap_err();
+        assert!(err.contains("auth"), "公网 + 空 auth 仍要拒绝：{err}");
+    }
+
+    #[test]
+    fn auth_without_a_colon_is_a_hard_error() {
+        // 两种「聪明」处理都是错的：当成无认证 = 把面板敞开；
+        // 当成空口令账号 = 静默锁死。所以直接拒绝启动，并说清怎么改。
+        for listen in ["0.0.0.0:2224", "127.0.0.1:18788"] {
+            let cfg: Config =
+                toml::from_str(&format!("listen = \"{listen}\"\nauth = \"admin\"")).unwrap();
+            let err = cfg.validate().unwrap_err();
+            assert!(err.contains("冒号"), "{listen}: {err}");
+        }
     }
 
     #[test]
