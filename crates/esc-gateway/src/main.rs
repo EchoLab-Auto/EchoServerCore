@@ -148,9 +148,15 @@ async fn main() -> anyhow::Result<()> {
             let rt = cfg.build().map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("OK  gateway config: {}", path.display());
             println!("    title        : {}", rt.title);
-            println!("    session ttl  : {} 小时", rt.session_ttl.as_secs() / 3600);
-            println!("    cookie       : {}{}", rt.cookie_name,
-                     if rt.secure_cookie { "  (Secure)" } else { "" });
+            println!(
+                "    session ttl  : {} 小时",
+                rt.session_ttl.as_secs() / 3600
+            );
+            println!(
+                "    cookie       : {}{}",
+                rt.cookie_name,
+                if rt.secure_cookie { "  (Secure)" } else { "" }
+            );
             println!("    users        : {}", rt.users.len());
             for u in rt.users.values() {
                 let scope = if u.all_routes {
@@ -158,8 +164,51 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     u.routes.join(", ")
                 };
-                println!("      - {:<12} routes: {scope}", u.name);
+                println!(
+                    "      - {:<12} routes: {scope}{}",
+                    u.name,
+                    if u.admin { "  [admin]" } else { "" }
+                );
             }
+            match &rt.users_file {
+                Some(p) => {
+                    let store = esc_gateway::AccountStore::load(Some(p));
+                    let state = if store.writable() {
+                        format!("可写，{} 个账号", store.count())
+                    } else {
+                        format!(
+                            "只读（{}）",
+                            store.note().unwrap_or_else(|| "原因未知".into())
+                        )
+                    };
+                    println!("    users_file   : {} —— {state}", p.display());
+                    if store.count() > 0 {
+                        for u in store.all() {
+                            let scope = if u.routes.iter().any(|r| r == "*") {
+                                "*".to_string()
+                            } else {
+                                u.routes.join(", ")
+                            };
+                            println!(
+                                "      - {:<12} routes: {scope}{}",
+                                u.name,
+                                if u.admin { "  [admin]" } else { "" }
+                            );
+                        }
+                    }
+                    for r in store.rejected() {
+                        println!("      ! 被拒绝的条目：{r}");
+                    }
+                }
+                None => println!("    users_file   : 未配置 —— 管理面板为只读"),
+            }
+            let admins = rt.users.values().filter(|u| u.admin).count();
+            if admins == 0 {
+                println!();
+                println!("⚠ 配置文件里没有管理员账号（admin = true），管理面板没人能进。");
+                println!("  要启用账号管理：给某个 [[user]] 加 admin = true。");
+            }
+
             println!("    routes       : {}", rt.routes.len());
             for r in rt.routes.values() {
                 println!(
@@ -170,6 +219,11 @@ async fn main() -> anyhow::Result<()> {
                     r.allow.len(),
                     r.max_body_bytes / 1024
                 );
+            }
+            println!();
+            println!("管理面板：登录后在任意端口访问 /__admin/");
+            if !rt.admin_allow.is_empty() {
+                println!("         （仅限 admin_allowed_cidrs 中的来源）");
             }
             if !rt.secure_cookie {
                 println!();
@@ -214,15 +268,21 @@ async fn main() -> anyhow::Result<()> {
                      生产环境应在前面加 TLS 终结（nginx/Caddy），并打开 secure_cookie"
                 );
             }
+            if !rt.users.values().any(|u| u.admin) {
+                tracing::warn!(
+                    "配置文件里没有管理员账号（admin = true）：/__admin/ 没人能进。\
+                     需要账号管理就给某个 [[user]] 加 admin = true"
+                );
+            }
             let shutdown = CancellationToken::new();
             let sig = shutdown.clone();
             tokio::spawn(async move {
-                let mut term = match tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                ) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
+                let mut term =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {}
                     _ = term.recv() => {}

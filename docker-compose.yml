@@ -7,7 +7,11 @@
 #   2. 校验配置
 #        docker run --rm -v /etc/esc/gateway.toml:/etc/esc/gateway.toml:ro \
 #          esc-gateway:latest check -c /etc/esc/gateway.toml
-#   3. docker compose up -d
+#   3. 建账号库目录（要让 uid 65532 可写，见 volumes 注释）
+#        install -d -o 65532 -g 65532 /var/lib/esc-gateway
+#      并在 gateway.toml 里写 users_file = "/var/lib/esc-gateway/gateway-users.toml"
+#      （不建也行：面板会退化成只读，账号只从 gateway.toml 来）
+#   4. docker compose up -d
 #
 # ⚠ 必须 host 网络
 #   网关要把请求转发到宿主机的 127.0.0.1:18787（面板）。用默认 bridge 网络时，
@@ -36,6 +40,13 @@ services:
 
     volumes:
       - /etc/esc/gateway.toml:/etc/esc/gateway.toml:ro
+      # 账号库（管理面板写的那个文件）。**必须可写**，否则 /__admin/ 只能是
+      # 只读视图——根文件系统是 read_only，容器里没有地方落盘。
+      #
+      # 目录要属于镜像里的 uid 65532，否则写不进去：
+      #   install -d -o 65532 -g 65532 /var/lib/esc-gateway
+      # 或者干脆不挂这个卷，接受面板只读（账号就只从 gateway.toml 来）。
+      - /var/lib/esc-gateway:/var/lib/esc-gateway
 
     environment:
       # 日志级别。生产用 info；排障时改 debug。

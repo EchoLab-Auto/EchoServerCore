@@ -38,7 +38,8 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{self, AuthState, Denied};
-use crate::config::{RuntimeConfig, RouteRuntime};
+use crate::config::{RouteRuntime, RuntimeConfig, UserRuntime};
+use crate::store::AccountStore;
 use crate::web;
 
 /// 上游连接超时。本地回环，1 秒都算慢。
@@ -57,16 +58,132 @@ pub type ProxyBody = http_body_util::combinators::BoxBody<Bytes, BoxErr>;
 pub struct Gateway {
     pub cfg: Arc<RuntimeConfig>,
     pub auth: Arc<AuthState>,
+    /// 面板管理的账号（叠加在 `cfg.users` 之上）。
+    pub store: Arc<AccountStore>,
+}
+
+/// 账号是从哪来的。面板上必须标出来——「这条改了不生效」全靠它解释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSource {
+    /// 来自 `gateway.toml`，面板只读。
+    Config,
+    /// 来自账号库，面板可改。
+    Store,
+    /// 账号库里有一条同名的，把配置文件里的那条覆盖了。
+    StoreOverConfig,
+}
+
+impl AccountSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Config => "配置文件（只读）",
+            Self::Store => "账号库",
+            Self::StoreOverConfig => "账号库（覆盖了配置文件）",
+        }
+    }
+    pub fn editable(self) -> bool {
+        !matches!(self, Self::Config)
+    }
+}
+
+/// 一条**生效**的账号。
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub user: UserRuntime,
+    pub source: AccountSource,
 }
 
 impl Gateway {
     pub fn new(cfg: Arc<RuntimeConfig>) -> Self {
         let auth = Arc::new(AuthState::new(&cfg));
-        Self { cfg, auth }
+        let store = Arc::new(AccountStore::load(cfg.users_file.as_deref()));
+        // 账号到底存在哪个文件里，是排查「改了没生效」时第一个要确认的事，
+        // 所以启动时就打出来，而不是等出问题再猜。
+        match (store.path(), store.writable()) {
+            (Some(p), true) => tracing::info!(
+                target: "esc_gateway",
+                "账号库：{}（可写，{} 个账号）", p.display(), store.count()
+            ),
+            (Some(p), false) => tracing::warn!(
+                target: "esc_gateway",
+                "账号库：{}（只读，{} 个账号）", p.display(), store.count()
+            ),
+            (None, _) => tracing::info!(
+                target: "esc_gateway",
+                "未配置 users_file：管理面板只读，账号只来自配置文件"
+            ),
+        }
+        if let Some(note) = store.note() {
+            tracing::warn!(target: "esc_gateway", "{note}");
+        }
+        for r in store.rejected() {
+            tracing::error!(target: "esc_gateway", "账号库里的条目被拒绝：{r}");
+        }
+        // 同名覆盖必须吵一次：否则「改了 gateway.toml 里的口令却不生效」
+        // 会变成一次很贵的排查。
+        for u in store.all() {
+            if cfg.users.contains_key(&u.name) {
+                tracing::warn!(
+                    target: "esc_gateway",
+                    user = %u.name,
+                    "账号库里有同名账号，已覆盖 gateway.toml 中的定义"
+                );
+            }
+        }
+        Self { cfg, auth, store }
     }
 
     pub fn title(&self) -> &str {
         &self.cfg.title
+    }
+
+    /// 解析**生效**的账号：账号库优先，配置文件兜底。
+    ///
+    /// 兜底顺序是刻意的：账号库丢了 / 坏了 / 卷没挂上，配置文件里的账号照样
+    /// 能登进来修，不会把自己锁在外面。
+    pub fn user(&self, name: &str) -> Option<UserRuntime> {
+        if let Some(u) = self.store.get(name) {
+            return Some(u.to_runtime());
+        }
+        self.cfg.user(name).cloned()
+    }
+
+    /// 生效账号全集（配置文件 ∪ 账号库），按名字排序。
+    pub fn accounts(&self) -> Vec<Account> {
+        let stored: std::collections::BTreeMap<String, UserRuntime> = self
+            .store
+            .all()
+            .into_iter()
+            .map(|u| (u.name.clone(), u.to_runtime()))
+            .collect();
+
+        let mut out: Vec<Account> = Vec::new();
+        for (name, user) in &stored {
+            let source = if self.cfg.users.contains_key(name) {
+                AccountSource::StoreOverConfig
+            } else {
+                AccountSource::Store
+            };
+            out.push(Account {
+                user: user.clone(),
+                source,
+            });
+        }
+        for (name, user) in &self.cfg.users {
+            if !stored.contains_key(name) {
+                out.push(Account {
+                    user: user.clone(),
+                    source: AccountSource::Config,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.user.name.cmp(&b.user.name));
+        out
+    }
+
+    /// 生效账号里的管理员数量。删账号 / 降权限前必须看这个。
+    pub fn admin_count(&self) -> usize {
+        self.accounts().iter().filter(|a| a.user.admin).count()
     }
 }
 
@@ -155,6 +272,12 @@ async fn handle(
     // ② 网关自己的端点（不转发）。`/__auth/*` 只有登录/登出/探活。
     if path.starts_with("/__auth/") {
         return gateway_endpoint(&gw, &route, source, req).await;
+    }
+
+    // ②b 管理面板。它要自己判登录态（普通用户也能进「我的账号」），
+    //     所以不能走下面的通用认证流程。
+    if path == "/__admin" || path.starts_with("/__admin/") {
+        return crate::admin::handle(&gw, source, req).await;
     }
 
     // ③ 登录态 + 权限
@@ -317,7 +440,7 @@ async fn do_login(
 
     // 手工比对而不是查表后短路：**用户名不存在时也要跑一次哈希校验**，
     // 否则响应时间会泄露「这个用户名存在」。
-    let candidate = gw.cfg.user(user).cloned();
+    let candidate = gw.user(user);
     let hash = candidate
         .as_ref()
         .map(|u| u.hash.clone())
@@ -352,7 +475,7 @@ async fn do_login(
     if let Some(old) = auth::cookie_value(headers, &gw.cfg.cookie_name) {
         gw.auth.logout(old);
     }
-    let sid = gw.auth.create(&user_rt);
+    let sid = gw.auth.create(&user_rt, source);
     tracing::info!(
         route = %route.name, user = %user_rt.name, source = ?source,
         "login ok"
@@ -361,7 +484,12 @@ async fn do_login(
     let mut resp = redirect(StatusCode::SEE_OTHER, &next);
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        auth::set_cookie(&gw.cfg.cookie_name, &sid, gw.cfg.session_ttl, gw.cfg.secure_cookie),
+        auth::set_cookie(
+            &gw.cfg.cookie_name,
+            &sid,
+            gw.cfg.session_ttl,
+            gw.cfg.secure_cookie,
+        ),
     );
     resp
 }
@@ -373,7 +501,8 @@ async fn do_login(
 /// 时间差重新出现。
 fn dummy_hash() -> String {
     // "dummy-password" 的 argon2id 哈希（m=19456,t=2,p=1）
-    "$argon2id$v=19$m=19456,t=2,p=1$ZHVtbXlzYWx0ZHVtbXk$0Yp2PZ0z1n0m3rN0zYb0uZ0dU0kQ0l0Yb0uZ0dU0kQ0".to_string()
+    "$argon2id$v=19$m=19456,t=2,p=1$ZHVtbXlzYWx0ZHVtbXk$0Yp2PZ0z1n0m3rN0zYb0uZ0dU0kQ0l0Yb0uZ0dU0kQ0"
+        .to_string()
 }
 
 fn login_page(
@@ -446,9 +575,10 @@ async fn forward(
     parts
         .headers
         .insert("x-forwarded-proto", HeaderValue::from_static("http"));
-    parts
-        .headers
-        .insert("x-esc-gateway-route", HeaderValue::from_str(&route.name).unwrap_or(HeaderValue::from_static("-")));
+    parts.headers.insert(
+        "x-esc-gateway-route",
+        HeaderValue::from_str(&route.name).unwrap_or(HeaderValue::from_static("-")),
+    );
 
     // ④ 路径重写
     if let Some(prefix) = &route.strip_prefix {
@@ -511,7 +641,8 @@ async fn forward(
         }
     });
 
-    let resp = match tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, sender.send_request(up_req)).await {
+    let resp = match tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, sender.send_request(up_req)).await
+    {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::error!(route = %route.name, error = %e, "upstream request failed");
@@ -592,7 +723,10 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     ];
     // 先把 Connection 里点名的头收集起来（它们也是 hop-by-hop）
     let mut named: Vec<String> = Vec::new();
-    if let Some(v) = headers.get(header::CONNECTION).and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+    {
         named = v
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
@@ -771,10 +905,8 @@ pub fn redirect(status: StatusCode, location: &str) -> HyperResponse<ProxyBody> 
     resp
 }
 
-fn json_error(kind: Denied, message: &str) -> HyperResponse<ProxyBody> {
-    let mut resp = HyperResponse::new(full(
-        serde_json::json!({ "error": message }).to_string(),
-    ));
+pub(crate) fn json_error(kind: Denied, message: &str) -> HyperResponse<ProxyBody> {
+    let mut resp = HyperResponse::new(full(serde_json::json!({ "error": message }).to_string()));
     *resp.status_mut() = kind.status_code();
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -797,9 +929,15 @@ mod tests {
     #[test]
     fn hop_by_hop_headers_are_stripped_including_named_ones() {
         let mut h = HeaderMap::new();
-        h.insert(header::CONNECTION, HeaderValue::from_static("keep-alive, X-Custom"));
+        h.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, X-Custom"),
+        );
         h.insert("x-custom", HeaderValue::from_static("v"));
-        h.insert(header::TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        h.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
         h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         h.insert(header::TE, HeaderValue::from_static("trailers"));
         h.insert("x-keep", HeaderValue::from_static("this one survives"));
@@ -809,7 +947,10 @@ mod tests {
 
         assert!(h.get(header::CONNECTION).is_none());
         assert!(h.get(header::TRANSFER_ENCODING).is_none());
-        assert!(h.get(header::UPGRADE).is_none(), "Upgrade 必须剥（我们不支持）");
+        assert!(
+            h.get(header::UPGRADE).is_none(),
+            "Upgrade 必须剥（我们不支持）"
+        );
         assert!(h.get(header::TE).is_none());
         assert!(h.get("x-custom").is_none(), "Connection 点名的头也要剥");
         assert_eq!(h.get("x-keep").unwrap(), "this one survives");
@@ -851,14 +992,19 @@ mod tests {
         assert_eq!(query_param(Some("a=1"), "nope"), None);
         assert_eq!(query_param(None, "a"), None);
         // 中文与空格
-        assert_eq!(query_param(Some("t=%E4%B8%AD+%E6%96%87"), "t"), Some("中 文".into()));
+        assert_eq!(
+            query_param(Some("t=%E4%B8%AD+%E6%96%87"), "t"),
+            Some("中 文".into())
+        );
     }
 
     #[test]
     fn urlencode_round_trips() {
         for s in ["/a/b", "/中文?x=1", "/a b", "/%", "/a+b"] {
             let enc = urlencode(s);
-            if s.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c)) {
+            if s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c))
+            {
                 assert_eq!(enc, s);
             }
             assert_eq!(urldecode(&enc), s, "round trip failed for {s:?}");

@@ -40,6 +40,57 @@ button:hover{background:#2a7cf5}
 .detail code{font-family:var(--mono);background:var(--bg3);padding:1px 6px;border-radius:4px;
   border:1px solid var(--line)}
 a{color:var(--info)}
+/* ── 管理面板 ── */
+body.wide{display:block;padding:0}
+.wrap{max-width:980px;margin:0 auto;padding:22px 20px 60px}
+.top{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--bg2);
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
+.brand{font-weight:600;font-size:14.5px;margin-right:6px}
+.nav{display:flex;gap:2px;flex-wrap:wrap}
+.nav a{padding:6px 11px;border-radius:7px;font-size:13px;color:var(--fg2);text-decoration:none}
+.nav a:hover{background:var(--bg3);color:var(--fg)}
+.nav a.on{background:#1f6feb22;color:#7cb0ff}
+.who{margin-left:auto;font-size:12.5px;color:var(--fg2);display:flex;gap:12px;align-items:center}
+h2{font-size:16px;margin:22px 0 12px;font-weight:600}
+h2:first-of-type{margin-top:4px}
+.banner{border-radius:8px;padding:10px 13px;font-size:12.5px;margin:0 0 14px;line-height:1.6}
+.banner.warn{background:#bb800914;border:1px solid #bb800944;color:#e3b341}
+.banner.err{background:#f8514914;border:1px solid #f8514944;color:#ff9d97}
+.banner.ok{background:#3fb95014;border:1px solid #3fb95044;color:#7ee787}
+.banner code{font-family:var(--mono);background:#00000044;padding:1px 5px;border-radius:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:500;color:var(--fg2);font-size:11.5px;letter-spacing:.4px;
+  text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#ffffff05}
+.mono{font-family:var(--mono);font-size:12.5px}
+.dim{color:var(--fg2)}
+.badge{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:99px;
+  border:1px solid var(--line);color:var(--fg2);margin-left:6px;white-space:nowrap}
+.badge.adm{background:#1f6feb1a;border-color:#1f6feb55;color:#7cb0ff}
+.badge.ro{background:#bb80091a;border-color:#bb800955;color:#e3b341}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.btn{font:inherit;font-size:12.5px;cursor:pointer;color:var(--fg);background:var(--bg3);
+  border:1px solid var(--line);border-radius:7px;padding:6px 11px;transition:.15s;width:auto}
+.btn:hover{border-color:#3d6fd4;color:#fff}
+.btn.pri{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn.pri:hover{background:#2a7cf5}
+.btn.danger{color:#ff9d97;border-color:#f8514944}
+.btn.danger:hover{background:#f8514914;border-color:#f85149}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+form.inline{display:inline}
+fieldset{border:1px solid var(--line);border-radius:9px;padding:14px 15px;margin:0 0 16px}
+legend{font-size:12px;color:var(--fg2);padding:0 6px}
+label.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);margin:0 0 8px}
+label.chk input{width:auto;margin:0}
+label.chk .mono{margin:0}
+.hint{font-size:11.5px;color:var(--fg3);line-height:1.6;margin:6px 0 0}
+.field{margin:0 0 14px}
+.field input[type=password],.field input[type=text]{margin-bottom:0}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:640px){.grid2{grid-template-columns:1fr}}
+.empty{color:var(--fg3);font-size:13px;padding:18px 0;text-align:center}
 "#;
 
 /// 登录页。
@@ -99,6 +150,470 @@ pub fn error_page(title: &str, heading: &str, detail_html: &str) -> String {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 管理面板
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 相对时间。面板上不显示绝对时间戳，理由是这些全是**本次运行内**的短时
+/// 事件（会话、刚才的操作），而绝对时间要引入时区与日历格式化——收益为零，
+/// 代价是一个依赖和一堆「服务器时区是 UTC 还是 CST」的困惑。
+pub fn ago_text(t: std::time::Instant) -> String {
+    let secs = t.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs} 秒前")
+    } else if secs < 3600 {
+        format!("{} 分钟前", secs / 60)
+    } else if secs < 86400 {
+        format!("{} 小时前", secs / 3600)
+    } else {
+        format!("{} 天前", secs / 86400)
+    }
+}
+
+/// 一条提示条。`kind` 取 `warn` / `err` / `ok`。
+#[derive(Debug, Clone)]
+pub struct Banner {
+    pub kind: &'static str,
+    pub text: String,
+}
+
+impl Banner {
+    pub fn warn(t: impl Into<String>) -> Self {
+        Self {
+            kind: "warn",
+            text: t.into(),
+        }
+    }
+    pub fn err(t: impl Into<String>) -> Self {
+        Self {
+            kind: "err",
+            text: t.into(),
+        }
+    }
+    pub fn ok(t: impl Into<String>) -> Self {
+        Self {
+            kind: "ok",
+            text: t.into(),
+        }
+    }
+    fn render(&self) -> String {
+        format!(
+            "<div class=\"banner {}\">{}</div>",
+            self.kind,
+            highlight(&self.text)
+        )
+    }
+}
+
+/// 把反引号里的内容渲染成 `<code>`，其余部分转义。
+///
+/// 提示文案里到处是文件名、账号名（`users_file`、`admin`），手写一长串
+/// `<code>` 拼接既难看又容易漏转义。约定一个最小的标记，渲染时统一处理。
+fn highlight(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, part) in text.split('`').enumerate() {
+        if i % 2 == 1 {
+            out.push_str("<code>");
+            out.push_str(&esc(part));
+            out.push_str("</code>");
+        } else {
+            out.push_str(&esc(part));
+        }
+    }
+    out
+}
+
+/// 面板外壳：顶栏 + 内容。
+fn layout(title: &str, actor: &str, is_admin: bool, active: &str, body: &str) -> String {
+    let item = |href: &str, label: &str, key: &str| {
+        let on = if key == active { " class=\"on\"" } else { "" };
+        format!("<a href=\"{href}\"{on}>{label}</a>")
+    };
+    let mut nav = item("/__admin/", "账号", "users");
+    if is_admin {
+        nav.push_str(&item("/__admin/sessions", "会话", "sessions"));
+    }
+    nav.push_str(&item("/__admin/me", "我的账号", "me"));
+
+    let role = if is_admin { "管理员" } else { "用户" };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>{title_esc} · 管理</title><style>{STYLE}</style></head>
+<body class="wide">
+<div class="top">
+  <span class="brand">{title_esc}</span>
+  <nav class="nav">{nav}</nav>
+  <span class="who"><span>{actor_esc}<span class="badge">{role}</span></span>
+    <a href="/__auth/logout">退出</a></span>
+</div>
+<div class="wrap">{body}</div>
+</body></html>"#,
+        title_esc = esc(title),
+        actor_esc = esc(actor),
+        nav = nav,
+        role = role,
+        body = body,
+        STYLE = STYLE,
+    )
+}
+
+/// 账号列表里的一行。
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub name: String,
+    pub source_label: String,
+    pub editable: bool,
+    pub admin: bool,
+    pub routes_label: String,
+    pub sessions: usize,
+}
+
+/// 账号列表页。
+#[derive(Debug, Clone)]
+pub struct UsersView {
+    pub title: String,
+    pub actor: String,
+    pub is_admin: bool,
+    pub rows: Vec<UserRow>,
+    /// 账号库状态说明（路径 + 是否可写），显示在标题下。
+    pub store_line: String,
+    pub banners: Vec<Banner>,
+    /// (多久前, 动作, 目标, 操作人)
+    pub recent: Vec<(String, String, String, String)>,
+    pub admin_count: usize,
+}
+
+pub fn users_page(v: &UsersView) -> String {
+    let mut body = String::new();
+    body.push_str("<h2>账号</h2>");
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+    body.push_str(&format!(
+        "<p class=\"hint\" style=\"margin-bottom:14px\">账号库：{}</p>",
+        esc(&v.store_line)
+    ));
+
+    if v.rows.is_empty() {
+        body.push_str("<div class=\"empty\">还没有账号</div>");
+    } else {
+        body.push_str(
+            "<table><thead><tr><th>账号</th><th>授权端口</th><th>会话</th><th></th></tr></thead><tbody>",
+        );
+        for r in &v.rows {
+            let name = esc(&r.name);
+            let adm = if r.admin {
+                "<span class=\"badge adm\">管理员</span>"
+            } else {
+                ""
+            };
+            let ro = if r.editable {
+                String::new()
+            } else {
+                "<span class=\"badge ro\">只读</span>".to_string()
+            };
+            let mut actions = String::new();
+            if r.editable {
+                actions.push_str(&format!(
+                    "<a class=\"btn\" href=\"/__admin/users/{name_enc}\">编辑</a>",
+                    name_enc = urlencode_attr(&r.name)
+                ));
+                if r.sessions > 0 {
+                    actions.push_str(&format!(
+                        " <form class=\"inline\" method=\"post\" action=\"/__admin/users/{}/revoke\">\
+<button class=\"btn\" type=\"submit\">踢下线</button></form>",
+                        urlencode_attr(&r.name)
+                    ));
+                }
+            } else {
+                actions.push_str(&format!(
+                    "<form class=\"inline\" method=\"post\" action=\"/__admin/users/{}/adopt\">\
+<button class=\"btn\" type=\"submit\">接管</button></form>",
+                    urlencode_attr(&r.name)
+                ));
+            }
+            body.push_str(&format!(
+                "<tr><td><span class=\"mono\">{name}</span>{adm}{ro}<div class=\"hint\">{src}</div></td>\
+<td class=\"mono dim\">{routes}</td><td class=\"dim\">{sess}</td>\
+<td><div class=\"row\" style=\"justify-content:flex-end\">{actions}</div></td></tr>",
+                src = esc(&r.source_label),
+                routes = esc(&r.routes_label),
+                sess = r.sessions,
+                actions = actions,
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+
+    if v.is_admin {
+        body.push_str(&format!(
+            "<div class=\"row\" style=\"margin-top:16px\">\
+<a class=\"btn pri\" href=\"/__admin/users/new\">新建账号</a>\
+<span class=\"hint\">共 {} 个账号，其中 {} 个管理员。网关至少要有 1 个管理员。</span></div>",
+            v.rows.len(),
+            v.admin_count
+        ));
+
+        if !v.recent.is_empty() {
+            body.push_str("<h2>最近操作</h2><table><thead><tr><th>时间</th><th>动作</th><th>目标</th><th>操作人</th></tr></thead><tbody>");
+            for (when, action, target, actor) in &v.recent {
+                body.push_str(&format!(
+                    "<tr><td class=\"dim\">{}</td><td>{}</td><td class=\"mono\">{}</td><td class=\"dim\">{}</td></tr>",
+                    esc(when),
+                    esc(action),
+                    esc(target),
+                    esc(actor),
+                ));
+            }
+            body.push_str("</tbody></table><p class=\"hint\">只保留本次运行内的最近 50 条，重启清空；完整审计看网关日志（tracing）。</p>");
+        }
+    }
+
+    layout(&v.title, &v.actor, v.is_admin, "users", &body)
+}
+
+/// 新建 / 编辑账号的表单。
+#[derive(Debug, Clone)]
+pub struct UserFormView {
+    pub title: String,
+    pub actor: String,
+    pub is_admin: bool,
+    pub name: String,
+    pub is_new: bool,
+    /// 用户名输入框是否锁死（编辑时锁死：改名等于换账号，容易搞混）。
+    pub name_locked: bool,
+    pub admin: bool,
+    /// 已选授权（含 `*`）。
+    pub routes: Vec<String>,
+    /// 可勾选的 route 名。
+    pub available: Vec<String>,
+    pub writable: bool,
+    pub banners: Vec<Banner>,
+}
+
+pub fn user_form_page(v: &UserFormView) -> String {
+    let mut body = String::new();
+    let heading = if v.is_new {
+        "新建账号".to_string()
+    } else {
+        format!("编辑账号 {}", v.name)
+    };
+    body.push_str(&format!("<h2>{}</h2>", esc(&heading)));
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+
+    let action = if v.is_new {
+        "/__admin/users".to_string()
+    } else {
+        format!("/__admin/users/{}", urlencode_attr(&v.name))
+    };
+
+    body.push_str(&format!(
+        "<form method=\"post\" action=\"{action}\">",
+        action = action
+    ));
+
+    // 用户名
+    if v.name_locked {
+        body.push_str(&format!(
+            "<div class=\"field\"><label>账号</label><div class=\"mono\">{}</div>\
+<p class=\"hint\">账号名不可修改。要换名字请新建一个再删掉这个。</p></div>",
+            esc(&v.name)
+        ));
+    } else {
+        body.push_str(
+            "<div class=\"field\"><label for=\"n\">账号</label>\
+<input id=\"n\" name=\"name\" autocomplete=\"off\" autocapitalize=\"none\" spellcheck=\"false\" required \
+placeholder=\"只允许字母、数字、点、下划线、减号\">\
+<p class=\"hint\">只允许字母、数字、<code>.</code> <code>-</code> <code>_</code>。</p></div>",
+        );
+    }
+
+    // 口令
+    let pw_label = if v.is_new {
+        "口令"
+    } else {
+        "新口令（留空 = 不修改）"
+    };
+    let pw_required = if v.is_new { " required" } else { "" };
+    body.push_str(&format!(
+        "<div class=\"grid2\"><div class=\"field\"><label for=\"p\">{pw_label}</label>\
+<input id=\"p\" name=\"pass\" type=\"password\" autocomplete=\"new-password\"{pw_required}></div>\
+<div class=\"field\"><label for=\"p2\">再输一次</label>\
+<input id=\"p2\" name=\"pass2\" type=\"password\" autocomplete=\"new-password\"{pw_required}></div></div>\
+<p class=\"hint\">至少 8 个字符。改口令会让这个账号**其他**已登录的会话立刻失效。</p>",
+        pw_label = esc(pw_label),
+        pw_required = pw_required,
+    ));
+
+    // 授权端口
+    body.push_str("<fieldset><legend>可以访问哪些端口</legend>");
+    let all_checked = v.routes.iter().any(|r| r == "*");
+    body.push_str(&format!(
+        "<label class=\"chk\"><input type=\"checkbox\" name=\"all_routes\" value=\"1\"{}>\
+<span>全部端口 <span class=\"badge\">含以后新增的</span></span></label>",
+        if all_checked { " checked" } else { "" }
+    ));
+    body.push_str("<div class=\"hint\" style=\"margin:10px 0 6px\">或者逐个指定：</div>");
+    if v.available.is_empty() {
+        body.push_str("<div class=\"empty\">配置里没有 route</div>");
+    }
+    for r in &v.available {
+        let checked = v.routes.iter().any(|x| x == r);
+        body.push_str(&format!(
+            "<label class=\"chk\"><input type=\"checkbox\" name=\"route\" value=\"{val}\"{}>\
+<span class=\"mono\">{val}</span></label>",
+            if checked { " checked" } else { "" },
+            val = esc(r)
+        ));
+    }
+    body.push_str("</fieldset>");
+
+    // 管理员
+    body.push_str(&format!(
+        "<fieldset><legend>管理权限</legend>\
+<label class=\"chk\"><input type=\"checkbox\" name=\"admin\" value=\"1\"{}>\
+<span>允许进入管理面板（能改所有账号、能给别人发权限）</span></label>\
+<p class=\"hint\">这一项等于把「给所有人发权限」的能力交出去，只在确实需要时打开。</p></fieldset>",
+        if v.admin { " checked" } else { "" }
+    ));
+
+    body.push_str(&format!(
+        "<div class=\"row\"><button class=\"btn pri\" type=\"submit\"{}>{}</button>\
+<a class=\"btn\" href=\"/__admin/\">取消</a></div></form>",
+        if v.writable { "" } else { " disabled" },
+        if v.is_new { "创建" } else { "保存" }
+    ));
+
+    layout(&v.title, &v.actor, v.is_admin, "users", &body)
+}
+
+/// 会话列表里的一行。
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    /// 短 id（前 12 字符）。完整 sid 不进 HTML，避免一次 XSS 就等于交出会话。
+    pub short: String,
+    pub user: String,
+    pub source: String,
+    pub created: String,
+    pub seen: String,
+    pub admin: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionsView {
+    pub title: String,
+    pub actor: String,
+    pub rows: Vec<SessionRow>,
+    pub banners: Vec<Banner>,
+}
+
+pub fn sessions_page(v: &SessionsView) -> String {
+    let mut body = String::new();
+    body.push_str("<h2>在线会话</h2>");
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+    if v.rows.is_empty() {
+        body.push_str("<div class=\"empty\">当前没有在线会话</div>");
+    } else {
+        body.push_str("<table><thead><tr><th>账号</th><th>来源</th><th>登录于</th><th>最近活动</th><th></th></tr></thead><tbody>");
+        for r in &v.rows {
+            let adm = if r.admin {
+                "<span class=\"badge adm\">管理员</span>"
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "<tr><td><span class=\"mono\">{}</span>{}</td><td class=\"mono dim\">{}</td>\
+<td class=\"dim\">{}</td><td class=\"dim\">{}</td>\
+<td><div class=\"row\" style=\"justify-content:flex-end\">\
+<form class=\"inline\" method=\"post\" action=\"/__admin/sessions/{}/revoke\">\
+<button class=\"btn danger\" type=\"submit\">踢下线</button></form></div></td></tr>",
+                esc(&r.user),
+                adm,
+                esc(&r.source),
+                esc(&r.created),
+                esc(&r.seen),
+                esc(&r.short),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str(
+        "<p class=\"hint\">会话存在内存里，网关重启即全部失效。这里只显示被截短后的会话 id。</p>",
+    );
+    layout(&v.title, &v.actor, true, "sessions", &body)
+}
+
+/// 「我的账号」页。
+#[derive(Debug, Clone)]
+pub struct MeView {
+    pub title: String,
+    pub actor: String,
+    pub is_admin: bool,
+    pub name: String,
+    pub admin: bool,
+    pub routes_label: String,
+    pub source_label: String,
+    pub writable: bool,
+    pub banners: Vec<Banner>,
+}
+
+pub fn me_page(v: &MeView) -> String {
+    let mut body = String::from("<h2>我的账号</h2>");
+    for b in &v.banners {
+        body.push_str(&b.render());
+    }
+    body.push_str(&format!(
+        "<table><tbody>\
+<tr><td class=\"dim\">账号</td><td class=\"mono\">{}</td></tr>\
+<tr><td class=\"dim\">授权端口</td><td class=\"mono\">{}</td></tr>\
+<tr><td class=\"dim\">管理权限</td><td>{}</td></tr>\
+<tr><td class=\"dim\">账号来源</td><td>{}</td></tr>\
+</tbody></table>",
+        esc(&v.name),
+        esc(&v.routes_label),
+        if v.admin { "是" } else { "否" },
+        esc(&v.source_label),
+    ));
+
+    body.push_str("<h2>改口令</h2>");
+    body.push_str(&format!(
+        "<form method=\"post\" action=\"/__admin/me\">\
+<div class=\"field\"><label for=\"o\">当前口令</label>\
+<input id=\"o\" name=\"old\" type=\"password\" autocomplete=\"current-password\" required></div>\
+<div class=\"grid2\"><div class=\"field\"><label for=\"p\">新口令</label>\
+<input id=\"p\" name=\"pass\" type=\"password\" autocomplete=\"new-password\" required></div>\
+<div class=\"field\"><label for=\"p2\">再输一次</label>\
+<input id=\"p2\" name=\"pass2\" type=\"password\" autocomplete=\"new-password\" required></div></div>\
+<p class=\"hint\">要输当前口令：光有 cookie 就能改口令的话，一次会话劫持就变成了永久占有。\
+改完之后这个账号的其他会话会立刻失效，当前这个保留。</p>\
+<div class=\"row\"><button class=\"btn pri\" type=\"submit\"{}>改口令</button></div></form>",
+        if v.writable { "" } else { " disabled" }
+    ));
+
+    layout(&v.title, &v.actor, v.is_admin, "me", &body)
+}
+
+/// 属性值里的百分号编码（账号名只含 ASCII 标识符字符，但仍然统一走一遍）。
+fn urlencode_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +624,10 @@ mod tests {
         // 标题 / route / next / 错误信息都不能原样出现
         assert!(!html.contains("<script>"), "错误信息里的标签必须被转义");
         assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("&quot;"), "引号要转义（因为它落在 value=\"...\" 里）");
+        assert!(
+            html.contains("&quot;"),
+            "引号要转义（因为它落在 value=\"...\" 里）"
+        );
         // 表单必须 POST 到网关自己的端点
         assert!(html.contains(r#"action="/__auth/login""#));
         assert!(html.contains(r#"method="post""#));
@@ -137,7 +655,10 @@ mod tests {
     fn error_page_renders_given_detail() {
         let html = error_page("网关", "无权访问", "当前账号 <code>bob</code> 被拒绝");
         assert!(html.contains("无权访问"));
-        assert!(html.contains("<code>bob</code>"), "已转义的 detail 应原样渲染");
+        assert!(
+            html.contains("<code>bob</code>"),
+            "已转义的 detail 应原样渲染"
+        );
         // 提供一条回到登录的路径
         assert!(html.contains("/__auth/logout"));
     }

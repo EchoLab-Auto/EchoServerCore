@@ -27,6 +27,23 @@ trust_forwarded_for = false
 # 注意：打开后纯 HTTP 访问会拿不到 cookie（浏览器不存 Secure cookie 到 http://）。
 secure_cookie = false
 
+# ── 管理面板 ────────────────────────────────────────────────────────────
+#
+# 登录后在任意端口访问 /__admin/ 就能增删账号、改口令、踢会话。
+#
+# 面板管理的账号存在这个文件里，**叠加**在上面 [[user]] 之上：同名账号以
+# 账号库为准。这样配置文件永远是一条救援通道——账号库删了、坏了、卷没挂上，
+# 这里的账号照样能登进来修。
+#
+# 不写这一行 = 自动取配置文件同目录的 gateway-users.toml
+# （/etc/esc/gateway.toml → /etc/esc/gateway-users.toml）。
+# 目录不可写时面板自动降级为只读，并在页面上说明原因。
+# users_file = "/var/lib/esc-gateway/gateway-users.toml"
+
+# 只允许这些来源访问管理面板（空 = 不限）。和账号认证是「与」关系。
+# 面板就挂在公网端口上，想「只从内网/VPN 改账号」填这里即可，不必多开端口。
+# admin_allowed_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]
+
 [rate_limit]
 # 同一来源允许的登录失败次数
 max_failures = 8
@@ -44,17 +61,20 @@ global_window_secs = 300
 #   esc-gateway hash-password
 #
 # routes 是该用户能访问的 route 名；["*"] = 全部。
+# admin = true 才允许进管理面板（/__admin/）。**至少留一个**，否则没人能管理账号。
 
 [[user]]
 name = "admin"
 hash = "$argon2id$v=19$m=19456,t=2,p=1$请替换成你自己的哈希$请替换成你自己的哈希"
 routes = ["*"]
+admin = true
 
 # 只读账号：只能看端口映射面板，看不到能管 Docker 的那个。
 # [[user]]
 # name = "viewer"
 # hash = "$argon2id$..."
 # routes = ["tunnel-panel"]
+# admin = false   # 默认就是 false，写出来只是提醒
 
 # ── 路由 ────────────────────────────────────────────────────────────────
 #

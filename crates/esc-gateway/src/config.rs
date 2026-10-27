@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -44,6 +44,23 @@ pub struct GatewayConfig {
 
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// 账号库文件（管理面板管理的账号）。
+    ///
+    /// 不设则默认取**配置文件同目录**的 `gateway-users.toml`
+    /// （`/etc/esc/gateway.toml` → `/etc/esc/gateway-users.toml`）。
+    /// 目录不可写时面板自动降级为只读，并把这个原因显示在页面上。
+    ///
+    /// 同名账号以账号库为准——这样配置文件永远是一条可用的救援通道。
+    #[serde(default)]
+    pub users_file: Option<PathBuf>,
+
+    /// 允许访问管理面板的来源白名单（空 = 不限）。和账号认证是**与**关系。
+    ///
+    /// 网关本身就在公网上，管理面板挂在同一个端口上。想「只从内网/VPN
+    /// 进去改账号」就填这里，不必为此多占一个端口。
+    #[serde(default)]
+    pub admin_allowed_cidrs: Vec<String>,
 
     /// 用户表。至少一个，且每个都必须有 `hash`。
     #[serde(default)]
@@ -95,6 +112,12 @@ pub struct UserConfig {
     /// 允许访问的 route 名。`["*"]` = 全部。
     #[serde(default)]
     pub routes: Vec<String>,
+    /// 是否允许进管理面板（`/__admin/`）。
+    ///
+    /// 刻意默认 `false`：能改账号 = 能给自己发权限，这个开关不该靠「碰巧
+    /// 复制了别人的配置」打开。
+    #[serde(default)]
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +151,8 @@ impl Default for GatewayConfig {
             rate_limit: RateLimitConfig::default(),
             user: Vec::new(),
             route: Vec::new(),
+            users_file: None,
+            admin_allowed_cidrs: Vec::new(),
         }
     }
 }
@@ -144,6 +169,24 @@ fn default_cookie() -> String {
 fn default_max_sessions() -> usize {
     4096
 }
+/// 账号库的默认位置：配置文件同目录的 `gateway-users.toml`。
+pub fn default_users_file(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("gateway-users.toml")
+}
+
+/// 用户名的合法字符集。
+///
+/// 严格限制不是为了洁癖：用户名会出现在 URL 路径（`/__admin/users/<名字>`）、
+/// 表单值和 HTML 里。三者各自有转义规则，允许任意字符就等于要求三处都不能
+/// 出错。限定成 ASCII 标识符后，这三个上下文里都是原样安全的。
+pub fn valid_user_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 fn default_max_failures() -> u32 {
     8
 }
@@ -165,9 +208,15 @@ impl GatewayConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("读取 {} 失败: {e}", path.display()))?;
-        let cfg: Self = toml::from_str(&raw)
+        let mut cfg: Self = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("解析 {} 失败: {e}", path.display()))?;
-        cfg.validate().map_err(|e| anyhow::anyhow!("配置无效: {e}"))?;
+        // 没显式配 users_file 就落到配置文件同目录：这样「不加任何配置也能用
+        // 管理面板」成立，而不至于因为漏配一个字段就得到一个只读面板。
+        if cfg.users_file.is_none() {
+            cfg.users_file = Some(default_users_file(path));
+        }
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("配置无效: {e}"))?;
         Ok(cfg)
     }
 
@@ -197,8 +246,11 @@ impl GatewayConfig {
             if !names.insert(u.name.as_str()) {
                 return Err(format!("用户名 {:?} 重复", u.name));
             }
-            if u.name.trim().is_empty() {
-                return Err("用户名不能为空".into());
+            if !valid_user_name(&u.name) {
+                return Err(format!(
+                    "用户名 {:?} 不合法：只能用字母、数字、`.` `-` `_`，长度 1..=64",
+                    u.name
+                ));
             }
             // 明确拒绝明文：这是最容易犯、后果最重的配置错误。
             if !u.hash.starts_with("$argon2") {
@@ -209,8 +261,15 @@ impl GatewayConfig {
                 ));
             }
             if u.routes.is_empty() {
-                return Err(format!("用户 {:?} 的 routes 为空，将无法访问任何页面", u.name));
+                return Err(format!(
+                    "用户 {:?} 的 routes 为空，将无法访问任何页面",
+                    u.name
+                ));
             }
+        }
+
+        for c in &self.admin_allowed_cidrs {
+            AllowRule::parse(c).map_err(|e| format!("admin_allowed_cidrs: {e}"))?;
         }
 
         // ── 路由 ──
@@ -220,17 +279,17 @@ impl GatewayConfig {
             if !rnames.insert(r.name.as_str()) {
                 return Err(format!("route 名 {:?} 重复", r.name));
             }
-            let addr: SocketAddr = r
-                .listen
-                .parse()
-                .map_err(|_| format!("route {:?} 的 listen 不是合法地址: {:?}", r.name, r.listen))?;
+            let addr: SocketAddr = r.listen.parse().map_err(|_| {
+                format!("route {:?} 的 listen 不是合法地址: {:?}", r.name, r.listen)
+            })?;
             if !listens.insert(addr) {
-                return Err(format!(
-                    "有多个 route 监听同一地址 {addr}，请改成不同端口"
-                ));
+                return Err(format!("有多个 route 监听同一地址 {addr}，请改成不同端口"));
             }
             let up: SocketAddr = r.upstream.parse().map_err(|_| {
-                format!("route {:?} 的 upstream 不是合法地址: {:?}（需要 host:port）", r.name, r.upstream)
+                format!(
+                    "route {:?} 的 upstream 不是合法地址: {:?}（需要 host:port）",
+                    r.name, r.upstream
+                )
             })?;
             // 上游指回自己 = 无限循环。这类错误一旦上线就是 CPU 100% 且难以定位。
             if up == addr {
@@ -249,7 +308,10 @@ impl GatewayConfig {
                 }
             }
             if r.max_body_bytes == Some(0) {
-                return Err(format!("route {:?} 的 max_body_bytes 不能是 0（用 null 表示默认）", r.name));
+                return Err(format!(
+                    "route {:?} 的 max_body_bytes 不能是 0（用 null 表示默认）",
+                    r.name
+                ));
             }
         }
 
@@ -318,6 +380,7 @@ impl GatewayConfig {
                         hash: u.hash.clone(),
                         all_routes: all,
                         routes: u.routes.iter().filter(|r| *r != "*").cloned().collect(),
+                        admin: u.admin,
                     },
                 )
             })
@@ -333,6 +396,12 @@ impl GatewayConfig {
             users,
             routes,
             listens,
+            users_file: self.users_file.clone(),
+            admin_allow: self
+                .admin_allowed_cidrs
+                .iter()
+                .filter_map(|c| AllowRule::parse(c).ok())
+                .collect(),
         })
     }
 }
@@ -344,6 +413,8 @@ pub struct UserRuntime {
     pub hash: String,
     pub all_routes: bool,
     pub routes: Vec<String>,
+    /// 是否能进管理面板。登录时固化进会话（改权限 = 该账号的会话全部作废）。
+    pub admin: bool,
 }
 
 impl UserRuntime {
@@ -392,11 +463,33 @@ pub struct RuntimeConfig {
     pub users: HashMap<String, UserRuntime>,
     pub routes: HashMap<String, RouteRuntime>,
     pub listens: Vec<SocketAddr>,
+    /// 账号库路径。`None` = 面板只读（只用配置文件里的账号）。
+    pub users_file: Option<PathBuf>,
+    /// 管理面板的来源白名单（空 = 不限）。
+    pub admin_allow: Vec<AllowRule>,
 }
 
 impl RuntimeConfig {
     pub fn user(&self, name: &str) -> Option<&UserRuntime> {
         self.users.get(name)
+    }
+
+    /// 来源是否允许访问管理面板。
+    pub fn admin_source_allowed(&self, peer: Option<IpAddr>) -> bool {
+        if self.admin_allow.is_empty() {
+            return true;
+        }
+        match peer {
+            Some(ip) => self.admin_allow.iter().any(|r| r.matches(ip)),
+            None => false,
+        }
+    }
+
+    /// 可授权的 route 名（面板里画成复选框）。
+    pub fn route_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.routes.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// 按监听地址找 route。

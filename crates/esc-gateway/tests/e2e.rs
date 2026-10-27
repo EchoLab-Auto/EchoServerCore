@@ -59,7 +59,10 @@ async fn http(
     let has_conn = headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("connection"));
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n", body.len());
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n",
+        body.len()
+    );
     if !has_conn {
         req.push_str("Connection: close\r\n");
     }
@@ -134,6 +137,8 @@ async fn start_upstream() -> (SocketAddr, CancellationToken) {
 struct Gw {
     /// route 名 → 真实监听地址（配置里写的是占位端口，实际绑 :0）
     addrs: std::collections::HashMap<String, SocketAddr>,
+    /// 共享状态本身。测试里查会话表、账号库用。
+    gw: Arc<Gateway>,
     token: CancellationToken,
 }
 
@@ -205,7 +210,7 @@ upstream = "{upstream}"
         tokio::spawn(async move { esc_gateway::proxy::serve_route(gw, r, l, shut).await });
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
-    Gw { addrs, token }
+    Gw { addrs, gw, token }
 }
 
 /// 登录，返回 session cookie。
@@ -228,12 +233,7 @@ async fn login(gw: &Gw, user: &str, pass: &str) -> Option<String> {
 }
 
 /// 在指定端口登录（多 route 场景下需要）。
-async fn login_at(
-    _gw: &Gw,
-    addr: SocketAddr,
-    user: &str,
-    pass: &str,
-) -> Option<String> {
+async fn login_at(_gw: &Gw, addr: SocketAddr, user: &str, pass: &str) -> Option<String> {
     let body = format!("user={user}&pass={pass}&next=/");
     let r = http(
         addr,
@@ -320,12 +320,30 @@ async fn login_page_is_served_without_cookie() {
     assert!(r.body.contains("测试网关"), "标题应来自配置");
 
     // next 会作为隐藏字段
-    let r = http(gw.addr(), "GET", "/__auth/login?next=%2Fapi%2Fstatus", &[], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__auth/login?next=%2Fapi%2Fstatus",
+        &[],
+        None,
+    )
+    .await;
     assert!(r.body.contains(r#"value="/api/status""#), "{}", r.body);
 
     // 开放重定向在登录页就该被中和
-    let r = http(gw.addr(), "GET", "/__auth/login?next=%2F%2Fevil.com", &[], None).await;
-    assert!(!r.body.contains("evil.com"), "协议相对 URL 应被中和: {}", r.body);
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__auth/login?next=%2F%2Fevil.com",
+        &[],
+        None,
+    )
+    .await;
+    assert!(
+        !r.body.contains("evil.com"),
+        "协议相对 URL 应被中和: {}",
+        r.body
+    );
 
     gw.token.cancel();
     _u.cancel();
@@ -368,7 +386,14 @@ async fn login_sets_httponly_strict_cookie_and_then_proxies() {
     assert!(sc.contains("Path=/"), "{sc}");
 
     // 带上 cookie 后能拿到上游内容
-    let r = http(gw.addr(), "GET", "/api/status?x=1", &[("cookie", &cookie)], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/api/status?x=1",
+        &[("cookie", &cookie)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200, "{}", r.body);
     let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
     assert_eq!(v["method"], "GET");
@@ -403,7 +428,10 @@ async fn upstream_sees_rewritten_host_and_xff_but_not_the_cookie() {
 
     // Host 被重写成上游地址（客户端无法用 Host 影响上游）
     let host = find("host").expect("应有 Host");
-    assert!(host.contains(&up.to_string()), "Host 应被重写为上游: {host}");
+    assert!(
+        host.contains(&up.to_string()),
+        "Host 应被重写为上游: {host}"
+    );
 
     // 客户端伪造的 XFF 必须被覆盖成真实来源 127.0.0.1
     let xff = find("x-forwarded-for").expect("应有 XFF");
@@ -546,14 +574,25 @@ async fn viewer_can_reach_its_route_but_not_others() {
     )
     .await;
     assert_eq!(r.status, 403);
-    assert!(r.body.contains("无权访问"), "浏览器应看到说明页: {}", r.body);
+    assert!(
+        r.body.contains("无权访问"),
+        "浏览器应看到说明页: {}",
+        r.body
+    );
     assert!(r.body.contains("viewer"), "应指明是哪个账号");
 
     // ④ admin 在 admin-only 端口能正常访问
     let admin_cookie = login_at(&gw, admin_addr, "admin", "pw-123")
         .await
         .expect("admin 应能在 admin-only 端口登录");
-    let r = http(admin_addr, "GET", "/marker", &[("cookie", &admin_cookie)], None).await;
+    let r = http(
+        admin_addr,
+        "GET",
+        "/marker",
+        &[("cookie", &admin_cookie)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200, "{}", r.body);
 
     gw.token.cancel();
@@ -625,7 +664,10 @@ async fn wrong_password_is_401_and_does_not_leak_whether_the_user_exists() {
     assert_eq!(a.status, 401);
     assert_eq!(b.status, 401, "用户不存在也应是 401");
     // 两种情况的响应体必须一样，否则响应内容泄露了用户是否存在
-    assert_eq!(a.body, b.body, "错误信息不能区分「用户不存在」与「口令错误」");
+    assert_eq!(
+        a.body, b.body,
+        "错误信息不能区分「用户不存在」与「口令错误」"
+    );
     assert!(a.set_cookie().is_none(), "失败时不能下发 cookie");
     gw.token.cancel();
     _u.cancel();
@@ -673,11 +715,20 @@ async fn logout_invalidates_the_session() {
     let cookie = login(&gw, "admin", "pw-123").await.unwrap();
 
     assert_eq!(
-        http(gw.addr(), "GET", "/", &[("cookie", &cookie)], None).await.status,
+        http(gw.addr(), "GET", "/", &[("cookie", &cookie)], None)
+            .await
+            .status,
         200
     );
 
-    let r = http(gw.addr(), "GET", "/__auth/logout", &[("cookie", &cookie)], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__auth/logout",
+        &[("cookie", &cookie)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 302);
     assert!(r.set_cookie().unwrap().contains("Max-Age=0"));
 
@@ -800,6 +851,514 @@ async fn source_allowlist_blocks_before_authentication() {
     )
     .await;
     assert_eq!(r.status, 403);
+    gw.token.cancel();
+    _u.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 管理面板
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn tmpdir(tag: &str) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let p = std::env::temp_dir().join(format!("esc-gw-e2e-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// 带可写账号库的网关，`admin` 账号提成管理员。
+async fn start_admin_gateway(upstream: SocketAddr) -> (Gw, std::path::PathBuf) {
+    let dir = tmpdir("panel");
+    let path = dir.join("gateway-users.toml");
+    let gw = start_gateway(upstream, |c| {
+        c.users_file = Some(path.clone());
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+    (gw, path)
+}
+
+/// 带 cookie 的 POST（表单）。
+async fn post_form(addr: SocketAddr, path: &str, cookie: &str, body: &str) -> Resp {
+    http(
+        addr,
+        "POST",
+        path,
+        &[
+            ("cookie", cookie),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ],
+        Some(body),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn admin_panel_needs_login_like_everything_else() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+
+    // 浏览器：跳登录页，且把原路径带回去
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/users",
+        &[("sec-fetch-mode", "navigate")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 302);
+    let loc = r.header("location").unwrap();
+    assert!(loc.starts_with("/__auth/login?next="), "{loc}");
+    assert!(loc.contains("__admin"), "登录后要回到面板: {loc}");
+
+    // 脚本：401 JSON（和普通页面的规则一致）
+    let r = http(gw.addr(), "GET", "/__admin/", &[("accept", "*/*")], None).await;
+    assert_eq!(r.status, 401);
+    assert_eq!(r.header("content-type"), Some("application/json"));
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn panel_pages_are_not_cacheable_and_not_framable() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    // 账号列表被中间层缓存下来会是什么后果，不用细想
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("x-frame-options"), Some("DENY"));
+    assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn plain_user_can_only_reach_my_account() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "viewer", "pw-123").await.unwrap();
+
+    // `/__admin/` 带他去看自己的账号，而不是一个冷冰冰的 403
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 302);
+    assert_eq!(r.header("location"), Some("/__admin/me"));
+
+    let r = http(gw.addr(), "GET", "/__admin/me", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("我的账号"));
+
+    // 但改账号一律 403——包括猜出来的端点
+    for path in [
+        "/__admin/users",
+        "/__admin/users/admin",
+        "/__admin/sessions",
+    ] {
+        let r = http(gw.addr(), "GET", path, &[("cookie", &c)], None).await;
+        assert_eq!(r.status, 403, "{path} 应对普通用户关闭");
+    }
+    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
+    assert_eq!(r.status, 403, "普通用户不能删账号");
+    assert!(gw.gw.user("admin").is_some(), "账号不该被删掉");
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn admin_creates_an_account_that_can_then_log_in() {
+    let (up, _u) = start_upstream().await;
+    let (gw, path) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 列表里能看到两个配置文件账号
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("viewer"));
+    assert!(r.body.contains("配置文件"), "要标出账号来源");
+
+    let r = post_form(
+        gw.addr(),
+        "/__admin/users",
+        &c,
+        "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
+    )
+    .await;
+    assert_eq!(r.status, 302, "成功后重定向: {}", r.body);
+    assert_eq!(
+        r.header("location"),
+        Some("/__admin/"),
+        "提示走会话，不进 URL"
+    );
+    // 提示条只在紧接着的那次 GET 出现一次
+    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert!(page.body.contains("已创建"), "{}", page.body);
+    let again = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert!(!again.body.contains("已创建"), "刷新不该重复出现提示");
+
+    // 落盘了，而且没有明文口令
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("name = \"bob\""), "{raw}");
+    assert!(!raw.contains("bob-pass-123"), "账号库不能出现明文口令");
+
+    // 新账号能登录并访问被授权的端口
+    let bob = login(&gw, "bob", "bob-pass-123").await;
+    assert!(bob.is_some(), "新建的账号应该能登录");
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/",
+        &[("cookie", &bob.unwrap()), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "应被转发到上游: {}", r.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn granted_routes_are_enforced_at_login_and_afterwards() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let r = post_form(
+        gw.addr(),
+        "/__admin/users",
+        &c,
+        "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
+    )
+    .await;
+    assert_eq!(r.status, 302);
+
+    // 只能在授权过的端口登录
+    assert!(login(&gw, "bob", "bob-pass-123").await.is_some());
+    let on_other = login_at(&gw, gw.addr_of("admin-only"), "bob", "bob-pass-123").await;
+    assert!(on_other.is_none(), "没授权的端口不该能登录");
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn the_last_admin_can_be_neither_deleted_nor_demoted() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 配置文件里的账号面板动不了，先接管进账号库
+    let r = post_form(gw.addr(), "/__admin/users/admin/adopt", &c, "").await;
+    assert_eq!(r.status, 302);
+    assert!(gw.gw.store.get("admin").is_some());
+
+    // 删：拒绝
+    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
+    assert_eq!(r.status, 302);
+    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert!(page.body.contains("最后一个管理员"), "{}", page.body);
+    assert!(gw.gw.user("admin").is_some(), "最后一个管理员不能被删");
+
+    // 降级：拒绝。这里是表单提交，所以错误要回到表单上（200 + 内联提示），
+    // 而不是重定向——否则用户填的东西全丢了。
+    let r = post_form(gw.addr(), "/__admin/users/admin", &c, "route=panel").await;
+    assert_eq!(r.status, 200, "表单错误应原地显示: {}", r.body);
+    assert!(r.body.contains("最后一个管理员"), "{}", r.body);
+    assert!(r.body.contains("type=\"checkbox\""), "表单要重新渲染出来");
+    assert!(gw.gw.user("admin").unwrap().admin, "管理权限不该被取消");
+
+    // 有第二个管理员之后，一切恢复正常
+    let r = post_form(
+        gw.addr(),
+        "/__admin/users",
+        &c,
+        "name=boss&pass=boss-pass-123&pass2=boss-pass-123&route=panel&admin=1",
+    )
+    .await;
+    assert_eq!(r.status, 302);
+    // 但不能用它自己的会话删自己：那会把当前会话一起打掉，
+    // 用户看到的是一个莫名其妙的登录页
+    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
+    assert_eq!(r.status, 302);
+    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert!(page.body.contains("正在使用的账号"), "{}", page.body);
+
+    // 换成 boss 的会话删，就成了
+    let boss = login(&gw, "boss", "boss-pass-123")
+        .await
+        .expect("boss 应能登录");
+    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &boss, "").await;
+    assert_eq!(r.status, 302);
+    assert!(
+        gw.gw.store.get("admin").is_none(),
+        "有了第二个管理员就该允许删除"
+    );
+
+    // 有意思的地方：删掉的是**账号库里那条**，gateway.toml 里的 admin 于是
+    // 又生效了。这不是 bug，是刻意留的救援通道——管理面板永远无法把配置
+    // 文件里的账号删掉，所以「把自己锁在门外」这件事有硬下限。
+    assert!(gw.gw.user("admin").is_some(), "配置文件里的账号应重新生效");
+    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &boss)], None).await;
+    assert!(page.body.contains("配置文件（只读）"), "{}", page.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn changing_a_password_kills_other_sessions_and_adopts_the_config_account() {
+    let (up, _u) = start_upstream().await;
+    let (gw, path) = start_admin_gateway(up).await;
+
+    // 同一个账号开两个会话：一个自己用，一个「被人拿了 cookie」
+    let mine = login(&gw, "admin", "pw-123").await.unwrap();
+    let stolen = login(&gw, "admin", "pw-123").await.unwrap();
+    assert_eq!(gw.gw.auth.session_count(), 2);
+
+    let r = post_form(
+        gw.addr(),
+        "/__admin/me",
+        &mine,
+        "old=pw-123&pass=new-pass-456&pass2=new-pass-456",
+    )
+    .await;
+    assert_eq!(r.status, 302);
+    assert_eq!(r.header("location"), Some("/__admin/me"));
+
+    // 旧 cookie 立刻失效，自己的这个保留
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &stolen)], None).await;
+    assert_eq!(r.status, 401, "被盗的会话必须马上踢掉");
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &mine)], None).await;
+    assert_eq!(r.status, 200, "自己的会话不该被自己踢掉");
+
+    // 口令真的换了
+    assert!(
+        login(&gw, "admin", "pw-123").await.is_none(),
+        "旧口令必须失效"
+    );
+    assert!(login(&gw, "admin", "new-pass-456").await.is_some());
+
+    // 配置文件里的账号被接管进了账号库，否则新口令无处可落
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("name = \"admin\""),
+        "自助改密应自动接管: {raw}"
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn self_service_password_change_requires_the_current_password() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 光有 cookie 不够：不验证当前口令的话，一次会话劫持就变成永久占有
+    let r = post_form(
+        gw.addr(),
+        "/__admin/me",
+        &c,
+        "old=wrong-pw&pass=new-pass-456&pass2=new-pass-456",
+    )
+    .await;
+    assert_eq!(r.status, 200, "口令不对应该回到表单");
+    assert!(r.body.contains("当前口令不正确"), "{}", r.body);
+    assert!(
+        login(&gw, "admin", "pw-123").await.is_some(),
+        "口令不该被改掉"
+    );
+
+    // 两次新口令不一致
+    let r = post_form(
+        gw.addr(),
+        "/__admin/me",
+        &c,
+        "old=pw-123&pass=new-pass-456&pass2=new-pass-457",
+    )
+    .await;
+    assert!(r.body.contains("不一致"), "{}", r.body);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn cross_origin_admin_post_is_rejected() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // SameSite=Strict 已经让浏览器不发 cookie，但纵深防御这一层要能独立成立
+    let r = http(
+        gw.addr(),
+        "POST",
+        "/__admin/users",
+        &[
+            ("cookie", &c),
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("origin", "http://evil.example"),
+        ],
+        Some("name=mallory&pass=mallory-pass&pass2=mallory-pass&route=panel"),
+    )
+    .await;
+    assert_eq!(r.status, 403, "跨站 POST 必须拒绝");
+    assert!(gw.gw.user("mallory").is_none(), "不该留下账号");
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn sessions_can_be_kicked_out_by_prefix_and_by_account() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let admin = login(&gw, "admin", "pw-123").await.unwrap();
+    let viewer = login(&gw, "viewer", "pw-123").await.unwrap();
+
+    // 会话页能看到双方
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/sessions",
+        &[("cookie", &admin)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("viewer"));
+    // 完整 session id 不进 HTML：一次 XSS 就等于把所有在线会话交出去
+    assert!(
+        !r.body.contains(&sid_of(&viewer)),
+        "页面不该包含完整会话 id"
+    );
+
+    // 按账号全踢
+    let r = post_form(gw.addr(), "/__admin/users/viewer/revoke", &admin, "").await;
+    assert_eq!(r.status, 302);
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/api/x",
+        &[("cookie", &viewer), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 401, "被踢的会话应立即失效");
+
+    // 按前缀踢单个（用自己的第二个会话试）
+    let other = login(&gw, "admin", "pw-123").await.unwrap();
+    let other_sid = sid_of(&other);
+    let prefix: String = gw
+        .gw
+        .auth
+        .list()
+        .into_iter()
+        .filter(|(sid, _)| sid.starts_with(&other_sid))
+        .map(|(sid, _)| sid.chars().take(12).collect())
+        .next()
+        .expect("应找到刚建的那个会话");
+    let r = post_form(
+        gw.addr(),
+        &format!("/__admin/sessions/{prefix}/revoke"),
+        &admin,
+        "",
+    )
+    .await;
+    assert_eq!(r.status, 302);
+    assert_eq!(r.header("location"), Some("/__admin/sessions"));
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &other)], None).await;
+    assert_eq!(r.status, 401);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+/// 从 cookie 里取 session id（`esc_gw=<sid>`）。
+fn sid_of(cookie: &str) -> String {
+    cookie
+        .split_once('=')
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_gateway_without_users_file_is_a_read_only_panel() {
+    let (up, _u) = start_upstream().await;
+    // 不设 users_file（等价于直接 build 的配置）
+    let gw = start_gateway(up, |c| {
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("只读"), "页面要说明为什么改不了");
+
+    // 提交了也不会生效，而且要说清楚原因
+    let r = post_form(
+        gw.addr(),
+        "/__admin/users",
+        &c,
+        "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
+    )
+    .await;
+    assert_eq!(r.status, 200, "错误应回到表单而不是重定向");
+    assert!(r.body.contains("只读"), "{}", r.body);
+    assert!(gw.gw.user("bob").is_none());
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn admin_allowed_cidrs_is_fail_closed() {
+    let (up, _u) = start_upstream().await;
+    let gw = start_gateway(up, |c| {
+        c.admin_allowed_cidrs = vec!["10.0.0.0/8".to_string()];
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    // 测试从 127.0.0.1 发起，不在 10/8 里 → 连登录页都不该给
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 403);
+    assert!(r.body.contains("admin_allowed_cidrs"), "{}", r.body);
+
+    // 普通页面不受影响
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/api/x",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+
     gw.token.cancel();
     _u.cancel();
 }

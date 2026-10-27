@@ -238,7 +238,7 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 | Hub 重启 → Spoke 自动重连 | ✅ 0.40s 恢复 |
 | 常驻内存 | Hub 5.4 MB / Spoke 5.3 MB |
 
-测试共 181 个，`cargo test --workspace` 全绿（`cargo clippy` 0 warning）。除了原有的协议 / 配置 / PKI 单测，
+测试共 221 个，`cargo test --workspace` 全绿（`cargo clippy` 0 warning）。除了原有的协议 / 配置 / PKI 单测，
 新增部分覆盖了这次改造的关键承诺：
 
 | 用例 | 断言的事 |

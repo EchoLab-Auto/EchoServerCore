@@ -31,8 +31,22 @@ pub struct Session {
     ///
     /// 刻意在登录时就固化：如果管理员在会话期间改了配置并重启，会话已经失效
     /// （在内存里），所以不存在「权限变更后旧会话仍在用旧权限」的窗口。
+    ///
+    /// 管理面板改账号时是**另一条路**：那时候进程不重启，所以由面板显式调用
+    /// [`AuthState::revoke_user`] 把该账号的会话全部作废。不这么做的话，
+    /// 「删掉一个被盗账号」只会在 TTL 到期后才真正生效。
     pub routes: Vec<String>,
     pub all_routes: bool,
+    /// 是否可进管理面板（登录时固化，同上由 revoke_user 兜底）。
+    pub admin: bool,
+    /// 登录来源 IP，供管理面板显示与排查。
+    pub source: Option<IpAddr>,
+    /// 一次性提示（成功/失败横幅），`bool` = 是否成功。
+    ///
+    /// 放在会话里而不是 URL 查询串上：查询串是**别人能构造**的，于是
+    /// `/__admin/?err=你的账号已被停用，请访问 …` 就能在我们自己的管理面板里
+    /// 显示一条看似权威的红条。转义能挡住 XSS，挡不住这种钓鱼。
+    pub flash: Option<(bool, String)>,
 }
 
 impl Session {
@@ -109,7 +123,9 @@ impl AuthState {
         let now = Instant::now();
         let mut inner = self.lock();
         // 顺带清过期：每次访问时做一点，不需要后台任务。
-        inner.sessions.retain(|_, s| now.duration_since(s.created) < self.ttl);
+        inner
+            .sessions
+            .retain(|_, s| now.duration_since(s.created) < self.ttl);
         let tick = {
             inner.tick += 1;
             inner.tick
@@ -125,7 +141,7 @@ impl AuthState {
     }
 
     /// 登录成功后建立会话，返回 session id。
-    pub fn create(&self, user: &UserRuntime) -> String {
+    pub fn create(&self, user: &UserRuntime, source: Option<IpAddr>) -> String {
         let mut rng = rand::thread_rng();
         // 32 字节熵。Base64URL 无填充，放进 cookie 不用转义。
         let mut raw = [0u8; 32];
@@ -139,10 +155,15 @@ impl AuthState {
             last_seen: now,
             routes: user.routes.clone(),
             all_routes: user.all_routes,
+            admin: user.admin,
+            source,
+            flash: None,
         };
 
         let mut inner = self.lock();
-        inner.sessions.retain(|_, s| now.duration_since(s.created) < self.ttl);
+        inner
+            .sessions
+            .retain(|_, s| now.duration_since(s.created) < self.ttl);
         // 达到上限时淘汰最久未使用的那个。不淘汰就等于给对面一个内存放大招：
         // 反复登录就能把会话表堆满。
         if inner.sessions.len() >= self.max_sessions {
@@ -165,6 +186,58 @@ impl AuthState {
 
     pub fn logout(&self, sid: &str) {
         self.lock().sessions.remove(sid);
+    }
+
+    /// 作废某账号的全部会话，`keep` 指定的那一个除外。
+    ///
+    /// 管理面板改口令 / 改授权 / 删账号时必须调它。理由很直接：会话里的权限
+    /// 是登录时快照的，不主动清就等于「删了账号，人还能用 8 小时」。
+    ///
+    /// `keep` 留给「管理员改自己的口令」——把自己也踢掉太蠢了，而真正要防的
+    /// 是**别人**拿着旧 cookie，那正是被清掉的那些。
+    pub fn revoke_user(&self, user: &str, keep: Option<&str>) -> usize {
+        let mut inner = self.lock();
+        let victims: Vec<String> = inner
+            .sessions
+            .iter()
+            .filter(|(sid, s)| s.user == user && Some(sid.as_str()) != keep)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in &victims {
+            inner.sessions.remove(sid);
+            inner.session_tick.remove(sid);
+        }
+        victims.len()
+    }
+
+    /// 给会话挂一条一次性提示。
+    pub fn set_flash(&self, sid: &str, ok: bool, msg: impl Into<String>) {
+        let mut inner = self.lock();
+        if let Some(s) = inner.sessions.get_mut(sid) {
+            s.flash = Some((ok, msg.into()));
+        }
+    }
+
+    /// 取走一次性提示（取完即清，刷新页面不会重复出现）。
+    pub fn take_flash(&self, sid: &str) -> Option<(bool, String)> {
+        let mut inner = self.lock();
+        inner.sessions.get_mut(sid).and_then(|s| s.flash.take())
+    }
+
+    /// 全部在线会话，按建立时间从新到旧。管理面板用。
+    pub fn list(&self) -> Vec<(String, Session)> {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        inner
+            .sessions
+            .retain(|_, s| now.duration_since(s.created) < self.ttl);
+        let mut v: Vec<(String, Session)> = inner
+            .sessions
+            .iter()
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect();
+        v.sort_by_key(|(_, s)| std::cmp::Reverse(s.created));
+        v
     }
 
     pub fn session_count(&self) -> usize {
@@ -214,7 +287,9 @@ impl AuthState {
             // 有界：被大规模扫描时不能无限增长
             if inner.fails.len() >= 4096 {
                 let window = self.fail_window;
-                inner.fails.retain(|_, (_, since)| now.duration_since(*since) < window);
+                inner
+                    .fails
+                    .retain(|_, (_, since)| now.duration_since(*since) < window);
                 if inner.fails.len() >= 4096 {
                     inner.fails.clear();
                 }
@@ -286,8 +361,10 @@ pub fn set_cookie(name: &str, value: &str, max_age: Duration, secure: bool) -> H
 
 /// 清掉 cookie（登出）。
 pub fn clear_cookie(name: &str) -> HeaderValue {
-    HeaderValue::from_str(&format!("{name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"))
-        .unwrap_or_else(|_| HeaderValue::from_static("esc_gw=; Max-Age=0"))
+    HeaderValue::from_str(&format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("esc_gw=; Max-Age=0"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -370,6 +447,8 @@ mod tests {
             users: HashMap::new(),
             routes: HashMap::new(),
             listens: vec![],
+            users_file: None,
+            admin_allow: vec![],
         }
     }
 
@@ -378,14 +457,19 @@ mod tests {
             name: "u".into(),
             hash: "$argon2id$x".into(),
             all_routes: routes.contains(&"*"),
-            routes: routes.iter().filter(|r| **r != "*").map(|r| r.to_string()).collect(),
+            routes: routes
+                .iter()
+                .filter(|r| **r != "*")
+                .map(|r| r.to_string())
+                .collect(),
+            admin: false,
         }
     }
 
     #[test]
     fn session_round_trips_and_logout_invalidates() {
         let st = AuthState::new(&runtime());
-        let sid = st.create(&user(&["*"]));
+        let sid = st.create(&user(&["*"]), None);
         let s = st.get(&sid).expect("刚建的会话应能查到");
         assert_eq!(s.user, "u");
         assert!(s.can_access("any"));
@@ -396,23 +480,25 @@ mod tests {
     #[test]
     fn session_ids_are_unguessable_and_unique() {
         let st = AuthState::new(&runtime());
-        let a = st.create(&user(&["*"]));
-        let b = st.create(&user(&["*"]));
+        let a = st.create(&user(&["*"]), None);
+        let b = st.create(&user(&["*"]), None);
         assert_ne!(a, b);
         // 32 字节 base64url 无填充 = 43 个字符
         assert_eq!(a.len(), 43, "session id 长度: {}", a.len());
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
     fn sessions_are_capped_and_evict_least_recently_used() {
         let st = AuthState::new(&runtime()); // max_sessions = 4
-        let ids: Vec<String> = (0..4).map(|_| st.create(&user(&["*"]))).collect();
+        let ids: Vec<String> = (0..4).map(|_| st.create(&user(&["*"]), None)).collect();
         assert_eq!(st.session_count(), 4);
         // 碰一下第 1 个，让第 0 个成为最久未使用
         assert!(st.get(&ids[1]).is_some());
 
-        let new = st.create(&user(&["*"]));
+        let new = st.create(&user(&["*"]), None);
         assert_eq!(st.session_count(), 4, "不能超过上限");
         assert!(st.get(&new).is_some());
         assert!(st.get(&ids[0]).is_none(), "最久未使用的应被淘汰");
@@ -424,7 +510,7 @@ mod tests {
         let mut rt = runtime();
         rt.session_ttl = Duration::from_millis(30);
         let st = AuthState::new(&rt);
-        let sid = st.create(&user(&["*"]));
+        let sid = st.create(&user(&["*"]), None);
         assert!(st.get(&sid).is_some());
         std::thread::sleep(Duration::from_millis(60));
         assert!(st.get(&sid).is_none(), "过期会话应查不到");
@@ -433,7 +519,7 @@ mod tests {
     #[test]
     fn per_user_acl_is_carried_into_the_session() {
         let st = AuthState::new(&runtime());
-        let sid = st.create(&user(&["p1"]));
+        let sid = st.create(&user(&["p1"]), None);
         let s = st.get(&sid).unwrap();
         assert!(s.can_access("p1"));
         assert!(!s.can_access("p2"));
@@ -468,7 +554,10 @@ mod tests {
             st.record_failure(Some(ip));
         }
         let fresh: IpAddr = "10.9.9.9".parse().unwrap();
-        assert!(st.blocked_for(Some(fresh)).is_some(), "换新 IP 也必须被全局闸挡住");
+        assert!(
+            st.blocked_for(Some(fresh)).is_some(),
+            "换新 IP 也必须被全局闸挡住"
+        );
     }
 
     #[test]
@@ -528,7 +617,10 @@ mod tests {
         assert!(s.contains("SameSite=Strict"), "{s}");
         assert!(s.contains("Path=/"), "{s}");
         assert!(s.contains("Max-Age=60"), "{s}");
-        assert!(!s.contains("Secure"), "没开 TLS 时不该加 Secure（否则浏览器不存）");
+        assert!(
+            !s.contains("Secure"),
+            "没开 TLS 时不该加 Secure（否则浏览器不存）"
+        );
 
         let v = set_cookie("esc_gw", "abc", Duration::from_secs(60), true);
         assert!(v.to_str().unwrap().contains("; Secure"));
@@ -550,7 +642,10 @@ mod tests {
         // 现代浏览器的 fetch：Sec-Fetch-Mode 会明确说是 cors/same-origin
         h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
         h.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
-        assert!(!wants_html(&h), "面板的 fetch 不带 Accept: json，必须按 API 处理");
+        assert!(
+            !wants_html(&h),
+            "面板的 fetch 不带 Accept: json，必须按 API 处理"
+        );
 
         // 老浏览器没有 Sec-Fetch-Mode，只能看 Accept
         let mut h = HeaderMap::new();
@@ -572,10 +667,7 @@ mod tests {
     fn cross_origin_post_is_detected() {
         let mut h = HeaderMap::new();
         h.insert(header::HOST, HeaderValue::from_static("example.com:2223"));
-        h.insert(
-            header::ORIGIN,
-            HeaderValue::from_static("https://evil.com"),
-        );
+        h.insert(header::ORIGIN, HeaderValue::from_static("https://evil.com"));
         assert!(!same_origin(&h));
 
         let mut h = HeaderMap::new();

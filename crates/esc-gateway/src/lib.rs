@@ -25,9 +25,11 @@
 //! WebSocket、HTTP/2、TLS 终结（见 [`proxy`] 的文档）。需要 TLS 就在前面
 //! 再放一层 nginx/Caddy，或者等以后加。
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod proxy;
+pub mod store;
 pub mod web;
 
 use std::sync::Arc;
@@ -36,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::{GatewayConfig, RuntimeConfig};
 pub use proxy::Gateway;
+pub use store::AccountStore;
 
 /// 起网关：按配置里的每个 route 各起一个监听，等 `shutdown` 后一起退出。
 ///
@@ -66,9 +69,9 @@ pub async fn run(cfg: RuntimeConfig, shutdown: CancellationToken) -> anyhow::Res
     for (route, listener) in listeners {
         let gw = gw.clone();
         let shut = shutdown.clone();
-        tasks.push(tokio::spawn(
-            async move { proxy::serve_route(gw, route, listener, shut).await },
-        ));
+        tasks.push(tokio::spawn(async move {
+            proxy::serve_route(gw, route, listener, shut).await
+        }));
     }
 
     // 任一任务结束就收尾（正常情况下只有 shutdown 能让它们结束）

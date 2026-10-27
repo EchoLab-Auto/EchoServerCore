@@ -94,6 +94,12 @@ COPY --from=builder /src/target/release/esc-gateway /usr/local/bin/esc-gateway
 # 默认读这个路径；用 volume 挂进来
 ENV ESC_GATEWAY_CONFIG=/etc/esc/gateway.toml
 
+# 账号库目录（管理面板写的那个文件）。预先建好并改成 65532，这样：
+#   * docker 命名卷首次创建时会继承这个属主 → 面板能直接写；
+#   * 跳过这个 volume 也不影响启动（面板自动退化成只读）。
+# 根文件系统是 read_only，所以这个目录必须由 volume 覆盖才有实际写入能力。
+RUN install -d -o 65532 -g 65532 /var/lib/esc-gateway
+
 # 非 root 运行。65532 是 distroless 的 nonroot uid，保持一致便于迁移。
 # 用数字而不是用户名：这个镜像里没有对应条目，写名字会起不来。
 USER 65532:65532
