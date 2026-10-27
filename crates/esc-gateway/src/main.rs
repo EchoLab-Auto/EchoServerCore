@@ -243,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
             match rt.admin_listen {
                 Some(a) => {
                     println!("管理面板：独立端口 {a}（/__admin/，含登录页）");
-                    println!("         转发端口上的 /__admin/ 只给一页「在别处」的说明");
+                    println!("         转发端口上的 /__admin/ 是普通路径（转发给上游，不暴露管理入口）");
                 }
                 None => println!("管理面板：登录后在任意端口访问 /__admin/"),
             }

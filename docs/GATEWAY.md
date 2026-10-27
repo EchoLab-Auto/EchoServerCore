@@ -305,6 +305,85 @@ Lax/None，那层还在）。
 用户名不存在时，仍然跑一次哈希校验（用硬编码的 dummy 哈希），让响应时间与
 真实用户相同；错误信息也完全一致（同样的文案、同样的状态码）。
 
+## 前面加一层 TLS（自签也能用）
+
+网关自己不做 TLS。生产上的做法是前面放一层 nginx 终结 TLS，网关退到回环：
+
+```text
+浏览器 ──https──▶ nginx :2223/:2224/:2226
+                    └─http（回环）─▶ 网关 127.0.0.1:18783/18784/18786
+                                       └─▶ 面板 127.0.0.1:18787/18788
+```
+
+这样切分的好处不只是"能加证书"：
+
+- **明文那一层物理上出不了本机**（网关只听 `127.0.0.1`），不是靠配置约束
+- 证书轮换、密码套件、TLS 版本这些交给 nginx，网关里少一个"解析 X.509"的攻击面
+- 网关的 `secure_cookie = true` 才有意义（否则浏览器在 http 下也会回传 cookie）
+
+### 生成自签证书
+
+没有域名也能用（用 IP SAN）。一条命令：
+
+```bash
+install -d -m 0750 /etc/ssl/esc && cd /etc/ssl/esc
+cat > san.cnf <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = 114.132.241.46
+[v3]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,digitalSignature,keyEncipherment,keyCertSign
+extendedKeyUsage = serverAuth
+subjectAltName = @alt
+[alt]
+IP.1 = 114.132.241.46
+IP.2 = 127.0.0.1
+DNS.1 = localhost
+EOF
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout esc.key -out esc.crt -days 3650 -config san.cnf -extensions v3
+chmod 0644 esc.crt && chmod 0640 esc.key
+```
+
+`basicConstraints CA:TRUE` 是刻意的：把 `esc.crt` 装进**手机/电脑的受信任根**之后，
+浏览器就完全没有警告了（自签叶子证书装进根库也不会被信任，自签 CA 才会）。
+不装也行，每个浏览器会话点一次"继续访问"。
+
+### nginx 侧两个必须注意的细节
+
+**① `Host` 要用 `$http_host`，不能用 `$host`。**
+
+```nginx
+proxy_set_header Host $http_host;   # 保留端口 → 网关能拼出 //host:2223/ 这样的链接
+# proxy_set_header Host $host;      # 会把端口吃掉，首页的端口列表全指错
+```
+
+网关首页和"管理面板在别处"的提示都是**按 `Host` 拼链接**的，丢掉端口就全错。
+
+**② `X-Forwarded-For` 要覆盖，并同时打开 `trust_forwarded_for`。**
+
+```nginx
+proxy_set_header X-Forwarded-For $remote_addr;   # 覆盖，不是 $proxy_add_x_forwarded_for
+```
+
+```toml
+trust_forwarded_for = true
+```
+
+网关取 XFF 的**最后一跳**（最靠近它的那一跳），所以 nginx 用真实对端地址整体
+替换时，客户端伪造的值进不来。不开这个开关的后果是：所有请求的来源都变成
+`127.0.0.1`，按来源限速把所有人算成同一个人，`allowed_cidrs` 也会失效。
+
+### 明文端口会怎样
+
+nginx 在 2223/2224/2226 上只监听 TLS，所以 `http://…:2226` 会得到
+`400 Bad Request`（nginx 报 "The plain HTTP request was sent to HTTPS port"）。
+这正是想要的：**没有任何一条明文路径能到达登录表单。**
+
 ## 管理面板
 
 登录后在**任意**端口访问 `/__admin/`：增删账号、改口令、改授权、踢会话。
@@ -606,7 +685,7 @@ curl -s -H 'Accept: */*' http://127.0.0.1:2223/api/status          # 期望 401
 |---|---|
 | WebSocket / Upgrade | 面板用不到，而支持它要处理连接升级、协议切换、双向流复制——占整个代理一半复杂度。遇到 `Upgrade` 头不转发（剥掉），请求会失败 |
 | HTTP/2 | 上下游都是 h1。面板不需要多路复用 |
-| TLS 终结 | 需要域名 + 证书管理。在前面放 nginx/Caddy 更合适，然后打开 `secure_cookie` |
+| TLS 终结 | 需要域名 + 证书管理。在前面放 nginx/Caddy 更合适，然后打开 `secure_cookie`（仓库里有现成的自签方案：见下） |
 | gzip 重压/解压 | 原样透传 `Accept-Encoding` 与 `Content-Encoding` |
 | 重定向跟随 | 代理不该跟随，那是客户端的事 |
 | 运行时改 `title` / `admin_allowed_cidrs` / 限速参数 | 这些仍在配置文件里、要重启。端口与账号都能热改（见下），剩下的属于"改了也不急"的一类 |
@@ -634,6 +713,10 @@ docker inspect esc-gateway --format '{{.State.Health.Status}}'
 | 面板的 fetch 报 JSON 解析错误 | 401/302 判定错了（看该请求的 `Sec-Fetch-Mode`） |
 | 容器起不来，`Permission denied` | 配置文件权限（见「硬约束 ②」） |
 | 429 一直不恢复 | 全局计数没清（设计如此）。等 `global_window_secs` 过去 |
+| 浏览器一直跳登录页，但口令没错 | `secure_cookie = true` 却在用 `http://` 访问——浏览器不会把 Secure cookie 回传。改用 `https://` |
+| 加了 nginx 后所有请求来源都是 127.0.0.1 | 忘了开 `trust_forwarded_for`，或 nginx 那边没设 `X-Forwarded-For $remote_addr` |
+| `http://…` 访问得到 400 Bad Request | 正常：那个端口只监听 TLS（nginx: "plain HTTP request was sent to HTTPS port"） |
+| 首页的端口链接少了端口号 | nginx 用了 `Host $host`，要改成 `$http_host` |
 | `/__admin/` 一直 403 | 账号没有 `admin = true`；或来源不在 `admin_allowed_cidrs` 里（页面会写明是哪一个） |
 | 面板是灰的、按钮点不动 | 账号库不可写。页面顶部有原因，`esc-gateway check` 也会列 |
 | 改了 `gateway.toml` 里的口令但不生效 | 该账号在账号库里也有同名条目，后者优先。看启动日志的 WARN 或面板里的「覆盖」标记 |
