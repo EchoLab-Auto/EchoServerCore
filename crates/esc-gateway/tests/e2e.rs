@@ -1362,3 +1362,86 @@ async fn admin_allowed_cidrs_is_fail_closed() {
     gw.token.cancel();
     _u.cancel();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 网关首页
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn gateway_home_lists_only_the_routes_you_may_use() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+
+    // 未登录：跳登录页
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__auth/",
+        &[("sec-fetch-mode", "navigate")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 302);
+    assert_eq!(r.header("location"), Some("/__auth/login?next=/__auth/"));
+
+    // admin 看得到两个端口，并且有管理入口
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("panel") && r.body.contains("admin-only"));
+    assert!(r.body.contains("/__admin/"), "管理员应有管理入口");
+    assert!(r.body.contains("你好，admin"));
+
+    // viewer 只能看到 panel：没权限的端口**连名字都不该出现**
+    let v = login(&gw, "viewer", "pw-123").await.unwrap();
+    let r = http(gw.addr(), "GET", "/__auth", &[("cookie", &v)], None).await;
+    assert_eq!(r.status, 200, "/__auth 不带斜杠也认");
+    assert!(r.body.contains("panel"));
+    assert!(
+        !r.body.contains("admin-only"),
+        "不该泄露自己无权访问的端口名：{}",
+        r.body
+    );
+    // 用链接而不是文案判断：页面上有一句「管理账号…需要管理员权限」的说明，
+    // 按文案断言会把提示语误判成入口。
+    assert!(
+        !r.body.contains("href=\"/__admin/\""),
+        "普通用户不该看到账号列表入口：{}",
+        r.body
+    );
+    assert!(
+        !r.body.contains(">/__admin/sessions<") && !r.body.contains("href=\"/__admin/sessions\""),
+        "也不该看到会话列表入口"
+    );
+    assert!(
+        r.body.contains("href=\"/__admin/me\""),
+        "但改自己口令要能给：{}",
+        r.body
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn gateway_home_links_carry_the_port_and_keep_the_scheme() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
+    // 端口取自**配置**（用户实际要连的那个），不是当前监听 socket。
+    // 测试配置里写的是占位端口，所以这里只验证形状：协议相对 + 带主机名 + 带端口。
+    assert!(
+        r.body.contains("href=\"//127.0.0.1:"),
+        "入口链接应是协议相对的 //host:port/：{}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("href=\"http://"),
+        "不该写死 scheme——前面挂 TLS 后就会跳回明文"
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}

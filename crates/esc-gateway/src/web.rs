@@ -116,7 +116,8 @@ pub fn login_page(title: &str, route: &str, next: &str, error: Option<&str>) -> 
   <label for="p">口令</label>
   <input id="p" name="pass" type="password" autocomplete="current-password" required>
   <button type="submit">登录</button>
-  <div class="foot">会话在你的浏览器里保存一个 cookie，关闭后需重新登录。</div>
+  <div class="foot">会话在你的浏览器里保存一个 cookie，关闭后需重新登录。<br>
+  登录后可在 <a href="/__auth/">网关首页</a> 看到你能访问的端口与账号设置。</div>
 </form>
 </body></html>"#,
         title = esc(title),
@@ -146,6 +147,93 @@ pub fn error_page(title: &str, heading: &str, detail_html: &str) -> String {
         title = esc(title),
         heading = esc(heading),
         detail_html = detail_html, // 调用方保证已转义
+        STYLE = STYLE,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 网关首页
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 首页上的一个端口入口。
+#[derive(Debug, Clone)]
+pub struct HomeLink {
+    pub name: String,
+    /// 协议相对链接（`//host:port/`），前面挂 TLS 也不用改。
+    pub href: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct HomeView {
+    pub title: String,
+    pub user: String,
+    pub admin: bool,
+    pub routes: Vec<HomeLink>,
+    /// 当前是从哪个端口进来的，标一下。
+    pub current_route: String,
+}
+
+pub fn home_page(v: &HomeView) -> String {
+    let mut body = String::new();
+    body.push_str(&format!("<h2>你好，{}</h2>", esc(&v.user)));
+    body.push_str(
+        "<p class=\"hint\" style=\"margin-bottom:18px\">\
+这是 esc 网关自己的页面。你登录了网关，下面这些端口不用再输口令。\
+想回到某个面板，点进去即可。</p>",
+    );
+
+    // 入口列表
+    body.push_str("<h2>你可以访问</h2>");
+    if v.routes.is_empty() {
+        body.push_str(
+            "<div class=\"banner warn\">这个账号没有任何端口权限。找管理员给 <code>routes</code> 加上端口名。</div>",
+        );
+    } else {
+        body.push_str("<table><thead><tr><th>端口</th><th>入口</th></tr></thead><tbody>");
+        for r in &v.routes {
+            let here = if r.name == v.current_route {
+                "<span class=\"badge\">你在这里</span>"
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "<tr><td class=\"mono\">{name}{here}</td>\
+<td><a href=\"{href}\">打开 {name}</a></td></tr>",
+                name = esc(&r.name),
+                href = esc(&r.href),
+                here = here,
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+
+    // 账号相关
+    body.push_str("<h2>账号</h2><div class=\"row\">");
+    body.push_str("<a class=\"btn\" href=\"/__admin/me\">我的账号 / 改口令</a>");
+    if v.admin {
+        body.push_str("<a class=\"btn pri\" href=\"/__admin/\">管理账号</a>");
+        body.push_str("<a class=\"btn\" href=\"/__admin/sessions\">在线会话</a>");
+    }
+    body.push_str("<a class=\"btn\" href=\"/__auth/logout\">退出登录</a></div>");
+
+    if !v.admin {
+        body.push_str(
+            "<p class=\"hint\">管理账号、给别人发权限需要管理员权限；改自己的口令不需要。</p>",
+        );
+    }
+
+    // 用首页自己的一套版式（顶栏那套是管理面板的，这里不需要导航）
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>网关 · {title_esc}</title><style>{STYLE}</style></head>
+<body class="wide">
+<div class="wrap" style="max-width:720px">{body}</div>
+</body></html>"#,
+        title_esc = esc(&v.title),
+        body = body,
         STYLE = STYLE,
     )
 }
@@ -234,6 +322,8 @@ fn layout(title: &str, actor: &str, is_admin: bool, active: &str, body: &str) ->
         nav.push_str(&item("/__admin/sessions", "会话", "sessions"));
     }
     nav.push_str(&item("/__admin/me", "我的账号", "me"));
+    // 回网关首页的出口。否则进去了就只能靠浏览器后退键。
+    nav.push_str(&item("/__auth/", "网关首页", "home"));
 
     let role = if is_admin { "管理员" } else { "用户" };
     format!(

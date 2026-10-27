@@ -269,8 +269,11 @@ async fn handle(
 
     let path = req.uri().path().to_string();
 
-    // ② 网关自己的端点（不转发）。`/__auth/*` 只有登录/登出/探活。
-    if path.starts_with("/__auth/") {
+    // ② 网关自己的端点（不转发）。`/__auth` 与 `/__auth/*`：登录/登出/探活/首页。
+    //    注意 `/__auth`（不带斜杠）必须单独判一次——`starts_with("/__auth/")`
+    //    对它是 false，于是它会一路转发到上游，变成一个「网关首页 404 或者
+    //    上游页面」的诡异现象。
+    if path == "/__auth" || path.starts_with("/__auth/") {
         return gateway_endpoint(&gw, &route, source, req).await;
     }
 
@@ -335,6 +338,69 @@ async fn handle(
     forward(&route, req, source, &gw.cfg.cookie_name).await
 }
 
+/// 网关首页。需要登录（它要显示「我能去哪」，那本身就是授权信息）。
+fn home(
+    gw: &Gateway,
+    route: &RouteRuntime,
+    headers: &axum::http::HeaderMap,
+) -> HyperResponse<ProxyBody> {
+    let sid = auth::cookie_value(headers, &gw.cfg.cookie_name);
+    let Some(session) = sid.and_then(|s| gw.auth.get(s)) else {
+        if auth::wants_html(headers) {
+            return redirect(StatusCode::FOUND, "/__auth/login?next=/__auth/");
+        }
+        return json_error(Denied::Unauthenticated, "网关首页需要登录");
+    };
+
+    // 只列这个会话**有权访问**的端口。理由和别处一致：没权限的东西连名字都
+    // 不该出现——否则「这台机器开了哪些面板」就成了公开信息。
+    let mut links: Vec<(String, u16)> = gw
+        .cfg
+        .routes
+        .values()
+        .filter(|r| session.can_access(&r.name))
+        .map(|r| (r.name.clone(), r.listen.port()))
+        .collect();
+    links.sort_by_key(|(_, port)| *port);
+
+    // 用当前请求的 Host 换端口拼链接。协议用 `//`（协议相对），这样将来
+    // 前面挂了 TLS 终结也不用改这里。
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    let routes: Vec<web::HomeLink> = links
+        .into_iter()
+        .map(|(name, port)| web::HomeLink {
+            name,
+            href: if host.is_empty() {
+                format!(":{}", port)
+            } else {
+                format!("//{host}:{port}/")
+            },
+        })
+        .collect();
+
+    let view = web::HomeView {
+        title: gw.title().to_string(),
+        user: session.user.clone(),
+        admin: session.admin,
+        routes,
+        current_route: route.name.clone(),
+    };
+    html(StatusCode::OK, web::home_page(&view))
+}
+
 /// 解析请求来源。
 ///
 /// `trust_forwarded_for = false`（默认）时**只认 socket 对端**。那个头谁都能写，
@@ -389,6 +455,10 @@ async fn gateway_endpoint(
             resp
         }
         "/__auth/healthz" => text(StatusCode::OK, "ok"),
+        // 网关自己的首页：我是谁、我能去哪些端口、管理入口在哪。
+        // 没有它的话，登录成功后落在被代理的面板里，那个页面完全不知道
+        // 「网关」的存在——于是 /__admin/ 变成一个只能靠记 URL 才到得了的地方。
+        "/__auth" | "/__auth/" => home(gw, route, req.headers()),
         _ => text(StatusCode::NOT_FOUND, "没有这个网关端点"),
     }
 }
