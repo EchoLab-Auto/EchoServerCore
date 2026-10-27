@@ -59,17 +59,43 @@ pub async fn run(cfg: RuntimeConfig, shutdown: CancellationToken) -> anyhow::Res
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // 管理端口单独绑、单独管：它**不登记进 ListenerSet**，否则面板做热应用
+    // 时会把它当成"多余的路由端口"顺手停掉——那等于改个上游就把管理面弄没了。
+    // 改 admin_listen 需要重启，和 title 一类。
+    let admin_listener = match gw.cfg.admin_listen {
+        Some(addr) => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("管理端口 {addr} 绑定失败: {e}"))?,
+        ),
+        None => None,
+    };
+
     tracing::info!(
         routes = gw.route_count(),
         users = gw.cfg.users.len(),
+        admin_listen = ?gw.cfg.admin_listen,
         http_only = !gw.cfg.secure_cookie,
         "gateway starting"
     );
 
-    // 启动时没有"旧端口"要停，prepare 只绑新的；commit 把任务起起来。
     gw.listeners.commit(&gw, prepared);
 
+    let admin_task = match (gw.cfg.admin_listen, admin_listener) {
+        (Some(addr), Some(l)) => {
+            let gw = gw.clone();
+            let shut = shutdown.clone();
+            Some(tokio::spawn(async move {
+                proxy::serve_admin(gw, addr, l, shut).await
+            }))
+        }
+        _ => None,
+    };
+
     shutdown.cancelled().await;
+    if let Some(t) = admin_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t).await;
+    }
     // 关掉所有监听（cancel 会让 accept loop 退出、连接进入收尾）
     for addr in gw.listeners.addrs() {
         gw.listeners.cancel(addr);

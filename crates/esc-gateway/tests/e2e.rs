@@ -139,6 +139,8 @@ struct Gw {
     addrs: std::collections::HashMap<String, SocketAddr>,
     /// 共享状态本身。测试里查会话表、账号库用。
     gw: Arc<Gateway>,
+    /// 配了 admin_listen 时的管理端口地址。
+    admin: Option<SocketAddr>,
     token: CancellationToken,
 }
 
@@ -148,6 +150,9 @@ impl Gw {
     }
     fn addr_of(&self, route: &str) -> SocketAddr {
         self.addrs[route]
+    }
+    fn admin_addr(&self) -> SocketAddr {
+        self.admin.expect("这个测试需要 admin_listen")
     }
 }
 
@@ -224,8 +229,29 @@ upstream = "{upstream}"
             esc_gateway::proxy::serve_route(gw, Arc::new(r2), l, tok).await;
         });
     }
+    // 配了独立管理端口就一起起起来（和 run() 里一样的做法：不登记进
+    // ListenerSet，免得被热应用当成多余的路由端口停掉）。
+    let admin_addr = match gw.cfg.admin_listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .unwrap_or_else(|e| panic!("绑定管理端口 {addr} 失败: {e}"));
+            let addr = l.local_addr().unwrap();
+            let gw2 = gw.clone();
+            let shut = token.clone();
+            tokio::spawn(async move { esc_gateway::proxy::serve_admin(gw2, addr, l, shut).await });
+            Some(addr)
+        }
+        None => None,
+    };
+
     tokio::time::sleep(Duration::from_millis(40)).await;
-    Gw { addrs, gw, token }
+    Gw {
+        addrs,
+        gw,
+        admin: admin_addr,
+        token,
+    }
 }
 
 /// 登录，返回 session cookie。
@@ -1740,4 +1766,165 @@ async fn deleting_a_port_stops_the_listener_and_refuses_to_break_the_current_one
 
     gw.token.cancel();
     _u.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 独立的管理端口
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 配了 admin_listen 的网关。
+async fn start_gateway_with_admin(upstream: SocketAddr) -> (Gw, std::path::PathBuf) {
+    let dir = tmpdir("adminport");
+    let path = dir.join("gateway-users.toml");
+    let admin_port = pick_port();
+    let gw = start_gateway(upstream, |c| {
+        c.users_file = Some(path.clone());
+        c.routes_file = Some(dir.join("gateway-routes.toml"));
+        c.admin_listen = Some(format!("127.0.0.1:{admin_port}"));
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+    (gw, path)
+}
+
+#[tokio::test]
+async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_gateway_with_admin(up).await;
+    let admin = gw.admin_addr();
+
+    // ① 管理端口上：登录页 + 管理面板都正常
+    let r = http(
+        admin,
+        "GET",
+        "/__auth/login",
+        &[("accept", "text/html")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("登录"), "{}", r.body);
+
+    let c = login_at(&gw, admin, "admin", "pw-123")
+        .await
+        .expect("管理端口应能登录");
+    let r = http(admin, "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("账号"));
+
+    // ② 管理端口不转发任何东西：`/` 是网关首页，不是上游内容
+    let r = http(admin, "GET", "/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(
+        !r.body.contains("\"uri\":\"/\""),
+        "管理端口不该转发到上游：{}",
+        r.body
+    );
+    assert!(r.body.contains("你可以访问"), "应是网关首页：{}", r.body);
+
+    // ③ 转发端口上的 /__admin/ 变成「在别处」的说明，而不是管理面板
+    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("管理面板不在这个端口"), "{}", r.body);
+    assert!(
+        r.body.contains(&format!(":{}", admin.port())),
+        "要给出管理端口的链接：{}",
+        r.body
+    );
+    assert!(!r.body.contains("最近操作"), "不该泄露管理面板内容");
+
+    // ④ 但转发端口照旧工作
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("\"uri\":\"/\""));
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn one_login_on_the_admin_port_opens_the_proxied_panels_too() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_gateway_with_admin(up).await;
+    let admin = gw.admin_addr();
+
+    // 登录发生在管理端口；cookie 是 host 级共享的（浏览器不按端口隔离），
+    // 所以拿同一个 cookie 去 2224/2225 那些转发端口也该直接通过。
+    let c = login_at(&gw, admin, "admin", "pw-123").await.unwrap();
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200, "管理端口的会话应能直接访问转发端口");
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn the_admin_port_accepts_non_route_users_for_self_service() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_gateway_with_admin(up).await;
+    let admin = gw.admin_addr();
+
+    // viewer 只有 panel 的权限、不是管理员。他登不进任何"没授权"的端口，
+    // 但管理端口要让他进来改自己的口令——否则一个只读账号连密码都改不了。
+    let c = login_at(&gw, admin, "viewer", "pw-123")
+        .await
+        .expect("非管理员也应能在管理端口登录");
+    let r = http(admin, "GET", "/__admin/me", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains("我的账号"));
+
+    // 但管理功能一如既往地关着
+    let r = http(admin, "GET", "/__admin/users", &[("cookie", &c)], None).await;
+    assert_eq!(r.status, 403);
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+#[tokio::test]
+async fn admin_listen_cannot_collide_with_a_route_port() {
+    // 撞车必须在启动时报错，而不是"谁先绑上谁赢"——输的那个可能是管理面板，
+    // 那就再也进不去了。
+    let raw = r#"
+admin_listen = "127.0.0.1:2224"
+
+[[user]]
+name = "a"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$11111111111111111111111111111111"
+routes = ["*"]
+
+[[route]]
+name = "p"
+listen = "0.0.0.0:2224"
+upstream = "127.0.0.1:18788"
+"#;
+    let cfg: esc_gateway::GatewayConfig = toml::from_str(raw).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("同一个端口"), "{err}");
+
+    // 0.0.0.0 与 127.0.0.1 撞同一端口也算（bind 时会 EADDRINUSE）
+    let raw2 = raw.replace(
+        "admin_listen = \"127.0.0.1:2224\"",
+        "admin_listen = \"0.0.0.0:2224\"",
+    );
+    let cfg2: esc_gateway::GatewayConfig = toml::from_str(&raw2).unwrap();
+    assert!(cfg2.validate().is_err());
 }

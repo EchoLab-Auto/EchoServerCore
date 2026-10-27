@@ -240,7 +240,13 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             println!();
-            println!("管理面板：登录后在任意端口访问 /__admin/");
+            match rt.admin_listen {
+                Some(a) => {
+                    println!("管理面板：独立端口 {a}（/__admin/，含登录页）");
+                    println!("         转发端口上的 /__admin/ 只给一页「在别处」的说明");
+                }
+                None => println!("管理面板：登录后在任意端口访问 /__admin/"),
+            }
             if !rt.admin_allow.is_empty() {
                 println!("         （仅限 admin_allowed_cidrs 中的来源）");
             }
@@ -285,6 +291,11 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(
                     "网关对外是明文 HTTP：口令与 session cookie 在链路上可被读取。\
                      生产环境应在前面加 TLS 终结（nginx/Caddy），并打开 secure_cookie"
+                );
+            }
+            if rt.admin_listen.is_none() {
+                tracing::info!(
+                    "管理面板挂在每个转发端口的 /__admin/ 上；                     想让它独占一个端口就配 admin_listen"
                 );
             }
             if !rt.users.values().any(|u| u.admin) {

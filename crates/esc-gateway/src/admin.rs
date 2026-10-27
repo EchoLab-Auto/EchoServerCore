@@ -594,6 +594,7 @@ impl Ctx<'_> {
             store_line: route_store_line(gw),
             banners,
             current_port: self.local.port(),
+            dedicated_admin: gw.cfg.admin_listen.is_some(),
         };
         page(StatusCode::OK, web::routes_page(&view))
     }

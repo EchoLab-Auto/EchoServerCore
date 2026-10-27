@@ -339,6 +339,103 @@ impl Gateway {
     }
 }
 
+/// 管理端口的链接：`//<当前主机名>:<管理端口>/__admin/`。
+///
+/// 主机名取请求的 `Host`（去端口）而不是配置里的 IP：配置里通常写
+/// `127.0.0.1` 或 `0.0.0.0`，前者对远程浏览器没意义、后者不能访问。
+///
+/// 用协议相对的 `//host:port/`，这样前面挂 TLS 也不用改。**不自动跳转**，
+/// 只给链接：`Host` 是客户端给的，拿它拼 302 的 Location 等于把跳转目标
+/// 交出去（Host 头注入）。多一次点击换掉这个面，值得。
+fn admin_href(admin: SocketAddr, req: &HyperRequest<Incoming>) -> String {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        format!(":{}/__admin/", admin.port())
+    } else {
+        format!("//{host}:{}/__admin/", admin.port())
+    }
+}
+
+/// 管理端口的 accept loop。
+///
+/// 它**不转发**任何东西：只提供 `/__auth/*`（登录/登出/探活/首页）和
+/// `/__admin/*`（管理面板）。其余路径给一页说明。
+pub async fn serve_admin(
+    gw: Arc<Gateway>,
+    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
+    shutdown: CancellationToken,
+) {
+    tracing::info!(listen = %addr, "admin panel listening");
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            r = listener.accept() => match r {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "admin accept failed");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+            },
+        };
+        let _ = stream.set_nodelay(true);
+
+        let gw2 = gw.clone();
+        let shut = shutdown.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: HyperRequest<Incoming>| {
+                let gw = gw2.clone();
+                async move { Ok::<_, std::convert::Infallible>(handle_admin(gw, peer, req).await) }
+            });
+            let conn = hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(io, service);
+            tokio::select! {
+                r = conn => {
+                    if let Err(e) = r {
+                        tracing::debug!(%peer, error = %e, "admin connection closed");
+                    }
+                }
+                _ = shut.cancelled() => {}
+            }
+        });
+    }
+    tracing::info!(%addr, "admin panel stopped");
+}
+
+async fn handle_admin(
+    gw: Arc<Gateway>,
+    peer: SocketAddr,
+    req: HyperRequest<Incoming>,
+) -> HyperResponse<ProxyBody> {
+    let source = resolve_source(&gw, &req, peer);
+    let local = gw.cfg.admin_listen.unwrap_or(peer);
+    let path = req.uri().path().to_string();
+
+    if path == "/__auth" || path.starts_with("/__auth/") {
+        return gateway_endpoint(&gw, None, source, req).await;
+    }
+    if path == "/__admin" || path.starts_with("/__admin/") {
+        return crate::admin::handle(&gw, source, local, req).await;
+    }
+    // 管理端口不转发。给一页"这里能干什么"，别让 / 变成 404。
+    home(&gw, None, req.headers())
+}
+
 /// 在某个监听地址上起 accept loop。
 ///
 /// `route` 只是**起监听那一刻**的快照，用来打日志和兜底：真正的定义在每个
@@ -439,12 +536,22 @@ async fn handle(
     //    对它是 false，于是它会一路转发到上游，变成一个「网关首页 404 或者
     //    上游页面」的诡异现象。
     if path == "/__auth" || path.starts_with("/__auth/") {
-        return gateway_endpoint(&gw, &route, source, req).await;
+        return gateway_endpoint(&gw, Some(&route), source, req).await;
     }
 
     // ②b 管理面板。它要自己判登录态（普通用户也能进「我的账号」），
     //     所以不能走下面的通用认证流程。
+    //
+    //     配了 `admin_listen` 之后，管理面板**只**在那个端口提供：这里换成
+    //     一页"管理面板在别处"的说明。不是 404——用户是照着旧记忆敲的，
+    //     给个明确指路比让他以为网关坏了要好。
     if path == "/__admin" || path.starts_with("/__admin/") {
+        if let Some(admin_addr) = gw.cfg.admin_listen {
+            return html(
+                StatusCode::OK,
+                web::admin_elsewhere_page(&gw.cfg.title, &admin_href(admin_addr, &req)),
+            );
+        }
         return crate::admin::handle(&gw, source, local, req).await;
     }
 
@@ -506,7 +613,7 @@ async fn handle(
 /// 网关首页。需要登录（它要显示「我能去哪」，那本身就是授权信息）。
 fn home(
     gw: &Gateway,
-    route: &RouteRuntime,
+    route: Option<&RouteRuntime>,
     headers: &axum::http::HeaderMap,
 ) -> HyperResponse<ProxyBody> {
     let sid = auth::cookie_value(headers, &gw.cfg.cookie_name);
@@ -561,7 +668,7 @@ fn home(
         user: session.user.clone(),
         admin: session.admin,
         routes,
-        current_route: route.name.clone(),
+        current_route: route.map(|r| r.name.clone()).unwrap_or_default(),
     };
     html(StatusCode::OK, web::home_page(&view))
 }
@@ -588,9 +695,11 @@ fn resolve_source(gw: &Gateway, req: &HyperRequest<Incoming>, peer: SocketAddr) 
 // 网关自己的端点
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `route` 为 `None` 表示这是**管理端口**：此时登录不检查任何 route 权限
+/// （管理权限由 `session.admin` 在 `/__admin/` 那边判）。
 async fn gateway_endpoint(
     gw: &Gateway,
-    route: &RouteRuntime,
+    route: Option<&RouteRuntime>,
     source: Option<IpAddr>,
     req: HyperRequest<Incoming>,
 ) -> HyperResponse<ProxyBody> {
@@ -612,7 +721,7 @@ async fn gateway_endpoint(
             if let Some(sid) = sid {
                 let who = gw.auth.get(sid).map(|s| s.user).unwrap_or_default();
                 gw.auth.logout(sid);
-                tracing::info!(route = %route.name, user = %who, source = ?source, "logout");
+                tracing::info!(route = %route_label(route), user = %who, source = ?source, "logout");
             }
             let mut resp = redirect(StatusCode::FOUND, "/__auth/login");
             resp.headers_mut()
@@ -630,7 +739,7 @@ async fn gateway_endpoint(
 
 async fn do_login(
     gw: &Gateway,
-    route: &RouteRuntime,
+    route: Option<&RouteRuntime>,
     source: Option<IpAddr>,
     headers: &HeaderMap,
     query: Option<&str>,
@@ -693,16 +802,20 @@ async fn do_login(
         }
     };
 
-    // 权限：登录成功但这个 route 不给它访问，直接告诉他，别让他登进去再撞墙
-    if !user_rt.can_access(&route.name) {
-        gw.auth.record_failure(source);
-        tracing::warn!(
-            source = ?source, user = %user_rt.name, route = %route.name,
-            "login ok but not authorised for this route"
-        );
-        let mut resp = login_page(gw, route, &next, Some("该账号没有此端口的访问权限"));
-        *resp.status_mut() = StatusCode::FORBIDDEN;
-        return resp;
+    // 权限：登录成功但这个 route 不给它访问，直接告诉他，别让他登进去再撞墙。
+    // 管理端口不检查 route 权限——那里要判的是 admin，由 admin::handle 负责
+    // （否则一个"只能看隧道面板"的账号会连自己的改密码页面都进不去）。
+    if let Some(r) = route {
+        if !user_rt.can_access(&r.name) {
+            gw.auth.record_failure(source);
+            tracing::warn!(
+                source = ?source, user = %user_rt.name, route = %r.name,
+                "login ok but not authorised for this route"
+            );
+            let mut resp = login_page(gw, route, &next, Some("该账号没有此端口的访问权限"));
+            *resp.status_mut() = StatusCode::FORBIDDEN;
+            return resp;
+        }
     }
 
     gw.auth.clear_source(source);
@@ -712,7 +825,7 @@ async fn do_login(
     }
     let sid = gw.auth.create(&user_rt, source);
     tracing::info!(
-        route = %route.name, user = %user_rt.name, source = ?source,
+        route = %route_label(route), user = %user_rt.name, source = ?source,
         "login ok"
     );
 
@@ -742,14 +855,20 @@ fn dummy_hash() -> String {
 
 fn login_page(
     gw: &Gateway,
-    route: &RouteRuntime,
+    route: Option<&RouteRuntime>,
     next: &str,
     error: Option<&str>,
 ) -> HyperResponse<ProxyBody> {
     html(
         StatusCode::OK,
-        web::login_page(&gw.cfg.title, &route.name, next, error),
+        web::login_page(&gw.cfg.title, route_label(route), next, error),
     )
+}
+
+/// 登录页上「要访问的端口」那一行显示什么。管理端口没有 route，
+/// 所以给它一句人话，而不是留空或者显示一个内部标识符。
+fn route_label(route: Option<&RouteRuntime>) -> &str {
+    route.map(|r| r.name.as_str()).unwrap_or("管理面板")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

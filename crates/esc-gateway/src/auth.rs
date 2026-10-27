@@ -449,6 +449,7 @@ mod tests {
             listens: vec![],
             users_file: None,
             routes_file: None,
+            admin_listen: None,
             admin_allow: vec![],
         }
     }

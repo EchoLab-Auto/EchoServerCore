@@ -63,6 +63,21 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub routes_file: Option<PathBuf>,
 
+    /// 管理面板（含登录页）的**独立监听端口**。
+    ///
+    /// 不设时管理面板挂在每个 route 端口的 `/__admin/` 上——方便，但管理面和
+    /// 业务面共用同一个公网端口，只有一道来源白名单隔着。
+    ///
+    /// 设了之后：
+    /// * 管理面板**只**在这个端口上提供；
+    /// * 其他端口上的 `/__admin/` 变成一页「管理面板在别处」的说明；
+    /// * cookie 是 host 级的（浏览器不按端口隔离），所以在这个端口登录一次，
+    ///   打开被代理的面板不用再登录。
+    ///
+    /// 举个典型的用法：`admin_listen = "127.0.0.1:2226"`，外面用 SSH 隧道进来。
+    #[serde(default)]
+    pub admin_listen: Option<String>,
+
     /// 允许访问管理面板的来源白名单（空 = 不限）。和账号认证是**与**关系。
     ///
     /// 网关本身就在公网上，管理面板挂在同一个端口上。想「只从内网/VPN
@@ -268,6 +283,7 @@ impl Default for GatewayConfig {
             route: Vec::new(),
             users_file: None,
             routes_file: None,
+            admin_listen: None,
             admin_allowed_cidrs: Vec::new(),
         }
     }
@@ -401,6 +417,25 @@ impl GatewayConfig {
             AllowRule::parse(c).map_err(|e| format!("admin_allowed_cidrs: {e}"))?;
         }
 
+        // 管理端口不能和任何转发端口撞车——否则谁先绑上谁赢，而输的那个
+        // 可能是管理面板本身（那就再也进不去了）。
+        if let Some(raw) = &self.admin_listen {
+            let admin: SocketAddr = raw.parse().map_err(|_| {
+                format!("admin_listen 不是合法地址: {raw:?}（需要 host:port，如 127.0.0.1:2226）")
+            })?;
+            for r in &self.route {
+                if let Ok(rt) = r.to_runtime() {
+                    if listeners_conflict(rt.listen, admin) {
+                        return Err(format!(
+                            "admin_listen 与 route {:?} 想监听同一个端口 {}，请改成不同端口",
+                            rt.name,
+                            admin.port()
+                        ));
+                    }
+                }
+            }
+        }
+
         // ── 路由 ──
         let mut rnames = HashSet::new();
         for r in &self.route {
@@ -486,6 +521,7 @@ impl GatewayConfig {
             listens,
             users_file: self.users_file.clone(),
             routes_file: self.routes_file.clone(),
+            admin_listen: self.admin_listen.as_deref().and_then(|s| s.parse().ok()),
             admin_allow: self
                 .admin_allowed_cidrs
                 .iter()
@@ -559,6 +595,8 @@ pub struct RuntimeConfig {
     pub users_file: Option<PathBuf>,
     /// 路由库路径。`None` = 端口只能在配置文件里改。
     pub routes_file: Option<PathBuf>,
+    /// 管理面板的独立监听端口。`None` = 挂在每个 route 端口的 `/__admin/` 上。
+    pub admin_listen: Option<SocketAddr>,
     /// 管理面板的来源白名单（空 = 不限）。
     pub admin_allow: Vec<AllowRule>,
 }
