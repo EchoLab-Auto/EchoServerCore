@@ -130,8 +130,104 @@ $ curl -s -H 'Host: nope.example.com' http://127.0.0.1:2229/
 | 域名未备案 | 走 HTTPS：在插件前面加一层 TLS 终结（nginx / `esc-tls`），或等插件支持 TLS |
 | 自用 | 直接 `http://<ip>:<port>/`，不碰域名 |
 
-> 坑：用**不存在的**假域名自测会得到"能用"的假阳性（不在备案库 → 放行）。
+> 坑 1：用**不存在的**假域名自测会得到"能用"的假阳性（不在备案库 → 放行）。
 > 真实域名一解析就会被拦。
+>
+> 坑 2：**这套判定会随时间变**。同一个 `cad.echo-demo.com`，上午实测 200
+> （放行），下午同一请求变成 302（拦截）；`cad.foo123.cn` 同样翻转，而
+> `cad.whatever-abc.com` 仍 200。所以别拿"刚测过是 200"当结论 ——
+> 判断自己的配置对不对，用 **loopback + `-H Host:`** 自测：
+>
+> ```console
+> $ curl -s -H 'Host: cad.任意域名' http://127.0.0.1:2229/api/health
+> {"status":"ok",...}        # 到了本机 = 配置对
+> ```
+>
+> 公网拿到 302 到 dnspod 时，先做这个自测排除自己的问题。
+
+## 部署
+
+### 1. 编译 / 安装
+
+```bash
+cargo build --release -p esc-host
+install -m755 target/release/esc-host /usr/local/bin/esc-host
+```
+
+> 二进制可以直接从别的机器搬（只要目标 glibc 不比编译机旧）：
+> 在 Ubuntu 24.04（glibc 2.39）上编译的 `esc-host` 在 glibc 2.43 的机器上实测正常。
+> 这条对云主机很实用 —— 1.9 GB 内存的机器上跑 release 构建要担心 OOM。
+
+### 2. 配置 `[edge_router]`
+
+见上面「配置」一节。**改完必须 `systemctl restart esc-host`**：插件在
+mount 时读配置，没有热重载（运行期增删走 `EdgeRouterControl`）。
+
+### 3. 绑 80 端口需要 capability
+
+服务通常以非 root 用户运行（本仓 `deploy/esc-host.service` 用 `User=esc`）。
+绑 <1024 端口要加：
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+验证只给了这一项：
+
+```console
+$ grep Cap /proc/$(systemctl show -p MainPID --value esc-host)/status
+CapEff: 0000000000000400
+CapAmb: 0000000000000400        # bit 10 = CAP_NET_BIND_SERVICE
+```
+
+不绑 80 的话把 `listen` 换成高位端口，这两行可以去掉。
+
+### 4. 启动后的自检
+
+```bash
+systemctl status esc-host            # active、内存、重启次数
+journalctl -u esc-host -n 30         # 应能看到 "edge router mounted" + 每条路由
+```
+
+日志长这样（`routes` 的条数与实际配置必须一致，这是"我以为配了"的对照）：
+
+```
+INFO esc_plugin_edge_router: edge router mounted listen=0.0.0.0:2229,0.0.0.0:80 routes=1
+INFO esc_plugin_edge_router:   edge route prefix=cad port=2228
+INFO esc_host: edge router ready listen=0.0.0.0:2229,0.0.0.0:80 routes=1
+```
+
+绕开公网自测（最可靠，不受云厂商 DNS/备案策略干扰）：
+
+```bash
+curl -s -H 'Host: cad.任意域名' http://127.0.0.1:2229/api/health
+curl -s -H 'Host: 没配的前缀.x' http://127.0.0.1:2229/     # 期望 421
+```
+
+### 5. 访问日志
+
+默认 `info` 级别只有挂载信息，**不打印每个请求**（避免日志爆量）。要看逐请求日志：
+
+```bash
+RUST_LOG=esc_plugin_edge_router=debug systemctl restart esc-host
+# 或者临时：journalctl -u esc-host | grep prefix=
+```
+
+### 一个真实部署（cloud-server-2，2026-10-29）
+
+从 `nginx:alpine` 容器迁到本插件的实际记录：
+
+| | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| 实现 | nginx 容器（host 网络）+ shell 管理脚本 | `esc-host` 进程内插件 |
+| 监听 80/2229 的进程 | `nginx`（容器内） | `esc-host`（pid 即主进程） |
+| 内存 | 容器约 6 MB | 约 2.5 MB |
+| 改动 | — | 换二进制 + 加 `[edge_router]` + 给 capability |
+
+迁移顺序（**顺序不能反**）：先停占端口的旧服务 → 换二进制 → 换配置 →
+`restart`。如果先 restart 而端口仍被占，插件 bind 失败 → mount 失败 →
+宿主 `bail!` 退出 → systemd 无限重启。迁移脚本带自动回滚。
 
 ## 实现要点（改代码前读）
 

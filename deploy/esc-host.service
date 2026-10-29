@@ -34,6 +34,14 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # 证书与配置只读：/etc/esc 下不应有任何运行时写入
 ReadOnlyPaths=/etc/esc
 
+# 边缘路由插件（esc.edge-router）要监听 80 —— 非 root 绑 <1024 端口需要这个
+# capability。只给这一项，不给其它任何特权（CapabilityBoundingSet 是上界；
+# 不用 root、也不用给整个进程放开权限）。
+#
+# 不用 80 端口的话这两行可以去掉（把 [edge_router.config] listen 改成高位端口）。
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 # 映射表是**运行时状态**，放 /var/lib/esc（FHS 惯例），由 StateDirectory 自动
 # 创建、赋予 User= 的属主，并隐含一条 ReadWritePaths —— 于是 ProtectSystem=strict
 # 下这个目录仍然可写。

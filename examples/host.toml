@@ -22,3 +22,24 @@ command = "/usr/local/libexec/esc/esc-plugin-tunnel-panel"
 listen = "127.0.0.1:8787"
 auth   = "admin:换成你自己的口令"
 title  = "隧道面板"
+
+# ── 边缘路由（可选）：按 HTTP Host 的第一段把请求分到本机不同端口 ──────────
+#
+#   http://cad.<任意域名>:2229/   → 127.0.0.1:2228
+#   http://panel.<任意域名>:2229/ → 127.0.0.1:8080
+#
+# 默认关闭（enabled = false）：它要 bind 端口，不该"默认打开"。
+# 详见 docs/EDGE-ROUTER.md。
+#
+# [edge_router]
+# enabled = true
+#
+# [edge_router.config]
+# # 绑 80 需要 CAP_NET_BIND_SERVICE（见 deploy/esc-host.service）
+# listen = ["0.0.0.0:2229", "0.0.0.0:80"]
+# timeout_ms = 300000
+#
+# [edge_router.config.routes]
+# cad = 2228                       # 前缀匹配：cad.任何域名 → 2228
+# panel = 8080
+# "cad.special.com" = 2229         # 键里带点 = 完整域名精确匹配（优先级更高）
