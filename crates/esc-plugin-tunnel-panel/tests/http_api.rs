@@ -544,3 +544,203 @@ async fn without_auth_requests_reach_the_backend() {
     assert!(!r.mock.calls.lock().unwrap().is_empty(), "请求应直达后端");
     r.token.cancel();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 边缘路由：可选能力的 HTTP 映射
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 支持边缘路由的假后端（把 `call_edge` 覆盖掉）。
+///
+/// 单独的 mock 而不是扩展 [`Mock`]：默认 trait 实现返回 501，正好用来测
+/// "这台机器没启用插件"那条路径。
+#[derive(Default)]
+struct EdgeMock {
+    calls: Mutex<Vec<(String, Value)>>,
+    routes: Mutex<Vec<(String, u16)>>,
+}
+
+#[async_trait::async_trait]
+impl ControlBackend for EdgeMock {
+    async fn call(&self, method: &str, _params: Value) -> Result<Value, (StatusCode, String)> {
+        // 隧道那侧不需要内容，给个最小可用的形状
+        match method {
+            method::STATUS => Ok(json!({"role": "hub", "running": true, "spokes": []})),
+            method::MAPPING_LIST => Ok(json!([])),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    async fn call_edge(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), params.clone()));
+        match method {
+            method::EDGE_ROUTE_STATUS => {
+                let routes: Vec<Value> = self
+                    .routes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(p, port)| json!({"prefix": p, "port": port}))
+                    .collect();
+                Ok(json!({
+                    "listens": ["0.0.0.0:2229", "0.0.0.0:80"],
+                    "routes": routes,
+                    "default_port": null,
+                    "counters": {"requests": 7, "proxied": 6, "unrouted": 1,
+                                 "upstream_errors": 0, "upgraded": 2}
+                }))
+            }
+            method::EDGE_ROUTE_UPSERT => {
+                let prefix = params.get("prefix").and_then(Value::as_str).unwrap_or("");
+                let port = params.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                let mut routes = self.routes.lock().unwrap();
+                routes.retain(|(p, _)| p != prefix);
+                routes.push((prefix.to_string(), port));
+                Ok(json!({"prefix": prefix, "port": port}))
+            }
+            method::EDGE_ROUTE_DELETE => {
+                let prefix = params.get("prefix").and_then(Value::as_str).unwrap_or("");
+                let mut routes = self.routes.lock().unwrap();
+                let before = routes.len();
+                routes.retain(|(p, _)| p != prefix);
+                if routes.len() == before {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        format!("没有这个前缀：{prefix}"),
+                    ));
+                }
+                Ok(Value::Null)
+            }
+            other => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("unexpected {other}"))),
+        }
+    }
+}
+
+/// `http()` 的 body 参数是 `Option<&str>`，这里包一层省掉每处 `.to_string()`。
+async fn post_json(addr: &str, path: &str, body: &Value) -> (u16, String) {
+    let raw = body.to_string();
+    common::http(addr, "POST", path, Some(&raw), None).await
+}
+
+async fn start_edge() -> (String, Arc<EdgeMock>, CancellationToken) {
+    let mock = Arc::new(EdgeMock::default());
+    let backend: Arc<dyn ControlBackend> = mock.clone();
+    let cfg = PanelConfig { listen: "127.0.0.1:0".into(), auth: None, ..Default::default() };
+    let token = CancellationToken::new();
+    let panel = Panel::new();
+    let addr = panel.serve(backend, cfg, token.clone()).await.expect("应能绑定");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, mock, token)
+}
+
+#[tokio::test]
+async fn edge_routes_crud_maps_onto_contract_methods() {
+    let (addr, mock, token) = start_edge().await;
+
+    // 初始为空
+    let (code, body) = common::http(&addr, "GET", "/api/edge", None, None).await;
+    assert_eq!(code, 200, "{body}");
+    let st: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["routes"].as_array().unwrap().len(), 0);
+    assert_eq!(st["listens"][0], "0.0.0.0:2229");
+    assert_eq!(st["counters"]["upgraded"], 2);
+    assert!(mock.calls.lock().unwrap().iter().any(|(m, _)| m == method::EDGE_ROUTE_STATUS));
+
+    // 新建
+    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"prefix": "cad", "port": 2228})).await;
+    assert_eq!(code, 200, "{body}");
+    let created: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(created["prefix"], "cad");
+    assert_eq!(created["port"], 2228);
+
+    // 出现在列表里
+    let (_, body) = common::http(&addr, "GET", "/api/edge", None, None).await;
+    let st: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(st["routes"][0]["prefix"], "cad");
+
+    // 删除
+    let (code, _) = common::http(&addr, "DELETE", "/api/edge/routes/cad", None, None).await;
+    assert_eq!(code, 200);
+    let (_, body) = common::http(&addr, "GET", "/api/edge", None, None).await;
+    let st: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["routes"].as_array().unwrap().len(), 0);
+
+    // 再删同一个 → 后端的 not_found 应被翻成 404（不是 500/502）
+    let (code, body) = common::http(&addr, "DELETE", "/api/edge/routes/cad", None, None).await;
+    assert_eq!(code, 404, "{body}");
+    assert!(body.contains("cad"), "错误里应点名前缀：{body}");
+
+    token.cancel();
+}
+
+#[tokio::test]
+async fn edge_upsert_validates_shape_before_calling_backend() {
+    let (addr, mock, token) = start_edge().await;
+    let before = mock.calls.lock().unwrap().len();
+
+    // 缺 prefix
+    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"port": 2228})).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("prefix"), "{body}");
+
+    // 缺 port
+    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"prefix": "cad"})).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("port"), "{body}");
+
+    // 端口越界
+    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"prefix": "cad", "port": 0})).await;
+    assert_eq!(code, 400, "{body}");
+
+    // 三次都不该打到后端（在面板就被拦下了）
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        before,
+        "非法入参不该转给后端"
+    );
+    token.cancel();
+}
+
+#[tokio::test]
+async fn edge_endpoints_report_501_when_plugin_is_not_enabled() {
+    // 默认 Mock 不覆盖 call_edge → 走 trait 默认实现 → 501。
+    // 前端靠这个码把卡片显示成"未启用"，所以它必须是 501 而不是 500。
+    let r = start(None).await;
+    for (method, path, body) in [
+        ("GET", "/api/edge", None),
+        ("POST", "/api/edge/routes", Some(json!({"prefix": "cad", "port": 2228}))),
+        ("DELETE", "/api/edge/routes/cad", None),
+    ] {
+        let raw = body.map(|v| v.to_string());
+        let (code, text) = common::http(&r.addr, method, path, raw.as_deref(), None).await;
+        assert_eq!(code, 501, "{method} {path} 应返回 501，实际 {code}: {text}");
+        assert!(
+            text.contains("边缘路由"),
+            "{method} {path} 的错误消息应说明原因：{text}"
+        );
+    }
+    // 隧道侧不受影响
+    let (code, _) = common::http(&r.addr, "GET", "/api/status", None, None).await;
+    assert_eq!(code, 200);
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn index_html_ships_the_edge_router_ui() {
+    // 前端是一张单页；这块 UI 缺失时接口再好也没人能用。
+    let r = start(None).await;
+    let (_, body) = common::http(&r.addr, "GET", "/", None, None).await;
+    for needle in ["edge-card", "btn-edge-new", "form-edge", "/api/edge", "边缘路由"] {
+        assert!(body.contains(needle), "页面里应包含 {needle}");
+    }
+    // 回归：`.inline-form { display: flex }` 会压过 UA 的 `[hidden]`，导致
+    // 表单初始就显示、保存后也收不起来。这条兜底样式必须存在。
+    assert!(
+        body.contains("[hidden] { display: none !important; }"),
+        "缺少 [hidden] 兜底样式，内联表单会藏不住"
+    );
+    r.token.cancel();
+}

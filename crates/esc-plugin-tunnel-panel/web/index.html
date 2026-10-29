@@ -12,6 +12,9 @@
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
+  /* `hidden` 属性必须真的隐藏元素：UA 的 `[hidden]{display:none}` 优先级低于
+     作者样式里的 `display:flex`（如 .inline-form），不加这条就会"藏不住"。 */
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font: 14px/1.55 -apple-system, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -62,6 +65,16 @@
   .pill.pending { color: var(--warn); background: #2a2313; border-color: #6a5324; }
   .arrow { color: var(--dim); padding: 0 6px; }
   .empty { color: var(--dim); padding: 22px 4px; text-align: center; }
+  /* 边缘路由：新建表单直接内联在卡片里，避免为两个输入框再开一个 dialog */
+  .inline-form {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end;
+    padding: 12px 14px; margin-bottom: 12px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .inline-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dim); }
+  .inline-form input { width: 170px; }
+  .counter { font-family: var(--mono); font-size: 12.5px; }
+  .counter .k { color: var(--dim); font-size: 11.5px; }
   .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .toast {
     position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 40;
@@ -135,6 +148,57 @@
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty" hidden>还没有映射。点右上角「新建映射」加一条。</div>
+  </div>
+
+  <div class="card" id="edge-card">
+    <div class="toolbar" style="margin-bottom:8px">
+      <h2 style="margin:0">边缘路由</h2>
+      <span class="badge" id="edge-listen">—</span>
+      <span class="spacer"></span>
+      <button class="primary" id="btn-edge-new">＋ 新建路由</button>
+    </div>
+    <div class="hint" style="margin:-4px 0 12px">
+      按 HTTP <code>Host</code> 的<strong>第一段</strong>分流：<code>cad.任意域名</code> → 指定的本机端口。
+      base domain 随意，换域名不用改配置。
+    </div>
+
+    <div class="empty" id="edge-unavailable" hidden>
+      这台机器没有启用边缘路由插件（<code>esc.edge-router</code>）。<br />
+      在 <code>host.toml</code> 里加 <code>[edge_router] enabled = true</code> 后重启 <code>esc-host</code>。
+    </div>
+
+    <div id="edge-body">
+      <form class="inline-form" id="form-edge" hidden>
+        <label>域名前缀
+          <input type="text" id="f-edge-prefix" placeholder="cad" required
+                 pattern="[A-Za-z0-9._\-]+" title="只能含字母、数字、-、_、." />
+        </label>
+        <label>转发到本机端口
+          <input type="number" id="f-edge-port" placeholder="2228" min="1" max="65535" required />
+        </label>
+        <button class="primary" type="submit" id="btn-edge-save">保存</button>
+        <button class="ghost" type="button" id="btn-edge-cancel">取消</button>
+      </form>
+
+      <table>
+        <thead>
+          <tr>
+            <th>域名前缀</th>
+            <th>转发到</th>
+            <th class="hide-sm">访问示例</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="edge-rows"></tbody>
+      </table>
+      <div class="empty" id="edge-empty" hidden>还没有路由。点右上角「新建路由」加一条。</div>
+
+      <div class="grid" id="edge-counters" style="margin-top:12px"></div>
+      <div class="hint" style="margin-top:10px">
+        改这里只影响<strong>运行时</strong>：重启 <code>esc-host</code> 会回到
+        <code>host.toml</code> 里那份路由表。持久化请改配置文件。
+      </div>
+    </div>
   </div>
 
   <div class="card" id="spokes-card" hidden>
@@ -333,6 +397,141 @@
     }
   }
 
+  // ── 边缘路由 ──────────────────────────────────────────────────────────────
+  //
+  // 这是一个**可选**能力：后端没启用插件时 `GET /api/edge` 返回 501。
+  // 那种情况不是错误，是"这台机器没这个功能"——卡片显示一行说明即可，
+  // 不弹 toast、不污染顶部的连接状态徽标。
+
+  let edgeAvailable = null;   // null = 还没探测过
+
+  function edgeExample(prefix) {
+    // 用当前页面的主机名做示例，比编一个假域名更有代入感；
+    // 面板本身可能就在回环上，那就退回一个示意域名。
+    const h = location.hostname;
+    const base = (h && h !== "127.0.0.1" && h !== "localhost") ? h : "你的域名";
+    return prefix + "." + base;
+  }
+
+  async function refreshEdge() {
+    const card = $("#edge-card");
+    let st;
+    try {
+      st = await api("/api/edge");
+      edgeAvailable = true;
+    } catch (e) {
+      // 501 = 未启用（正常情况）；其它状态码是真错误，要让人看到。
+      const notEnabled = /没有启用|未启用|not registered|service_not_found|NOT_IMPLEMENTED/i.test(e.message);
+      edgeAvailable = false;
+      card.hidden = false;
+      $("#edge-unavailable").hidden = false;
+      $("#edge-unavailable").textContent = "";
+      const line = el("div");
+      line.appendChild(document.createTextNode(
+        notEnabled ? "这台机器没有启用边缘路由插件（esc.edge-router）。" : "边缘路由不可用：" + e.message
+      ));
+      if (notEnabled) {
+        line.appendChild(el("br"));
+        const code = el("code", null, "[edge_router] enabled = true");
+        line.appendChild(document.createTextNode("在 host.toml 里加 "));
+        line.appendChild(code);
+        line.appendChild(document.createTextNode(" 后重启 esc-host。"));
+      }
+      $("#edge-unavailable").appendChild(line);
+      $("#edge-body").hidden = true;
+      $("#edge-listen").textContent = "未启用";
+      $("#edge-listen").className = "badge off";
+      return;
+    }
+
+    $("#edge-unavailable").hidden = true;
+    $("#edge-body").hidden = false;
+    const listens = st.listens || [];
+    $("#edge-listen").textContent = listens.length ? "监听 " + listens.join("  ") : "未在监听";
+    $("#edge-listen").className = "badge " + (listens.length ? "on" : "off");
+
+    const routes = st.routes || [];
+    const body = $("#edge-rows");
+    body.replaceChildren();
+    $("#edge-empty").hidden = routes.length > 0;
+    for (const r of routes) {
+      const tr = el("tr");
+      tr.appendChild(el("td", "mono", r.prefix));
+      tr.appendChild(el("td", "mono", "127.0.0.1:" + r.port));
+      tr.appendChild(el("td", "mono hide-sm", edgeExample(r.prefix)));
+      const act = el("td");
+      const del = el("button", "ghost danger", "删除");
+      del.onclick = async () => {
+        if (!confirm("删除路由 " + r.prefix + ".* → 127.0.0.1:" + r.port + "？")) return;
+        try {
+          await api("/api/edge/routes/" + encodeURIComponent(r.prefix), { method: "DELETE" });
+          toast("已删除 " + r.prefix, "ok");
+          refreshEdge();
+        } catch (e) { toast("删除失败：" + e.message, "err"); }
+      };
+      act.appendChild(del);
+      tr.appendChild(act);
+      body.appendChild(tr);
+    }
+
+    // 计数器：只展示有用的几个，避免堆一排 0。
+    const box = $("#edge-counters");
+    box.replaceChildren();
+    const c = st.counters || {};
+    const items = [
+      ["请求", c.requests],
+      ["已转发", c.proxied],
+      ["无路由(421)", c.unrouted],
+      ["后端错误", c.upstream_errors],
+      ["已升级(WS)", c.upgraded],
+    ];
+    for (const [k, v] of items) {
+      const cell = el("div", "kv");
+      cell.appendChild(el("div", "k", k));
+      cell.appendChild(el("div", "v", String(v ?? 0)));
+      box.appendChild(cell);
+    }
+    if (st.default_port) {
+      const cell = el("div", "kv");
+      cell.appendChild(el("div", "k", "兜底端口"));
+      cell.appendChild(el("div", "v", String(st.default_port)));
+      box.appendChild(cell);
+    }
+  }
+
+  $("#btn-edge-new").onclick = () => {
+    if (edgeAvailable === false) return;
+    const f = $("#form-edge");
+    f.hidden = !f.hidden;
+    if (!f.hidden) $("#f-edge-prefix").focus();
+  };
+  $("#btn-edge-cancel").onclick = () => {
+    $("#form-edge").hidden = true;
+    $("#form-edge").reset();
+  };
+  $("#form-edge").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const prefix = $("#f-edge-prefix").value.trim().toLowerCase();
+    const port = parseInt($("#f-edge-port").value, 10);
+    if (!prefix || !port) return;
+    const btn = $("#btn-edge-save");
+    btn.disabled = true;
+    try {
+      await api("/api/edge/routes", {
+        method: "POST",
+        body: JSON.stringify({ prefix, port }),
+      });
+      toast("已保存 " + prefix + ".* → " + port, "ok");
+      $("#form-edge").hidden = true;
+      $("#form-edge").reset();
+      refreshEdge();
+    } catch (e) {
+      toast("保存失败：" + e.message, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   function renderMappings(list) {
     const body = $("#rows");
     body.replaceChildren();
@@ -473,7 +672,7 @@
     }
   }
 
-  $("#btn-refresh").onclick = refresh;
+  $("#btn-refresh").onclick = () => { refresh(); refreshEdge(); };
   $("#btn-new").onclick = () => openEditor(null);
   $("#btn-reload").onclick = async () => {
     try { await api("/api/reload", { method: "POST" }); toast("已重新加载映射表", "ok"); refresh(); }
@@ -501,7 +700,13 @@
   $("#dlg-map").addEventListener("close", () => { state.paused = false; refresh(); });
 
   refresh();
-  setInterval(() => { if (!state.paused) refresh(); }, 3000);
+  refreshEdge();
+  setInterval(() => {
+    if (state.paused) return;
+    refresh();
+    // 边缘路由与隧道状态互不依赖；单独刷，一方失败不影响另一方。
+    refreshEdge();
+  }, 3000);
 })();
 </script>
 </body>

@@ -251,6 +251,7 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 | `esc-host` 边缘路由端到端 | 真二进制 + TOML → `[edge_router]` 段被读到 → 插件挂载 → 端口 listen → 两个域名分到两个后端 → `esc.edge` 控制服务已注册 |
 | 边缘路由的 WebSocket | 假后端回 101 + 回显：101 首部原样回给客户端、之后 `ping`/中文/单字节都被原样搬回；上游拒绝升级（426）被原样透传而不是变成 502 |
 | 边缘路由的跨进程控制面 | `HostCall("esc.edge", …)` 的 status/list/upsert/delete 全链路；非法前缀→`invalid`、删不存在→`not_found`、未知方法→`invalid` |
+| 边缘路由的面板 UI | `/api/edge` CRUD 映射到契约方法；入参不合法时**在面板就拦下**（不打到后端）；未启用插件时返回 501 而非 500；页面里带卡片与 `[hidden]` 兜底样式 |
 
 ## 已知边界（当前版本故意不做）
 

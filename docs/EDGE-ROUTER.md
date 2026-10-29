@@ -102,6 +102,50 @@ pub trait EdgeRouteControl: Send + Sync + 'static {
 > systemd 的 `ReadOnlyPaths=/etc/esc`……这些都属于**宿主/部署层**的判断，
 > 塞进代理插件会让它必须认识"配置在哪、能不能写"。宁可少一个便利方法。
 
+## 面板 UI
+
+隧道面板（`esc-plugin-tunnel-panel`，默认 `127.0.0.1:18787`）里有一张「边缘路由」卡片：
+列出监听地址、路由表、计数器，可以点「新建路由」/「删除」直接改运行时路由表。
+
+![边缘路由卡片](img/panel-edge-router.png)
+
+HTTP 端点（都经由 `HostCall("esc.edge", …)` 转发给背部宿主，面板不认识插件）：
+
+| 方法 | 路径 | 转成的契约方法 |
+| --- | --- | --- |
+| `GET` | `/api/edge` | `edge.status` |
+| `POST` | `/api/edge/routes` | `edge.route.upsert`（body `{prefix, port}`） |
+| `DELETE` | `/api/edge/routes/{prefix}` | `edge.route.delete` |
+
+面板侧的两条设计取舍：
+
+1. **`call_edge` 在 `ControlBackend` 里是默认方法**（默认 `501`）。边缘路由是可选插件，
+   假后端与"没启用插件"都不该被迫写一个永远失败的方法；而 `501 Not Implemented`
+   恰好就是"这台机器没这个能力"的正确语义。
+2. **`service_not_found` 特别翻成 501**。框架用它表示"宿主没注册这个服务"，
+   如果落到 `ErrorKind::Other` 会变成 `502`，把用户引向"后端坏了"。前端靠
+   `501` 把卡片显示成"未启用"而不是弹错误。
+
+未启用时卡片长这样（不弹 toast、不影响顶部隧道状态徽标）：
+
+![未启用](img/panel-edge-router-off.png)
+
+> 面板只改**运行时**路由表；重启 `esc-host` 会回到 `host.toml` 里那份。
+> 面板上没有"保存到配置文件"——写盘涉及属主/`ReadOnlyPaths`/原子替换，
+> 那是部署层的事（见上面「为什么没有 edge.route.save」）。
+
+### 一个前端坑（修过一次）
+
+`.inline-form { display: flex }` 的优先级高于浏览器对 `[hidden]` 的
+`display: none`，于是 `hidden` 属性完全失效——表单初始就显示、保存后也收不起来。
+修法是加一条兜底：
+
+```css
+[hidden] { display: none !important; }
+```
+
+`tests/http_api.rs` 里有一条断言守着这行样式存在。
+
 ## 错误语义
 
 | 状态码 | `error` 字段 | 什么时候 |

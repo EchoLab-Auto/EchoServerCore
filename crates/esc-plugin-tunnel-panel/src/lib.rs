@@ -22,13 +22,13 @@
 //! 于是「面板的 API 是否正确映射到契约方法」这件事可以在**没有框架、没有引擎**
 //! 的情况下单测——这也是解耦带来的直接好处。
 
+pub mod backend;
 pub mod web;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -46,7 +46,9 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use esc_control_api::{method, CONTROL_SERVICE};
+use esc_control_api::method;
+
+pub use backend::{ControlBackend, HostCallBackend};
 
 /// 本插件在宿主里暴露的贡献名（宿主可以用 `invoke("esc.tunnel-panel", …)` 探测它）。
 ///
@@ -197,72 +199,6 @@ impl PanelConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 后端抽象
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// 面板把请求转给谁。
-#[async_trait]
-pub trait ControlBackend: Send + Sync + 'static {
-    async fn call(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)>;
-}
-
-/// 引擎侧的操作（bind、写映射表、查状态）都是毫秒级的，所以 10 秒已经是
-/// 非常宽松的上限。默认的 30 秒会让浏览器在一个真的卡住的调用上白等半分钟，
-/// 而这时用户想看到的是「引擎没响应」而不是转圈。
-const CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 生产实现：走插件框架的 `HostCall`。
-pub struct HostCallBackend {
-    host: HostClient,
-}
-
-impl HostCallBackend {
-    pub fn new(host: HostClient) -> Self {
-        Self { host }
-    }
-}
-
-#[async_trait]
-impl ControlBackend for HostCallBackend {
-    async fn call(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
-        match self
-            .host
-            .call_with_timeout(CONTROL_SERVICE, method, params, CONTROL_CALL_TIMEOUT)
-            .await
-        {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // 用 `code` 而不是解析 `Display` 文本来决定状态码：错误文本会变，
-                // 机器可读的 code 是契约的一部分。
-                let (status, text) = match &e {
-                    echo_plugin_sdk::HostCallError::Timeout => (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        format!(
-                            "引擎在 {}s 内没有响应（{}）——看宿主日志确认隧道引擎是否卡住",
-                            CONTROL_CALL_TIMEOUT.as_secs(),
-                            method
-                        ),
-                    ),
-                    echo_plugin_sdk::HostCallError::Closed => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "与宿主的连接已断开，面板即将退出".to_string(),
-                    ),
-                    echo_plugin_sdk::HostCallError::Service { code, message } => {
-                        // 码表在契约里（`ErrorKind::as_code` / `http_status`），
-                        // 面板只管把码翻成状态码，不维护第二份字符串表。
-                        let kind = esc_control_api::ErrorKind::from_code(code);
-                        let status = StatusCode::from_u16(kind.http_status())
-                            .unwrap_or(StatusCode::BAD_GATEWAY);
-                        (status, message.clone())
-                    }
-                    other => (StatusCode::BAD_GATEWAY, other.to_string()),
-                };
-                Err((status, text))
-            }
-        }
-    }
-}
-
 // 访问控制（Basic 认证 / 来源白名单 / 失败限速）住在 `esc-panel-auth` 里。
 // 那边有一份完整实现与测试，服务器面板也用它——这套逻辑不能有两份。
 
@@ -308,6 +244,10 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/reload", post(api_reload))
         .route("/api/spokes/kick", post(api_kick))
         .route("/api/export", get(api_export))
+        // ── 边缘路由（可能不存在：未启用插件时全部返回 501）────────────
+        .route("/api/edge", get(api_edge_status))
+        .route("/api/edge/routes", post(api_edge_upsert))
+        .route("/api/edge/routes/{prefix}", axum::routing::delete(api_edge_delete))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -427,6 +367,62 @@ async fn api_export(
     Ok(Json(
         st.backend
             .call(method::CONFIG_EXPORT, json!({ "role": role }))
+            .await?,
+    ))
+}
+
+// ── 边缘路由：域名前缀 → 本机端口 ────────────────────────────────────────────
+//
+// 这一组端点是**可选能力**：`[edge_router] enabled = false` 时宿主不会注册
+// `esc.edge` 服务，`call_edge` 返回 501，前端据此把卡片显示成"未启用"，
+// 而不是弹一堆报错。
+
+/// `GET /api/edge`：监听地址 + 路由表 + 计数器（一次拿全，前端只发一个请求）。
+async fn api_edge_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        st.backend.call_edge(method::EDGE_ROUTE_STATUS, Value::Null).await?,
+    ))
+}
+
+/// `POST /api/edge/routes`：新增/覆盖一条路由（`{prefix, port}`）。
+async fn api_edge_upsert(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    // 在这里做一次形状校验：错误信息能点名"缺哪个字段"，比让引擎返回
+    // "bad params for edge.route.upsert" 好读。
+    let prefix = body.get("prefix").and_then(Value::as_str).unwrap_or("").trim();
+    let port = body.get("port").and_then(Value::as_u64);
+    if prefix.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 prefix（域名前缀）".into()));
+    }
+    let Some(port) = port else {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 port（本机端口）".into()));
+    };
+    if port == 0 || port > 65535 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("port 必须在 1..=65535，拿到 {port}"),
+        ));
+    }
+    Ok(Json(
+        st.backend
+            .call_edge(
+                method::EDGE_ROUTE_UPSERT,
+                json!({ "prefix": prefix, "port": port }),
+            )
+            .await?,
+    ))
+}
+
+/// `DELETE /api/edge/routes/{prefix}`：删掉一条路由。
+async fn api_edge_delete(
+    State(st): State<AppState>,
+    Path(prefix): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        st.backend
+            .call_edge(method::EDGE_ROUTE_DELETE, json!({ "prefix": prefix }))
             .await?,
     ))
 }
