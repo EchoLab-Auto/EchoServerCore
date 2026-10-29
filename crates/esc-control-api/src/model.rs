@@ -222,6 +222,66 @@ pub struct ExportedConfig {
     pub toml: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 边缘路由（域名前缀 → 本机端口）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 一条边缘路由。
+///
+/// `prefix` 是**域名第一段**（`cad`）或**完整域名**（`cad.example.com`），
+/// 一律小写。完整域名优先匹配 —— 这样同一个前缀在不同域名下可以指向
+/// 不同后端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRoute {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub port: u16,
+}
+
+/// 新增/覆盖一条路由的入参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRouteUpsert {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub port: u16,
+}
+
+/// 边缘路由的计数器。
+///
+/// 只做全局聚合：按前缀计数要在无锁热路径上加锁，收益不抵成本；日志里有
+/// `prefix=` 字段，`grep` 就能统计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRouterCounters {
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub proxied: u64,
+    #[serde(default)]
+    pub unrouted: u64,
+    #[serde(default)]
+    pub upstream_errors: u64,
+    /// 成功升级（101 + 双向搬运已建立）的连接数。
+    #[serde(default)]
+    pub upgraded: u64,
+}
+
+/// 边缘路由的运行状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRouterStatus {
+    /// 实际在听的地址（`0.0.0.0:2229`）。
+    #[serde(default)]
+    pub listens: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<EdgeRoute>,
+    /// 没有前缀的 Host 兜底到哪个端口（`None` = 直接 421）。
+    #[serde(default)]
+    pub default_port: Option<u16>,
+    #[serde(default)]
+    pub counters: EdgeRouterCounters,
+}
+
 /// 引擎侧的错误。用字符串是为了能跨进程边界无损传递。
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
 #[error("{message}")]

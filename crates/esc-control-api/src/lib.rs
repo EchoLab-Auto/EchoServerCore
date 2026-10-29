@@ -7,9 +7,11 @@ pub mod dispatch;
 pub mod model;
 
 pub use dispatch::{
-    dispatch, method, ControlRequest, ControlResponse, TunnelControl, CONTROL_SERVICE,
+    dispatch, dispatch_edge, method, ControlRequest, ControlResponse, EdgeRouteControl,
+    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE,
 };
 pub use model::{
-    ControlError, EngineStatus, ErrorKind, ExportedConfig, Mapping, MappingState, MappingStats,
-    MappingUpsert, MappingView, Role, SpokeView,
+    ControlError, EdgeRoute, EdgeRouteUpsert, EdgeRouterCounters, EdgeRouterStatus, EngineStatus,
+    ErrorKind, ExportedConfig, Mapping, MappingState, MappingStats, MappingUpsert, MappingView,
+    Role, SpokeView,
 };

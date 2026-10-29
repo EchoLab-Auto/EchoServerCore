@@ -22,11 +22,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{
-    ControlError, EngineStatus, ExportedConfig, MappingUpsert, MappingView, Role,
+    ControlError, EdgeRoute, EdgeRouteUpsert, EdgeRouterStatus, EngineStatus, ExportedConfig,
+    MappingUpsert, MappingView, Role,
 };
 
 /// 宿主注册的服务名。面板通过 `HostCall` 调它。
 pub const CONTROL_SERVICE: &str = "esc.control";
+
+/// 边缘路由的控制服务名。
+///
+/// 与 [`CONTROL_SERVICE`] 分开的原因：不同插件、不同能力面。面板可以只挂
+/// 隧道控制而不给路由控制（反之亦然），绑在一起就得一起开。
+pub const EDGE_ROUTE_SERVICE: &str = "esc.edge";
 
 /// 面板的菜单/命令键。名字进 JSON，所以一律小写点分。
 pub mod method {
@@ -38,6 +45,12 @@ pub mod method {
     pub const ENGINE_RELOAD: &str = "engine.reload";
     pub const SPOKES_KICK: &str = "spokes.kick";
     pub const CONFIG_EXPORT: &str = "config.export";
+
+    // ── 边缘路由（走 [`EDGE_ROUTE_SERVICE`]）────────────────────────────
+    pub const EDGE_ROUTE_LIST: &str = "edge.route.list";
+    pub const EDGE_ROUTE_UPSERT: &str = "edge.route.upsert";
+    pub const EDGE_ROUTE_DELETE: &str = "edge.route.delete";
+    pub const EDGE_ROUTE_STATUS: &str = "edge.status";
 }
 
 /// 一次控制调用。
@@ -123,6 +136,21 @@ pub trait TunnelControl: Send + Sync + 'static {
     async fn export_config(&self, role: Role) -> Result<ExportedConfig, ControlError>;
 }
 
+/// 边缘路由的控制面契约。
+///
+/// 与 [`TunnelControl`] 平行的第二组能力：域名前缀 → 本机端口的路由表。
+/// 同样只有形状，不认识具体实现（面板侧编译期不需要 `esc-plugin-edge-router`）。
+///
+/// 注意：**增删只在内存里生效**。持久化是宿主的职责（改 TOML 再重启），
+/// 所以这里刻意没有 `save` 方法 —— 调用方不该以为它能写盘。
+#[async_trait::async_trait]
+pub trait EdgeRouteControl: Send + Sync + 'static {
+    async fn status(&self) -> Result<EdgeRouterStatus, ControlError>;
+    /// 新增或覆盖一条路由（同前缀覆盖，不同前缀可以共用同一端口）。
+    async fn upsert_route(&self, spec: EdgeRouteUpsert) -> Result<EdgeRoute, ControlError>;
+    async fn delete_route(&self, prefix: &str) -> Result<(), ControlError>;
+}
+
 /// 单点分发：把 [`ControlRequest`] 路由到 [`TunnelControl`] 的某个方法。
 ///
 /// 引擎与测试共用这一个实现，保证「面板能调到的」和「引擎真正支持的」
@@ -199,6 +227,53 @@ pub async fn dispatch(ctl: &dyn TunnelControl, req: ControlRequest) -> ControlRe
         }
         other => ControlResponse::err(ControlError::invalid(format!(
             "unknown control method {other:?}"
+        ))),
+    }
+}
+
+/// 边缘路由的分发：把 [`ControlRequest`] 路由到 [`EdgeRouteControl`]。
+///
+/// 与 [`dispatch`] 分开而不是塞进同一个 match：两组能力属于不同插件，
+/// 混在一起会让"没装边缘路由的面板"收到一堆 unknown method。
+pub async fn dispatch_edge(ctl: &dyn EdgeRouteControl, req: ControlRequest) -> ControlResponse {
+    use method::*;
+    match req.method.as_str() {
+        EDGE_ROUTE_STATUS => match ctl.status().await {
+            Ok(v) => ControlResponse::ok(v),
+            Err(e) => ControlResponse::err(e),
+        },
+        EDGE_ROUTE_LIST => match ctl.status().await {
+            // 列表就从 status 里取：不必再定义一套"只有列表"的返回形状，
+            // 而且顺手把 listens 一起给到，面板画表格时不用再调一次。
+            Ok(v) => ControlResponse::ok(v.routes),
+            Err(e) => ControlResponse::err(e),
+        },
+        EDGE_ROUTE_UPSERT => {
+            let spec: EdgeRouteUpsert = match req.parse() {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::err(e),
+            };
+            match ctl.upsert_route(spec).await {
+                Ok(v) => ControlResponse::ok(v),
+                Err(e) => ControlResponse::err(e),
+            }
+        }
+        EDGE_ROUTE_DELETE => {
+            #[derive(Deserialize)]
+            struct P {
+                prefix: String,
+            }
+            let p: P = match req.parse() {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::err(e),
+            };
+            match ctl.delete_route(&p.prefix).await {
+                Ok(()) => ControlResponse { ok: true, data: Value::Null, error: None },
+                Err(e) => ControlResponse::err(e),
+            }
+        }
+        other => ControlResponse::err(ControlError::invalid(format!(
+            "unknown edge method: {other}"
         ))),
     }
 }

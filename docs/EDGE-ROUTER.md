@@ -61,32 +61,52 @@ panel = 8080
 - **配置错就挂载失败**（fail-closed）：一个"起来了但全 421"的边缘路由比没起来更难查。
 - **持久化是宿主的职责**：运行期增删路由只在内存里生效，改完 TOML 要重启。
 
-## 运行期控制面
+## 运行期控制面（进程内 + 跨进程两条路）
 
-插件把 `Arc<dyn EdgeRouterControl>` 注册到 `Ctx` 的
-`esc.edge-router.control` 服务键下：
+### 进程内：Ctx 服务
+
+插件把 `Arc<dyn EdgeRouteControl>` 注册到 `Ctx` 的 `esc.edge-router.control`
+服务键下。trait 定义在 **`esc-control-api`**（不是插件里），因为面板要能
+编译期读到同一份形状：
 
 ```rust
-pub trait EdgeRouterControl {
-    async fn status(&self) -> Result<RouterStatus, ControlError>;   // listen / routes / 计数
-    async fn upsert_route(&self, prefix: &str, port: u16) -> Result<RouteView, ControlError>;
+// esc-control-api
+pub trait EdgeRouteControl: Send + Sync + 'static {
+    async fn status(&self) -> Result<EdgeRouterStatus, ControlError>;
+    async fn upsert_route(&self, spec: EdgeRouteUpsert) -> Result<EdgeRoute, ControlError>;
     async fn delete_route(&self, prefix: &str) -> Result<(), ControlError>;
 }
 ```
 
-宿主侧取用：`Host::edge_router()`（未启用时为 `None`）。错误用本仓统一的
-`ControlError`：`ErrorKind` 自带 `http_status()`，面板可以直接把 `not_found`
-映射成 404，不会出现两套码表。
+宿主侧取用：`Host::edge_router()`（未启用时为 `None`）。
 
-> 面板要不要显示路由表、要不要让用户点一下加路由，取决于面板 —— 但**不需要
-> 改这个插件**，它已经是一个服务了。
+### 跨进程：`HostCall("esc.edge", …)`
+
+子进程插件（面板）经宿主服务调同一组能力：
+
+| `HostCall("esc.edge", method, params)` | 参数 | 返回 |
+| --- | --- | --- |
+| `edge.status` | — | `EdgeRouterStatus`（listens + routes + default_port + counters） |
+| `edge.route.list` | — | `[EdgeRoute]`（只给路由，面板画表格） |
+| `edge.route.upsert` | `{prefix, port}` | `EdgeRoute` |
+| `edge.route.delete` | `{prefix}` | `null` |
+
+- 服务名 `esc.edge` **只在 `[edge_router] enabled = true` 时注册** —— 面板据此
+  判断这台机器有没有路由能力（而不是调了才发现 unimplemented）。
+- 错误码走 `ErrorKind::as_code`：`invalid`/`not_found`/… 与隧道控制面完全一致，
+  面板可以直接用 `ErrorKind::http_status()` 转 HTTP 状态码。
+- **增删只在内存生效**：容器重启即回到 TOML 里那份。要在面板上"永久保存"，
+  得由面板去改配置文件 —— 这条边界是刻意的（见下）。
+
+> 为什么没有 `edge.route.save`：写盘涉及配置文件的原子替换、属主权限、
+> systemd 的 `ReadOnlyPaths=/etc/esc`……这些都属于**宿主/部署层**的判断，
+> 塞进代理插件会让它必须认识"配置在哪、能不能写"。宁可少一个便利方法。
 
 ## 错误语义
 
 | 状态码 | `error` 字段 | 什么时候 |
 | --- | --- | --- |
 | `421 Misdirected Request` | `no_route` | Host 没有对应路由（故意不用 404，避免与后端自己的 404 混淆） |
-| `501 Not Implemented` | `upgrade_not_supported` | 请求带 `Upgrade`（WebSocket）—— 见下 |
 | `502 Bad Gateway` | `bad_gateway` | 后端连不上（响应体里带目标端口） |
 | `504 Gateway Timeout` | `upstream_timeout` | 超过 `timeout_ms` |
 
@@ -109,14 +129,31 @@ $ curl -s -H 'Host: nope.example.com' http://127.0.0.1:2229/
 - 多值首部（`Set-Cookie`）逐条保留，不会只剩一个。
 - 说明：hyper 输出的首部名统一小写（HTTP 首部名本就大小写不敏感）。
 
-## 已知限制（v1）
+## 已知限制
 
 | 限制 | 说明 |
 | --- | --- |
-| **不支持 WebSocket / Upgrade** | 带 `Upgrade` 的请求直接回 `501`（附 JSON 说明），而不是挂着不动。需要 WS 的路径暂时走端口直连。v2 再做 `hyper::upgrade` 双向搬运。 |
 | 只做 HTTP/1.1 | 没有 HTTP/2、没有 TLS 终结。要 HTTPS 就在前面放一层（见下）。 |
 | 只连本机 | 目标恒为 `127.0.0.1:<port>`，不是通用出网代理（顺手关掉了 SSRF 面）。 |
-| 路由表不持久化 | 运行期 `upsert_route` 只改内存。 |
+| 路由表不持久化 | 运行期 `upsert_route` 只改内存，重启回到 TOML。 |
+| 升级协商超时不可配 | 固定 15s（`UPGRADE_NEGOTIATION_TIMEOUT`）。它不该跟普通请求的 5 分钟共用。 |
+
+### WebSocket / Upgrade（v2 已支持）
+
+带 `Upgrade` 的请求会走独立路径（`forward_upgrade`），不是复用普通转发：
+
+1. 从 request extensions 取 `OnUpgrade`（**必须在拆 body 之前**，`on()` 会取走它）；
+2. 转发时**保留** `Upgrade` 与 `Connection` 两个首部（普通路径按逐跳首部丢掉，
+   但升级路径它们就是协商载荷）；
+3. 上游回 `101` 后，两侧的 `Upgraded` 用 `TokioIo` 包起来，
+   `tokio::io::copy_bidirectional` 直接搬字节 —— 此后与 HTTP 状态机无关；
+4. 上游回非 101（如 `426 Upgrade Required`）→ **原样返回**它的响应，这不是
+   网关错误（测试里专门有一条守这个）。
+
+计数器 `upgraded` 统计成功升级的连接数；被上游拒绝的计入 `proxied`。
+
+日志：协商超时/连不上是 `warn`，成功升级是 `info`（`已升级连接（WebSocket 等）`），
+连接结束（含双向字节数）是 `debug`。
 
 ## 与「备案拦截」的关系（腾讯云实测）
 
@@ -246,3 +283,13 @@ RUST_LOG=esc_plugin_edge_router=debug systemctl restart esc-host
 
 4. **默认不挂载**：`Host::start` 只在 `[edge_router] enabled = true` 时才
    `register`，没启用就完全不存在（不注册 → 不挂载 → 不占端口）。
+
+5. **`hyper::upgrade::on()` 会把 `OnUpgrade` 从 extensions 取走。**
+   所以必须在把 request 拆成 parts/body **之前**调用，且这个 future 要一直
+   活着到 101 响应发出去之后（这就是它为什么被移进 `tokio::spawn`）——
+   提前 drop 掉会让连接永远等不到升级、表现成客户端一直挂着。
+
+6. **契约放 `esc-control-api`，不放插件。**
+   面板要编译期知道 `EdgeRoute` / `EdgeRouteControl` 的形状，但它不该依赖
+   代理插件（那是"面板认识实现"）。所以类型与 trait 都在契约 crate 里，
+   插件只是实现者；本仓的 `RouteView` / `RouterStatus` 之类的私有副本已删。

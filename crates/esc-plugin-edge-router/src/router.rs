@@ -29,14 +29,16 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use esc_control_api::ControlError;
+use esc_control_api::{
+    ControlError, EdgeRoute, EdgeRouteControl, EdgeRouteUpsert, EdgeRouterStatus,
+};
 
 use crate::config::RouterConfig;
-use crate::control::{Counters, RouteView, RouterStatus};
+use crate::control::Counters;
 
 /// 跳过的逐跳首部（RFC 9110 §7.6.1）。转发时两端都不该带。
 const HOP_BY_HOP: [&str; 8] = [
@@ -165,16 +167,21 @@ impl EdgeRouter {
         }
     }
 
-    pub fn routes(&self) -> Vec<RouteView> {
+    /// 当前路由表（按前缀字典序，便于面板稳定展示）。
+    pub fn routes(&self) -> Vec<EdgeRoute> {
         self.routes
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(prefix, port)| RouteView { prefix: prefix.clone(), port: *port })
+            .map(|(prefix, port)| EdgeRoute { prefix: prefix.clone(), port: *port })
             .collect()
     }
 
-    pub fn upsert_route(&self, prefix: &str, port: u16) -> Result<RouteView, ControlError> {
+    /// 新增/覆盖一条路由（同前缀覆盖；不同前缀可共用同一端口）。
+    ///
+    /// 与契约里的 [`EdgeRouteControl::upsert_route`] 是同一个语义，这里用
+    /// 拆开的 (prefix, port) 方便内部调用与测试；trait 实现直接转调。
+    pub fn upsert_route(&self, prefix: &str, port: u16) -> Result<EdgeRoute, ControlError> {
         let prefix = prefix.trim().to_ascii_lowercase();
         let ok = !prefix.is_empty()
             && prefix.chars().all(|c| {
@@ -194,7 +201,7 @@ impl EdgeRouter {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(prefix.clone(), port);
-        Ok(RouteView { prefix, port })
+        Ok(EdgeRoute { prefix, port })
     }
 
     pub fn delete_route(&self, prefix: &str) -> Result<(), ControlError> {
@@ -218,8 +225,12 @@ impl EdgeRouter {
         &self.counters
     }
 
-    pub fn status(&self) -> RouterStatus {
-        RouterStatus {
+    /// 一次性快照：监听地址 + 路由表 + 计数器。
+    ///
+    /// 名字用 `snapshot` 而不是 `status`，是为了避免与契约里的
+    /// [`EdgeRouteControl::status`]（async）在阅读时混淆 —— 两者内容相同。
+    pub fn snapshot(&self) -> EdgeRouterStatus {
+        EdgeRouterStatus {
             listens: self.listens.iter().map(|a| a.to_string()).collect(),
             routes: self.routes(),
             default_port: self.default_port,
@@ -231,9 +242,8 @@ impl EdgeRouter {
     ///
     /// 错误语义（都写成 JSON 响应体，`curl` 一眼能看出问题）：
     /// - 前缀没配 → `421 no_route`
-    /// - 请求要 Upgrade（WebSocket）→ `501 upgrade_not_supported`（v1 不做，
-    ///   见 `docs/EDGE-ROUTER.md`）
     /// - 后端连不上 → `502 bad_gateway`；超时 → `504 upstream_timeout`
+    /// - 带 `Upgrade` 的请求走 [`Self::forward_upgrade`]（WebSocket 等）
     async fn forward(
         self: Arc<Self>,
         req: Request,
@@ -241,21 +251,14 @@ impl EdgeRouter {
         matched: String,
         peer: Option<SocketAddr>,
     ) -> Response {
-        let (parts, body) = req.into_parts();
-
-        // Upgrade 必须在动 body 之前判断：那种请求的 body 是空壳，真正的
-        // 数据在 101 之后走 TCP。v1 明确拒绝（501）而不是挂着不动。
-        if parts.headers.contains_key(header::UPGRADE) {
-            warn!(prefix = %matched, "拒绝 Upgrade 请求（edge router v1 不支持 WebSocket 透传）");
-            self.counters.record_upgrade_rejected();
-            return json_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "upgrade_not_supported",
-                "edge router v1 不支持 WebSocket/Upgrade 透传；该路径请走端口直连（v2 计划支持）",
-                serde_json::json!({ "prefix": matched, "route": port }),
-            );
+        // Upgrade 要在拆 body 之前判断：这类请求的 body 是空壳，真正的数据
+        // 在 101 之后走裸 TCP。hyper 把 `OnUpgrade` 放在 request extensions
+        // 里，`hyper::upgrade::on` 会把它**取走**，所以必须在转发前调用。
+        if req.headers().contains_key(header::UPGRADE) {
+            return self.forward_upgrade(req, port, matched, peer).await;
         }
 
+        let (parts, body) = req.into_parts();
         let path = parts
             .uri
             .path_and_query()
@@ -285,31 +288,7 @@ impl EdgeRouter {
             if let Some(host) = parts.headers.get(header::HOST) {
                 headers.insert(header::HOST, host.clone());
             }
-            if let Some(peer) = peer {
-                let forwarded = match parts
-                    .headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                {
-                    Some(existing) if !existing.is_empty() => format!("{existing}, {}", peer.ip()),
-                    _ => peer.ip().to_string(),
-                };
-                if let Ok(v) = HeaderValue::from_str(&forwarded) {
-                    headers.insert(HeaderName::from_static("x-forwarded-for"), v);
-                }
-                if let Ok(v) = HeaderValue::from_str(&peer.port().to_string()) {
-                    headers.insert(HeaderName::from_static("x-forwarded-port"), v);
-                }
-            }
-            if let Some(host) = parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-                if let Ok(v) = HeaderValue::from_str(host) {
-                    headers.insert(HeaderName::from_static("x-forwarded-host"), v);
-                }
-            }
-            headers.insert(
-                HeaderName::from_static("x-forwarded-proto"),
-                HeaderValue::from_static("http"),
-            );
+            apply_forwarded_headers(headers, &parts.headers, peer);
         }
 
         let upstream_req = match builder.body(body) {
@@ -377,6 +356,185 @@ impl EdgeRouter {
             }
         }
     }
+
+    /// Upgrade（WebSocket 等）转发：协商 101 之后把两侧连接直接对接。
+    ///
+    /// 为什么不能复用 [`Self::forward`]：
+    /// 1. 这类请求的 body 是空壳，真正的数据在 101 之后走裸字节流 ——
+    ///    当普通 body 转发会在请求结束时就断开；
+    /// 2. `Upgrade` / `Connection` 是逐跳首部，普通路径会丢掉它们，
+    ///    而它们**正是**"这一跳换协议"的协商内容；
+    /// 3. 101 之后要做双向 `copy_bidirectional`，与请求/响应生命周期解耦。
+    ///
+    /// 语义要点：上游拒绝升级（回 400/426 等）**不是**网关错误 —— 把它的
+    /// 响应原样返回。只有连不上（502）或协商超时（504）才算错误。
+    async fn forward_upgrade(
+        self: Arc<Self>,
+        mut req: Request,
+        port: u16,
+        matched: String,
+        peer: Option<SocketAddr>,
+    ) -> Response {
+        // hyper 把 OnUpgrade 放在 request extensions 里；`on()` 会取走它，
+        // 所以必须在把 req 拆成 parts/body 之前调用。
+        let client_upgrade = hyper::upgrade::on(&mut req);
+        let (parts, body) = req.into_parts();
+
+        let path = parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let upstream_uri: Uri = match format!("http://127.0.0.1:{port}{path}").parse() {
+            Ok(u) => u,
+            Err(e) => {
+                self.counters.record_upstream_error();
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_request_uri",
+                    &format!("无法构造上游 URI: {e}"),
+                    serde_json::json!({ "prefix": matched, "route": port }),
+                );
+            }
+        };
+
+        let mut builder = Request::builder().method(parts.method.clone()).uri(upstream_uri);
+        {
+            let headers = builder.headers_mut().expect("builder 刚创建，headers 一定存在");
+            // keep_upgrade = true：这两个首部是协商载荷，不能丢。
+            copy_headers(&parts.headers, headers, true);
+            if let Some(host) = parts.headers.get(header::HOST) {
+                headers.insert(header::HOST, host.clone());
+            }
+            apply_forwarded_headers(headers, &parts.headers, peer);
+        }
+
+        let upstream_req = match builder.body(body) {
+            Ok(r) => r,
+            Err(e) => {
+                self.counters.record_upstream_error();
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    &format!("无法构造上游升级请求: {e}"),
+                    serde_json::json!({ "prefix": matched, "route": port }),
+                );
+            }
+        };
+
+        // 协商本身应该很快：对端要么立刻 101，要么立刻拒绝。这里不用
+        // `self.timeout`（那是给普通请求的 5 分钟），否则对端不回手时会挂很久。
+        let mut resp = match tokio::time::timeout(
+            UPGRADE_NEGOTIATION_TIMEOUT,
+            self.client.request(upstream_req),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.counters.record_upstream_error();
+                warn!(prefix = %matched, port, error = %e, "上游升级请求失败");
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_gateway",
+                    &format!("后端 127.0.0.1:{port} 不可达: {e}"),
+                    serde_json::json!({ "prefix": matched, "route": port }),
+                );
+            }
+            Err(_) => {
+                self.counters.record_upstream_error();
+                warn!(prefix = %matched, port, "上游升级协商超时");
+                return json_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_timeout",
+                    &format!(
+                        "后端 127.0.0.1:{port} 在 {}s 内没有回应升级请求",
+                        UPGRADE_NEGOTIATION_TIMEOUT.as_secs()
+                    ),
+                    serde_json::json!({ "prefix": matched, "route": port }),
+                );
+            }
+        };
+
+        let status = resp.status();
+        // 先把响应首部搬进 builder（借 resp，此时还能拿到它的 headers）。
+        let mut out = Response::builder().status(status);
+        copy_headers(
+            resp.headers(),
+            out.headers_mut().expect("builder 刚创建，headers 一定存在"),
+            true,
+        );
+
+        if status != StatusCode::SWITCHING_PROTOCOLS {
+            // 对端拒绝升级：原样把它的响应（含 body，可能有说明文字）返回。
+            self.counters.record_proxied();
+            debug!(prefix = %matched, port, %status, "上游拒绝升级，原样返回");
+            let (_, rbody) = resp.into_parts();
+            return out.body(Body::new(rbody)).unwrap_or_else(|_| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bad_response",
+                    "无法构造响应",
+                    serde_json::json!({ "prefix": matched }),
+                )
+            });
+        }
+
+        // 101：两侧连接都已被 hyper 摘出 HTTP 状态机。
+        let upstream_upgrade = hyper::upgrade::on(&mut resp);
+        let log_prefix = matched.clone();
+        tokio::spawn(async move {
+            match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                Ok((client_io, upstream_io)) => {
+                    // TokioIo 把 hyper 的 Upgraded 适配成 AsyncRead/AsyncWrite。
+                    let mut client = TokioIo::new(client_io);
+                    let mut upstream = TokioIo::new(upstream_io);
+                    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                        Ok((c2u, u2c)) => debug!(
+                            prefix = %log_prefix,
+                            client_to_upstream = c2u,
+                            upstream_to_client = u2c,
+                            "升级连接结束"
+                        ),
+                        Err(e) => debug!(prefix = %log_prefix, error = %e, "升级连接中断"),
+                    }
+                }
+                Err(e) => warn!(prefix = %log_prefix, error = %e, "取升级连接失败"),
+            }
+        });
+
+        self.counters.record_upgraded();
+        info!(prefix = %matched, port, "已升级连接（WebSocket 等）");
+        out.body(Body::empty()).unwrap_or_else(|_| {
+            json_error(
+                StatusCode::BAD_GATEWAY,
+                "bad_response",
+                "无法构造 101 响应",
+                serde_json::json!({ "prefix": matched }),
+            )
+        })
+    }
+}
+
+/// 契约实现：把 [`EdgeRouter`] 暴露成 `esc-control-api` 的
+/// [`EdgeRouteControl`]，于是面板（子进程）也能经 `HostCall` 增删路由。
+///
+/// 注意这里是**唯一**的契约实现：插件内部与外部调用方走同一条路径，
+/// 不会出现"面板删路由有一套逻辑、自己人删又有一套"。
+#[async_trait::async_trait]
+impl EdgeRouteControl for EdgeRouter {
+    async fn status(&self) -> Result<EdgeRouterStatus, ControlError> {
+        Ok(self.snapshot())
+    }
+
+    async fn upsert_route(&self, spec: EdgeRouteUpsert) -> Result<EdgeRoute, ControlError> {
+        // 复用 inherent 方法（同一套校验），不重复实现规则。
+        self.upsert_route(&spec.prefix, spec.port)
+    }
+
+    async fn delete_route(&self, prefix: &str) -> Result<(), ControlError> {
+        EdgeRouter::delete_route(self, prefix)
+    }
 }
 
 /// `Host` 转成查表用的完整域名键：小写、去端口、去末尾的点。
@@ -394,8 +552,50 @@ fn normalize_host(host: &str) -> String {
     host
 }
 
+/// Upgrade 协商的等待上限。
+///
+/// 与普通请求的 `timeout_ms`（默认 5 分钟）分开：升级协商要么立刻成功、
+/// 要么立刻被拒。对端不回手时快速失败，比挂着占连接好。
+const UPGRADE_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 写入 `X-Forwarded-*`（网关重算，不信任客户端带来的值）。
+///
+/// `X-Forwarded-For` 是**追加**：`客户端, 已有值`。这是反向代理的通行做法，
+/// 代价是前面几项可被客户端伪造 —— 后端**只能信任最后一项**。
+fn apply_forwarded_headers(headers: &mut HeaderMap, src: &HeaderMap, peer: Option<SocketAddr>) {
+    if let Some(peer) = peer {
+        let forwarded = match src.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            Some(existing) if !existing.is_empty() => format!("{existing}, {}", peer.ip()),
+            _ => peer.ip().to_string(),
+        };
+        if let Ok(v) = HeaderValue::from_str(&forwarded) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&peer.port().to_string()) {
+            headers.insert(HeaderName::from_static("x-forwarded-port"), v);
+        }
+    }
+    if let Some(host) = src.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        if let Ok(v) = HeaderValue::from_str(host) {
+            headers.insert(HeaderName::from_static("x-forwarded-host"), v);
+        }
+    }
+    headers.insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_static("http"),
+    );
+}
+
 /// 复制端到端首部：跳过逐跳首部、以及 `Connection` 里点名的那几个。
 fn copy_end_to_end(src: &HeaderMap, dst: &mut HeaderMap) {
+    copy_headers(src, dst, false);
+}
+
+/// 复制首部；`keep_upgrade` 时**保留** `Upgrade` 与 `Connection`。
+///
+/// 只有升级路径（101）才需要保留这两个 —— 它们是"这一跳要换协议"的协商，
+/// 恰恰不能丢。其它情况一律按逐跳首部丢掉（否则后端会以为要 upgrade）。
+fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap, keep_upgrade: bool) {
     // `Connection: foo, bar` 里点名的首部同样是逐跳的，必须一起丢
     // （`x-secret` 这种"只在连接内向一跳说话"的首部不能漏出去）。
     let extra: Vec<String> = src
@@ -409,7 +609,14 @@ fn copy_end_to_end(src: &HeaderMap, dst: &mut HeaderMap) {
 
     for (name, value) in src.iter() {
         let lower = name.as_str();
-        if HOP_BY_HOP.contains(&lower) || REWRITTEN.contains(&lower) {
+        if REWRITTEN.contains(&lower) {
+            continue;
+        }
+        if keep_upgrade && matches!(lower, "upgrade" | "connection") {
+            dst.append(name.clone(), value.clone());
+            continue;
+        }
+        if HOP_BY_HOP.contains(&lower) {
             continue;
         }
         if extra.iter().any(|e| e == lower) {

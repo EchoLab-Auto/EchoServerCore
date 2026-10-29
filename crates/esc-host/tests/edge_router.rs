@@ -190,7 +190,13 @@ shop = {backend_shop}
     let resp = http_get(edge_port, "127.0.0.1", "/");
     assert!(resp.starts_with("HTTP/1.1 421"), "{resp}");
 
-    // 5) 宿主仍在运行（边缘路由不该影响隧道/宿主生命周期）
+    // 5) 边缘路由的控制服务已注册（面板靠这个 service 名调 HostCall）
+    assert!(
+        text.contains("edge control service registered"),
+        "宿主应注册 esc.edge 控制服务：\n{text}"
+    );
+
+    // 6) 宿主仍在运行（边缘路由不该影响隧道/宿主生命周期）
     assert!(
         child.try_wait().expect("try_wait 失败").is_none(),
         "宿主应持续运行：\n{}",

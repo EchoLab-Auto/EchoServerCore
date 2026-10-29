@@ -39,9 +39,10 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use esc_control_api::{
-    dispatch, ControlError, ControlRequest, ControlResponse, TunnelControl, CONTROL_SERVICE,
+    dispatch, dispatch_edge, ControlError, ControlRequest, ControlResponse, EdgeRouteControl,
+    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE,
 };
-use esc_plugin_edge_router::{EdgeRouterControl, EdgeRouterPlugin};
+use esc_plugin_edge_router::EdgeRouterPlugin;
 use esc_plugin_tunnel::TunnelPlugin;
 
 /// 隧道插件在注册表里的 id。
@@ -192,6 +193,38 @@ impl HostService for EngineHostService {
     }
 }
 
+/// `HostCall("esc.edge", <method>, <params>)` 的宿主端实现。
+///
+/// 与 [`EngineHostService`] 同一套路：同步 `HostService::call` → `block_in_place`
+/// → 异步 `dispatch_edge`。分成两个服务而不是合成一个，是因为它们背后是
+/// **两个不同插件**：没启用边缘路由时这个服务根本不该存在（注册了也没有
+/// 实现可转），面板据此就能判断"这台机器有没有路由能力"。
+pub struct EdgeHostService {
+    ctl: Arc<dyn EdgeRouteControl>,
+}
+
+impl EdgeHostService {
+    pub fn new(ctl: Arc<dyn EdgeRouteControl>) -> Self {
+        Self { ctl }
+    }
+}
+
+impl HostService for EdgeHostService {
+    fn call(&self, method: &str, payload: Value) -> Result<Value, (String, String)> {
+        let ctl = Arc::clone(&self.ctl);
+        let req = ControlRequest { method: method.to_string(), params: payload };
+        let resp: ControlResponse = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(dispatch_edge(ctl.as_ref(), req))
+        });
+        if resp.ok {
+            Ok(resp.data)
+        } else {
+            let err = resp.error.unwrap_or_else(|| ControlError::other("边缘路由控制失败"));
+            Err((err.kind.as_code().to_string(), err.message))
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Host
 // ─────────────────────────────────────────────────────────────────────────────
@@ -202,7 +235,7 @@ pub struct Host {
     registry: PluginRegistry,
     panel: Option<PluginHandle>,
     control: Arc<dyn TunnelControl>,
-    edge_router: Option<Arc<dyn EdgeRouterControl>>,
+    edge_router: Option<Arc<dyn EdgeRouteControl>>,
 }
 
 impl Host {
@@ -258,6 +291,15 @@ impl Host {
             .host_services()
             .register(CONTROL_SERVICE, Arc::new(EngineHostService::new(Arc::clone(&control))));
 
+        // 边缘路由控制面：只有启用了插件才注册 —— 面板据此判断能力是否存在。
+        if let Some(edge) = &edge_router {
+            supervisor.host_services().register(
+                EDGE_ROUTE_SERVICE,
+                Arc::new(EdgeHostService::new(Arc::clone(edge))),
+            );
+            info!(service = EDGE_ROUTE_SERVICE, "edge control service registered");
+        }
+
         let mut panel = None;
         if cfg.panel.enabled {
             let program = panel_program.unwrap_or_else(|| resolve_program(&cfg.panel.command));
@@ -300,8 +342,7 @@ impl Host {
     /// 暴露出来的动机：面板将来要显示"哪个域名去了哪个端口"，它需要这个句柄。
     /// 现在没有调用方，但它是**契约的一部分**（服务已注册在 Ctx 里），所以
     /// 保留并 `#[allow(dead_code)]`，而不是等到要用时再改公共 API。
-    #[allow(dead_code)]
-    pub fn edge_router(&self) -> Option<Arc<dyn EdgeRouterControl>> {
+    pub fn edge_router(&self) -> Option<Arc<dyn EdgeRouteControl>> {
         self.edge_router.as_ref().map(Arc::clone)
     }
 
@@ -557,6 +598,113 @@ mod tests {
         assert!(!cfg.edge_router.enabled);
         // 关闭时配置原样是空表 —— 宿主不认识路由表 schema，不做任何猜测。
         assert_eq!(cfg.edge_router_json(), Value::Object(Default::default()));
+    }
+
+    // ── 边缘路由的跨进程控制面 ──────────────────────────────────────────
+    //
+    // 验证链路：面板 HostCall("esc.edge", method, params)
+    //   → EdgeHostService::call → dispatch_edge → EdgeRouteControl → 插件
+    //
+    // 这里直接调 EdgeHostService::call（supervisor 那层是框架的，已有自己的
+    // 测试）；整个调用是同步签名，与真实 HostCall 一致。
+
+    /// 挂一个边缘路由插件（监听 :0），返回控制面句柄。
+    ///
+    /// 注册表要跟着返回：它持有 mount() 的 `Disposer`，Drop 时会撤销服务
+    /// （框架语义：注册即副作用、必须可逆）。只返回句柄的话，注册表一
+    /// 出作用域服务就消失了。
+    async fn mount_edge_router() -> (
+        Arc<dyn EdgeRouteControl>,
+        Arc<Ctx>,
+        PluginRegistry,
+    ) {
+        let ctx = Arc::new(Ctx::default());
+        let registry = PluginRegistry::default();
+        let plugin: Arc<dyn Plugin> = Arc::new(EdgeRouterPlugin::new());
+        registry.register(plugin).unwrap();
+        registry.set_config(
+            EDGE_ROUTER_PLUGIN_ID,
+            serde_json::json!({
+                "listen": ["127.0.0.1:0"],
+                "routes": { "cad": 2228 },
+            }),
+        );
+        let errors = registry.mount_all(&MountContext::new().with_ctx(Arc::clone(&ctx)));
+        assert!(errors.is_empty(), "{errors:?}");
+        let ctl = esc_plugin_edge_router::resolve(&ctx).expect("控制面应已注册");
+        (ctl, ctx, registry)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edge_control_service_exposes_status_and_mutations() {
+        use esc_control_api::method;
+        let (ctl, _ctx, _registry) = mount_edge_router().await;
+        let svc = EdgeHostService::new(ctl);
+
+        // 1) status：监听地址 + 路由表 + 计数器都在
+        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        assert_eq!(st["routes"][0]["prefix"], "cad");
+        assert_eq!(st["routes"][0]["port"], 2228);
+        assert!(
+            st["listens"][0].as_str().unwrap().starts_with("127.0.0.1:"),
+            "{st}"
+        );
+        assert_eq!(st["counters"]["requests"], 0);
+
+        // 2) list：只给路由数组（面板画表格用）
+        let list = svc.call(method::EDGE_ROUTE_LIST, Value::Null).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+
+        // 3) upsert：新增立即出现在 status 里
+        let added = svc
+            .call(
+                method::EDGE_ROUTE_UPSERT,
+                serde_json::json!({ "prefix": "panel", "port": 8080 }),
+            )
+            .unwrap();
+        assert_eq!(added["prefix"], "panel");
+        assert_eq!(added["port"], 8080);
+        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        assert_eq!(st["routes"].as_array().unwrap().len(), 2, "{st}");
+
+        // 4) delete
+        svc.call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "prefix": "panel" }))
+            .unwrap();
+        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        assert_eq!(st["routes"].as_array().unwrap().len(), 1, "{st}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edge_control_service_maps_errors_to_contract_codes() {
+        use esc_control_api::method;
+        let (ctl, _ctx, _registry) = mount_edge_router().await;
+        let svc = EdgeHostService::new(ctl);
+
+        // 非法前缀 → invalid（面板按 ErrorKind::http_status 变 400）
+        let (code, msg) = svc
+            .call(
+                method::EDGE_ROUTE_UPSERT,
+                serde_json::json!({ "prefix": "a b", "port": 1 }),
+            )
+            .unwrap_err();
+        assert_eq!(code, "invalid", "{msg}");
+
+        // 删不存在的 → not_found（→ 404）
+        let (code, msg) = svc
+            .call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "prefix": "nope" }))
+            .unwrap_err();
+        assert_eq!(code, "not_found", "{msg}");
+
+        // 参数形状不对 → invalid，且错误里带方法名（便于定位是谁调错）
+        let (code, msg) = svc
+            .call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "wrong": 1 }))
+            .unwrap_err();
+        assert_eq!(code, "invalid", "{msg}");
+        assert!(msg.contains("edge.route.delete"), "错误应点名方法：{msg}");
+
+        // 未知方法 → invalid（不是静默成功）
+        let (code, _) = svc.call("edge.route.explode", Value::Null).unwrap_err();
+        assert_eq!(code, "invalid");
     }
 
     #[test]

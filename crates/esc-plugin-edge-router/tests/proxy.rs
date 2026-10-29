@@ -181,20 +181,166 @@ async fn post_body_and_multiline_headers_survive() {
     handle.shutdown().await;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Upgrade（WebSocket）：101 之后必须变成真正的双向字节流
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 假 WebSocket 后端：握手回 101，之后进入**回显**循环（收到什么原样吐回）。
+///
+/// 用裸 std TcpListener + 线程，而不是 axum —— 这里要验的正是"101 之后
+/// 连接不再走 HTTP 状态机"，任何 HTTP 框架都会把这一点藏起来。
+fn spawn_ws_echo_backend(require_upgrade: bool) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                // 读到请求头结束（\r\n\r\n）
+                let mut head = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&tmp[..n]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let req = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                if require_upgrade && !req.contains("upgrade: websocket") {
+                    // 回归点：边缘路由**必须**把 Upgrade 首部传给后端，
+                    // 否则后端根本不知道要升级。
+                    let _ = s.write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\nConnection: close\r\n\r\nmissing upgrade hdr\r\n",
+                    );
+                    return;
+                }
+                if !require_upgrade {
+                    // 故意拒绝升级：验证"对端拒绝"被原样返回而不是变成 502
+                    let _ = s.write_all(
+                        b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnope!\n",
+                    );
+                    return;
+                }
+                let _ = s.write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Backend: ws\r\n\r\n",
+                );
+                let _ = s.flush();
+                // 回显
+                loop {
+                    let n = s.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    if s.write_all(&tmp[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// 连上边缘路由、发 Upgrade 请求、返回 (连接, 响应头文本)。
+async fn start_upgrade(edge: SocketAddr, host: &str, path: &str) -> (TcpStream, String) {
+    use tokio::io::AsyncWriteExt;
+    let mut s = TcpStream::connect(edge).await.unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    // 读到响应头结束为止（不能多读：之后是业务字节）
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = s.read(&mut byte).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        head.push(byte[0]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    (s, String::from_utf8_lossy(&head).to_string())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn websocket_upgrade_is_refused_explicitly_not_hung() {
-    // v1 不支持 Upgrade。宁可回一个明确的 501（运维能看懂），也不要挂着不动。
-    let backend = start_backend("ws").await;
+async fn websocket_upgrade_becomes_a_real_bidirectional_pipe() {
+    let backend = spawn_ws_echo_backend(true);
     let (edge, handle) = start_router(&[("cad", backend)], None);
-    let resp = raw_request(
-        edge,
-        "cad.x.com",
-        "/ws",
-        "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
-    )
-    .await;
-    assert!(status_line(&resp).contains("501"), "{resp}");
-    assert!(body_of(&resp).contains("upgrade_not_supported"), "{resp}");
+
+    let (mut client, head) = start_upgrade(edge, "cad.x.com", "/ws").await;
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "应回 101，实际：{head}"
+    );
+    let lower = head.to_ascii_lowercase();
+    // 交换协议的两个首部必须原样回给客户端，否则浏览器会认为握手失败。
+    assert!(lower.contains("upgrade: websocket"), "{head}");
+    assert!(lower.contains("connection: upgrade"), "{head}");
+    // 后端自定义的首部也要透传。
+    assert!(lower.contains("x-backend: ws"), "{head}");
+
+    // 现在是裸字节：发什么都该被后端原样吐回。
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for payload in ["ping-1", "中文也要原样通过", "x"] {
+        client.write_all(payload.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("等回显超时（说明 101 之后没有真的对接字节流）")
+            .expect("读回显失败");
+        assert_eq!(
+            String::from_utf8_lossy(&buf),
+            payload,
+            "回显内容不一致（双向搬运有问题）"
+        );
+    }
+
+    // 服务端关闭 → 客户端读到 EOF（copy_bidirectional 正确收尾）
+    drop(client);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 计数器：至少有一次成功升级
+    let st = handle.router().snapshot();
+    assert!(st.counters.upgraded >= 1, "{st:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backend_refusing_upgrade_is_passed_through_not_masked_as_502() {
+    // 对端回 426 是**正常**结果（它不想升级），不能变成 502。
+    let backend = spawn_ws_echo_backend(false);
+    let (edge, handle) = start_router(&[("cad", backend)], None);
+
+    let (mut client, head) = start_upgrade(edge, "cad.x.com", "/ws").await;
+    assert!(head.starts_with("HTTP/1.1 426"), "应原样返回 426：{head}");
+
+    // body 也要透传
+    use tokio::io::AsyncReadExt;
+    let mut body = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_string(&mut body)).await;
+    assert!(body.contains("nope!"), "拒绝原因应透传：{body:?}");
+
+    let st = handle.router().snapshot();
+    assert_eq!(st.counters.upgraded, 0, "被拒绝的升级不该计数：{st:?}");
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_to_dead_backend_is_502_with_port() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = probe.local_addr().unwrap().port();
+    drop(probe);
+    let (edge, handle) = start_router(&[("cad", dead)], None);
+    let (_, head) = start_upgrade(edge, "cad.x.com", "/ws").await;
+    assert!(head.contains("502"), "{head}");
     handle.shutdown().await;
 }
 
@@ -207,22 +353,22 @@ async fn runtime_upsert_and_delete_take_effect_without_restart() {
     assert!(body_of(&raw_request(edge, "cad.x.com", "/", "").await).contains("\"tag\":\"A\""));
 
     // 指向 B（覆盖同前缀）
-    handle.router().upsert_route("cad", b).unwrap();
+    esc_plugin_edge_router::EdgeRouter::upsert_route(&handle.router(), "cad", b).unwrap();
     assert!(
         body_of(&raw_request(edge, "cad.x.com", "/", "").await).contains("\"tag\":\"B\""),
         "覆盖同前缀应立刻生效"
     );
 
     // 新前缀
-    handle.router().upsert_route("shop", b).unwrap();
+    esc_plugin_edge_router::EdgeRouter::upsert_route(&handle.router(), "shop", b).unwrap();
     assert!(body_of(&raw_request(edge, "shop.x.com", "/", "").await).contains("\"tag\":\"B\""));
 
     // 删除后回到 421
-    handle.router().delete_route("shop").unwrap();
+    esc_plugin_edge_router::EdgeRouter::delete_route(&handle.router(), "shop").unwrap();
     assert!(status_line(&raw_request(edge, "shop.x.com", "/", "").await).contains("421"));
 
     // 状态里的计数要对得上（至少 requests 涨了、unrouted 有值）
-    let st = handle.router().status();
+    let st = handle.router().snapshot();
     assert!(st.counters.requests >= 4, "{st:?}");
     assert!(st.counters.unrouted >= 1, "{st:?}");
     assert_eq!(st.routes.len(), 1, "{st:?}");
@@ -323,7 +469,12 @@ mod plugin_level {
         assert!(body_of(&resp).contains("\"tag\":\"A\""), "{resp}");
 
         // 控制面能改路由（面板将来的入口就是它）。
-        ctl.upsert_route("shop", backend).await.unwrap();
+        ctl.upsert_route(esc_plugin_edge_router::EdgeRouteUpsert {
+            prefix: "shop".into(),
+            port: backend,
+        })
+        .await
+        .unwrap();
         let resp = raw_request(listen, "shop.anywhere.io", "/", "").await;
         assert!(status_line(&resp).contains("200"), "{resp}");
         ctl.delete_route("shop").await.unwrap();

@@ -248,7 +248,9 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 | `esc-plugin-tunnel-panel` HTTP 测试 | 每个 REST 端点映射到正确的契约方法；URL 里的 id 覆盖 body；口令缺失即 401 |
 | `esc-plugin-tunnel-panel` 端到端测试 | 浏览器 API → 子进程面板 → HostCall → 宿主 → 进程内插件 → 引擎 → spoke → 回显服务，全链路真实流量 |
 | `esc-plugin-edge-router` 测试 | 域名前缀 → 本机端口的真转发（两个前缀两个后端）、纯 IP 不被误当前缀、未配前缀 421、后端不可达 502、Upgrade 501、运行期增删路由立即生效、shutdown 释放端口 |
-| `esc-host` 边缘路由端到端 | 真二进制 + TOML → `[edge_router]` 段被读到 → 插件挂载 → 端口 listen → 两个域名分到两个后端 |
+| `esc-host` 边缘路由端到端 | 真二进制 + TOML → `[edge_router]` 段被读到 → 插件挂载 → 端口 listen → 两个域名分到两个后端 → `esc.edge` 控制服务已注册 |
+| 边缘路由的 WebSocket | 假后端回 101 + 回显：101 首部原样回给客户端、之后 `ping`/中文/单字节都被原样搬回；上游拒绝升级（426）被原样透传而不是变成 502 |
+| 边缘路由的跨进程控制面 | `HostCall("esc.edge", …)` 的 status/list/upsert/delete 全链路；非法前缀→`invalid`、删不存在→`not_found`、未知方法→`invalid` |
 
 ## 已知边界（当前版本故意不做）
 

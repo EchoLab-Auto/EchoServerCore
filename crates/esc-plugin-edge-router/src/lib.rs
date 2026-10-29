@@ -45,11 +45,20 @@ pub mod control;
 pub mod router;
 
 pub use config::RouterConfig;
-pub use control::{CounterSnapshot, Counters, EdgeRouterControl, RouteView, RouterHandle, RouterStatus};
+pub use control::Counters;
 pub use router::{bind, first_label, spawn, EdgeRouter, Resolution, ServerHandle};
 
+// 契约类型从 `esc-control-api` 重新导出：调用方只 `use esc_plugin_edge_router::…`
+// 就能拿到完整的一套，不必再记住"哪些定义在哪个 crate"。
+pub use esc_control_api::{
+    EdgeRoute, EdgeRouteControl, EdgeRouteUpsert, EdgeRouterCounters, EdgeRouterStatus,
+};
+
 /// Ctx 里的服务键。宿主按这个键取控制面。
-pub static EDGE_ROUTER_CONTROL: ServiceKey<Arc<dyn EdgeRouterControl>> =
+///
+/// 值是 `esc-control-api` 的 [`EdgeRouteControl`]（不是插件私有 trait）——
+/// 这样宿主、面板代理、测试都用同一份契约。
+pub static EDGE_ROUTER_CONTROL: ServiceKey<Arc<dyn EdgeRouteControl>> =
     ServiceKey::new("esc.edge-router.control");
 
 /// 插件在注册表里的 id（与 crate 名对应：`esc-plugin-edge-router` ↔ `esc.edge-router`）。
@@ -117,7 +126,8 @@ impl Plugin for EdgeRouterPlugin {
 
         // 注册控制面。失败要把刚起的监听关掉，否则端口泄漏（挂载失败但
         // 端口还占着，下次重试会报 "Address already in use"）。
-        let ctl: Arc<dyn EdgeRouterControl> = Arc::new(RouterHandle::new(Arc::clone(&edge)));
+        // `EdgeRouter` 自己就实现契约，不需要适配层。
+        let ctl: Arc<dyn EdgeRouteControl> = Arc::clone(&edge) as Arc<dyn EdgeRouteControl>;
         let disposer = match ctx.provide(&EDGE_ROUTER_CONTROL, ctl) {
             Ok(d) => d,
             Err(e) => {
@@ -173,7 +183,7 @@ impl Plugin for EdgeRouterPlugin {
 }
 
 /// 把 Ctx 里的边缘路由服务取出来（宿主在 mount 之后用）。
-pub fn resolve(ctx: &Ctx) -> Result<Arc<dyn EdgeRouterControl>, ControlError> {
+pub fn resolve(ctx: &Ctx) -> Result<Arc<dyn EdgeRouteControl>, ControlError> {
     ctx.require(&EDGE_ROUTER_CONTROL)
         .map_err(|e| ControlError::unavailable(format!("边缘路由服务未注册: {e}")))
 }
