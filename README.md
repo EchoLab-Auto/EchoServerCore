@@ -247,12 +247,16 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 | `esc-plugin-tunnel` 测试 | 插件 mount 后 Ctx 里出现隧道服务；配置非法时 fail-closed |
 | `esc-plugin-tunnel-panel` HTTP 测试 | 每个 REST 端点映射到正确的契约方法；URL 里的 id 覆盖 body；口令缺失即 401 |
 | `esc-plugin-tunnel-panel` 端到端测试 | 浏览器 API → 子进程面板 → HostCall → 宿主 → 进程内插件 → 引擎 → spoke → 回显服务，全链路真实流量 |
+| `esc-plugin-edge-router` 测试 | 域名前缀 → 本机端口的真转发（两个前缀两个后端）、纯 IP 不被误当前缀、未配前缀 421、后端不可达 502、Upgrade 501、运行期增删路由立即生效、shutdown 释放端口 |
+| `esc-host` 边缘路由端到端 | 真二进制 + TOML → `[edge_router]` 段被读到 → 插件挂载 → 端口 listen → 两个域名分到两个后端 |
 
 ## 已知边界（当前版本故意不做）
 
 - **仅 TCP**。UDP 映射（DNS / QUIC / 游戏）未实现。
-- **无 HTTP 层能力**。不做按 `Host` 头分流、不做 TLS 终止、不管路径。
-  做这些请在前面放 nginx/caddy。
+- **隧道本身无 HTTP 层能力**。隧道不做按 `Host` 分流、不做 TLS 终止、不管路径。
+  需要「同一端口按域名分到本机不同服务」时，用进程内插件 `esc.edge-router`
+  （见 [`docs/EDGE-ROUTER.md`](./docs/EDGE-ROUTER.md)）；TLS 终止仍建议放在前面
+  （nginx / caddy），该插件只做 HTTP/1.1 明文转发、**不支持 WebSocket**。
 - **单 Hub**。没有 Hub 之间的高可用与状态同步；Hub 是单点。
 - **无权流量统计 / 限速**。目前只有日志里的字节数。
 - **一个服务一个端口**。同一个 public 端口不能按域名分给多个 spoke。
@@ -265,6 +269,7 @@ crates/
   esc-engine/        可编程内核：动态端口绑定 / 注册表 / 映射表 / 计数管道
   esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
   esc-plugin-tunnel/ 进程内插件：把引擎注册进宿主的 Ctx
+  esc-plugin-edge-router/  进程内插件：按域名前缀把请求分到本机不同端口
   esc-plugin-tunnel-panel/  子进程插件：axum + 单文件前端，只认契约
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）

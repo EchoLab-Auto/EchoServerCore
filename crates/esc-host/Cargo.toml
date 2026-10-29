@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 esc-control-api = { workspace = true }
 esc-plugin-tunnel = { workspace = true }
+esc-plugin-edge-router = { workspace = true }
 echo-context = { workspace = true }
 echo-plugin = { workspace = true }
 echo-plugin-host = { workspace = true }

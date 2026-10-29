@@ -1,0 +1,30 @@
+[package]
+name = "esc-plugin-edge-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP edge router as an in-process plugin (domain prefix -> local port)"
+
+[dependencies]
+esc-control-api = { workspace = true }
+echo-context = { workspace = true }
+echo-plugin = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+echo-context = { workspace = true }
+echo-plugin = { workspace = true }

@@ -1,12 +1,14 @@
 //! 宿主（组合根）的组装逻辑。
 //!
-//! 这个 crate 只做四件事，**不认识隧道协议，也不认识 HTTP**：
+//! 这个 crate 只做这几件事，**不认识隧道协议，也不认识 HTTP**：
 //!
 //! 1. 建 [`Ctx`]（服务定位器）；
 //! 2. 挂载进程内插件 `esc.tunnel` → 它把 `Arc<dyn TunnelControl>` 放进 `Ctx`；
-//! 3. 注册宿主服务 `esc.control` → 把子进程插件的 `HostCall` 转成对上面那个
+//! 3. 按需挂载进程内插件 `esc.edge-router` → 按域名前缀把本机端口分开
+//!    （`[edge_router] enabled = true` 才挂）；
+//! 4. 注册宿主服务 `esc.control` → 把子进程插件的 `HostCall` 转成对上面那个
 //!    服务的 `dispatch(ControlRequest)` 调用；
-//! 4. 用 `PluginSupervisor` 拉起子进程插件 `esc.tunnel-panel`，退出时优雅排空。
+//! 5. 用 `PluginSupervisor` 拉起子进程插件 `esc.tunnel-panel`，退出时优雅排空。
 //!
 //! ```text
 //!   浏览器 ──▶ esc-panel（子进程，axum）
@@ -39,10 +41,13 @@ use tracing::{error, info, warn};
 use esc_control_api::{
     dispatch, ControlError, ControlRequest, ControlResponse, TunnelControl, CONTROL_SERVICE,
 };
+use esc_plugin_edge_router::{EdgeRouterControl, EdgeRouterPlugin};
 use esc_plugin_tunnel::TunnelPlugin;
 
 /// 隧道插件在注册表里的 id。
 pub const TUNNEL_PLUGIN_ID: &str = "esc.tunnel";
+/// 边缘路由插件的 id。默认**不挂载**（要绑端口，必须显式开启）。
+pub const EDGE_ROUTER_PLUGIN_ID: &str = esc_plugin_edge_router::PLUGIN_ID;
 /// 隧道面板插件的 id（与面板 `Hello` 里的 plugin_id 一致）。
 ///
 /// 名字对齐 crate：`esc-plugin-tunnel-panel` ↔ `esc.tunnel-panel`。
@@ -59,6 +64,31 @@ pub struct HostConfig {
     pub engine: toml::Value,
     #[serde(default)]
     pub panel: PanelSection,
+    /// 边缘路由（域名前缀 → 本机端口）。默认关闭：它要监听端口，不能"默认打开"。
+    #[serde(default)]
+    pub edge_router: EdgeRouterSection,
+}
+
+/// `[edge_router]` 段。
+///
+/// 这里只保留宿主真正需要的两项（开关 + 透传给插件的配置），路由表的具体
+/// schema 由插件自己定义 —— 宿主不认识 `routes` / `default_port`，加字段
+/// 不用改这里。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EdgeRouterSection {
+    /// 关掉它（默认）就完全不挂载该插件，也不占用任何端口。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 原样透传给插件（`listen` / `routes` / `default_port` / `timeout_ms`）。
+    #[serde(default = "empty_table")]
+    pub config: toml::Value,
+}
+
+// `toml::Value` 没有 `Default`，所以手写一个（空表 = "本段没写"）。
+impl Default for EdgeRouterSection {
+    fn default() -> Self {
+        Self { enabled: false, config: empty_table() }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +146,10 @@ impl HostConfig {
     fn panel_json(&self) -> Value {
         toml_to_json(&self.panel.config)
     }
+
+    fn edge_router_json(&self) -> Value {
+        toml_to_json(&self.edge_router.config)
+    }
 }
 
 fn toml_to_json(v: &toml::Value) -> Value {
@@ -168,6 +202,7 @@ pub struct Host {
     registry: PluginRegistry,
     panel: Option<PluginHandle>,
     control: Arc<dyn TunnelControl>,
+    edge_router: Option<Arc<dyn EdgeRouterControl>>,
 }
 
 impl Host {
@@ -182,6 +217,16 @@ impl Host {
             .register(tunnel)
             .map_err(|e| anyhow::anyhow!("无法注册隧道插件: {e}"))?;
         registry.set_config(TUNNEL_PLUGIN_ID, cfg.engine_json());
+
+        // 边缘路由按需注册：没 enabled 就完全不存在（不注册 → 不挂载 → 不占端口）。
+        if cfg.edge_router.enabled {
+            let router: Arc<dyn Plugin> = Arc::new(EdgeRouterPlugin::new());
+            registry
+                .register(router)
+                .map_err(|e| anyhow::anyhow!("无法注册边缘路由插件: {e}"))?;
+            registry.set_config(EDGE_ROUTER_PLUGIN_ID, cfg.edge_router_json());
+        }
+
         let errors = registry.mount_all(&MountContext::new().with_ctx(Arc::clone(&ctx)));
         if let Some((id, why)) = errors.first() {
             anyhow::bail!("插件 {id} 挂载失败: {why}");
@@ -190,6 +235,23 @@ impl Host {
 
         let control = esc_plugin_tunnel::resolve(&ctx)
             .map_err(|e| anyhow::anyhow!("隧道服务不可用: {}", e.message))?;
+
+        let edge_router = if cfg.edge_router.enabled {
+            let ctl = esc_plugin_edge_router::resolve(&ctx)
+                .map_err(|e| anyhow::anyhow!("边缘路由服务不可用: {}", e.message))?;
+            match ctl.status().await {
+                Ok(st) => info!(
+                    listen = %st.listens.join(","),
+                    routes = st.routes.len(),
+                    default_port = ?st.default_port,
+                    "edge router ready"
+                ),
+                Err(e) => warn!("边缘路由已挂载但状态不可读: {}", e.message),
+            }
+            Some(ctl)
+        } else {
+            None
+        };
 
         let supervisor = PluginSupervisor::new();
         supervisor
@@ -221,7 +283,7 @@ impl Host {
             info!("panel disabled; tunnel-only mode");
         }
 
-        Ok(Self { ctx, registry, panel, control })
+        Ok(Self { ctx, registry, panel, control, edge_router })
     }
 
     /// 控制面句柄（测试与嵌入式用法）。
@@ -231,6 +293,16 @@ impl Host {
 
     pub fn panel(&self) -> Option<&PluginHandle> {
         self.panel.as_ref()
+    }
+
+    /// 边缘路由控制面（未启用 `[edge_router]` 时为 `None`）。
+    ///
+    /// 暴露出来的动机：面板将来要显示"哪个域名去了哪个端口"，它需要这个句柄。
+    /// 现在没有调用方，但它是**契约的一部分**（服务已注册在 Ctx 里），所以
+    /// 保留并 `#[allow(dead_code)]`，而不是等到要用时再改公共 API。
+    #[allow(dead_code)]
+    pub fn edge_router(&self) -> Option<Arc<dyn EdgeRouterControl>> {
+        self.edge_router.as_ref().map(Arc::clone)
     }
 
     /// 优雅收尾：先控制面（面板），后数据面（隧道）。
@@ -474,5 +546,47 @@ mod tests {
     fn error_message_points_at_the_usage() {
         let err = parse_args(["--nope"]).unwrap_err();
         assert!(err.contains("用法"), "错误信息应带用法：{err}");
+    }
+
+    // ── [edge_router] 段 ────────────────────────────────────────────────
+
+    #[test]
+    fn edge_router_is_off_unless_explicitly_enabled() {
+        // 默认关闭是刻意的：这个插件要 bind 端口（可能是 :80），不能"默认打开"。
+        let cfg = HostConfig::parse("[panel]\nenabled = false\n").unwrap();
+        assert!(!cfg.edge_router.enabled);
+        // 关闭时配置原样是空表 —— 宿主不认识路由表 schema，不做任何猜测。
+        assert_eq!(cfg.edge_router_json(), Value::Object(Default::default()));
+    }
+
+    #[test]
+    fn edge_router_section_is_passed_through_verbatim() {
+        let cfg = HostConfig::parse(
+            r#"
+[panel]
+enabled = false
+
+[edge_router]
+enabled = true
+
+[edge_router.config]
+listen = ["0.0.0.0:2229"]
+
+[edge_router.config.routes]
+cad = 2228
+panel = 8080
+"#,
+        )
+        .unwrap();
+        assert!(cfg.edge_router.enabled);
+        let json = cfg.edge_router_json();
+        assert_eq!(json["listen"][0], "0.0.0.0:2229");
+        assert_eq!(json["routes"]["cad"], 2228);
+        assert_eq!(json["routes"]["panel"], 8080);
+        // 透传的东西能被插件自己的 schema 解析（这里做一次端到端校验）。
+        let parsed = esc_plugin_edge_router::RouterConfig::from_json(&json)
+            .expect("宿主透传的形状必须能被插件解析");
+        assert_eq!(parsed.listen, vec!["0.0.0.0:2229"]);
+        assert_eq!(parsed.routes.get("cad"), Some(&2228));
     }
 }

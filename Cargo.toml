@@ -12,6 +12,7 @@ members = [
     "crates/esc-cli",
     "crates/esc-plugin-tunnel",
     "crates/esc-plugin-tunnel-panel",
+    "crates/esc-plugin-edge-router",
     "crates/esc-host",
 
 ]
@@ -54,6 +55,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json",
 
 # ── Web / 插件化 ─────────────────────────────────────────────────────
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+# 反向代理需要 http client：axum 只带 server 侧。hyper-util 的 legacy client
+# 是 hyper 1.x 官方推荐的入门客户端（连接池 + keep-alive 都现成）。
+hyper = { version = "1.12", default-features = false, features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 # 插件框架：宿主 / 插件契约 / 插件侧运行时。
 #
 # 钉在 tag 上（框架 README 的推荐做法）。`v0.11.1` = commit a16b3e5，记在这里
@@ -76,6 +81,7 @@ esc-server-panel = { path = "crates/esc-server-panel" }
 esc-gateway = { path = "crates/esc-gateway" }
 esc-engine = { path = "crates/esc-engine" }
 esc-plugin-tunnel = { path = "crates/esc-plugin-tunnel" }
+esc-plugin-edge-router = { path = "crates/esc-plugin-edge-router" }
 esc-hub = { path = "crates/esc-hub" }
 esc-spoke = { path = "crates/esc-spoke" }
 

@@ -621,6 +621,7 @@ dependencies = [
  "echo-plugin-host",
  "esc-common",
  "esc-control-api",
+ "esc-plugin-edge-router",
  "esc-plugin-tunnel",
  "serde",
  "serde_json",
@@ -647,6 +648,23 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "esc-plugin-edge-router"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "echo-context",
+ "echo-plugin",
+ "esc-control-api",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "tokio",

@@ -53,6 +53,8 @@ crates/
       pipe.rs        带计数的双向搬运（替代 copy_bidirectional）
   esc-control-api/   ★ 新增：控制面契约（DTO + 方法名 + 信封 + trait）
   esc-plugin-tunnel/ ★ 新增：进程内插件，把引擎注册进 Ctx
+  esc-plugin-edge-router/
+                     ★ 新增：进程内插件，按域名前缀把请求分到本机不同端口
   esc-panel-auth/    ★ 新增：两个面板共用的访问控制（Basic + 白名单 + 限速）
   esc-plugin-tunnel-panel/
                      ★ 新增：子进程插件，端口映射面板（HTTP + 单页前端，:2223）
@@ -71,6 +73,7 @@ esc-cli ──▶ esc-hub / esc-spoke ──▶ esc-engine ──▶ esc-common
                                               └──▶ esc-control-api
 
 esc-host ──▶ esc-plugin-tunnel ──▶ esc-engine
+        ├──▶ esc-plugin-edge-router ──▶ esc-control-api   ← 不认识隧道
         └──▶ esc-control-api
 
 esc-plugin-tunnel-panel ──▶ esc-control-api      ← 没有 esc-engine（物理隔离）
@@ -202,6 +205,7 @@ spoke 只读 `local`。
 | Cargo crate / 目录 | 框架 manifest id | 二进制 | 形态 |
 |---|---|---|---|
 | `esc-plugin-tunnel` | `esc.tunnel` | （无，进程内） | `esc-host` 的进程内插件 |
+| `esc-plugin-edge-router` | `esc.edge-router` | （无，进程内） | `esc-host` 的进程内插件（默认不挂载） |
 | `esc-plugin-tunnel-panel` | `esc.tunnel-panel` | `esc-plugin-tunnel-panel` | `esc-host` 的子进程插件 |
 | —（不是插件） | — | `esc-server-panel` | 独立 systemd 服务 |
 | —（不是插件） | — | `esc-gateway` | 独立服务（也可跑在 Docker 里） |
