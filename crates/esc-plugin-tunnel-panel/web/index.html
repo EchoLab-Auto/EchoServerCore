@@ -194,10 +194,7 @@
       <div class="empty" id="edge-empty" hidden>还没有路由。点右上角「新建路由」加一条。</div>
 
       <div class="grid" id="edge-counters" style="margin-top:12px"></div>
-      <div class="hint" style="margin-top:10px">
-        改这里只影响<strong>运行时</strong>：重启 <code>esc-host</code> 会回到
-        <code>host.toml</code> 里那份路由表。持久化请改配置文件。
-      </div>
+      <div class="hint" id="edge-store-hint" style="margin-top:10px"></div>
     </div>
   </div>
 
@@ -496,6 +493,22 @@
       cell.appendChild(el("div", "k", "兜底端口"));
       cell.appendChild(el("div", "v", String(st.default_port)));
       box.appendChild(cell);
+    }
+
+    // 持久化状态：这条提示比文档重要 —— 它决定用户"改完能不能不管"。
+    const hint = $("#edge-store-hint");
+    hint.replaceChildren();
+    if (st.store) {
+      hint.appendChild(document.createTextNode("改动会写入状态文件 "));
+      hint.appendChild(el("code", null, st.store));
+      hint.appendChild(document.createTextNode("，重启后仍在。想回到 host.toml 的基线：删掉该文件后重启 esc-host。"));
+    } else {
+      hint.appendChild(document.createTextNode("这台机器没配 store：改动只影响"));
+      const b = el("strong", null, "运行时");
+      hint.appendChild(b);
+      hint.appendChild(document.createTextNode("，重启 esc-host 会回到 host.toml 里那份路由表。"));
+      hint.appendChild(document.createElement("br"));
+      hint.appendChild(document.createTextNode("要持久化，在 host.toml 的 [edge_router.config] 里加 store = \"/var/lib/esc/edge-routes.toml\"。")); 
     }
   }
 

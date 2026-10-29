@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -39,6 +39,7 @@ use esc_control_api::{
 
 use crate::config::RouterConfig;
 use crate::control::Counters;
+use crate::store::RouteStore;
 
 /// 跳过的逐跳首部（RFC 9110 §7.6.1）。转发时两端都不该带。
 const HOP_BY_HOP: [&str; 8] = [
@@ -114,6 +115,16 @@ pub fn first_label(host: &str) -> Option<String> {
 /// 要引入新依赖，收益不明显。
 pub struct EdgeRouter {
     routes: RwLock<BTreeMap<String, u16>>,
+    /// 路由变更的串行化闸门。
+    ///
+    /// 变更流程是「读当前表 → 算新表 → 写盘 → 替换内存」，中间不能在锁内做
+    /// 磁盘 IO（会卡住所有转发读路径）。所以用一把独立的 Mutex 串行化整个
+    /// 序列，而不是靠 `RwLock` 的写锁 —— 后者只保护最后一步替换。
+    ///
+    /// 路由增删是人工低频操作（面板点一下），一把 Mutex 的代价可以忽略。
+    write_gate: Mutex<()>,
+    /// 状态文件；`None` = 运行期改动不落盘（重启回基线）。
+    store: Option<RouteStore>,
     default_port: Option<u16>,
     client: Client<HttpConnector, Body>,
     timeout: Option<Duration>,
@@ -122,6 +133,24 @@ pub struct EdgeRouter {
 }
 
 impl EdgeRouter {
+    /// 构造并把状态文件叠加到基线路由之上。
+    ///
+    /// **所有生产路径都该用这个**，而不是 [`Self::new`] —— 否则状态文件里的
+    /// 改动会在重启后失效（正是持久化要解决的问题）。`new` 保留给"明确不要
+    /// 读盘"的场景（单元测试、只读检查）。
+    pub fn load(cfg: &RouterConfig, listens: Vec<SocketAddr>) -> Result<Arc<Self>, ControlError> {
+        let mut effective = cfg.clone();
+        if let Some(path) = &cfg.store {
+            // 有就用它（**整体覆盖**基线，不是合并——否则被删掉的基线条目会
+            // "复活"，用户永远删不干净）；没有就保持基线。
+            if let Some(saved) = RouteStore::new(path).load()? {
+                effective.routes = saved;
+            }
+        }
+        Ok(Self::new(&effective, listens))
+    }
+
+    /// 不读状态文件，直接用 `cfg.routes` 构造。写入与状态上报仍会带上 `store`。
     pub fn new(cfg: &RouterConfig, listens: Vec<SocketAddr>) -> Arc<Self> {
         let mut connector = HttpConnector::new();
         // 只连 127.0.0.1 —— 这个插件的定位是"把域名指到本机端口"，不是
@@ -134,6 +163,8 @@ impl EdgeRouter {
 
         Arc::new(Self {
             routes: RwLock::new(cfg.routes.clone()),
+            write_gate: Mutex::new(()),
+            store: cfg.store.clone().map(RouteStore::new),
             default_port: cfg.default_port,
             client,
             timeout: (cfg.timeout_ms > 0).then(|| Duration::from_millis(cfg.timeout_ms)),
@@ -197,20 +228,40 @@ impl EdgeRouter {
         if port == 0 {
             return Err(ControlError::invalid("端口不能是 0"));
         }
-        self.routes
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(prefix.clone(), port);
+
+        // 串行化「读-改-写盘-替换」全过程，避免两个并发变更互相覆盖。
+        let _gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = self.routes.read().unwrap_or_else(|e| e.into_inner()).clone();
+        next.insert(prefix.clone(), port);
+
+        // **先落盘、再改内存**：这样"返回成功"永远意味着内存与磁盘都生效。
+        // 反过来的话（先改内存再写盘），写盘失败时调用方看到 Err 而运行期
+        // 已经改了 —— 面板显示失败、实际却生效，是最难排查的一类错觉。
+        if let Some(store) = &self.store {
+            store.save(&next)?;
+        }
+        *self.routes.write().unwrap_or_else(|e| e.into_inner()) = next;
         Ok(EdgeRoute { prefix, port })
     }
 
     pub fn delete_route(&self, prefix: &str) -> Result<(), ControlError> {
         let prefix = prefix.trim().to_ascii_lowercase();
-        let removed = self.routes.write().unwrap_or_else(|e| e.into_inner()).remove(&prefix);
-        match removed {
-            Some(_) => Ok(()),
-            None => Err(ControlError::not_found(format!("没有这个前缀：{prefix}"))),
+
+        let _gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = self.routes.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if next.remove(&prefix).is_none() {
+            return Err(ControlError::not_found(format!("没有这个前缀：{prefix}")));
         }
+        if let Some(store) = &self.store {
+            store.save(&next)?;
+        }
+        *self.routes.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
+    }
+
+    /// 状态文件路径（面板据此告诉用户"改动会不会活过重启"）。
+    pub fn store_path(&self) -> Option<&std::path::Path> {
+        self.store.as_ref().map(RouteStore::path)
     }
 
     pub fn default_port(&self) -> Option<u16> {
@@ -234,6 +285,10 @@ impl EdgeRouter {
             listens: self.listens.iter().map(|a| a.to_string()).collect(),
             routes: self.routes(),
             default_port: self.default_port,
+            store: self
+                .store
+                .as_ref()
+                .map(|s| s.path().display().to_string()),
             counters: self.counters.snapshot(),
         }
     }
@@ -806,6 +861,7 @@ mod tests {
             routes: routes.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             default_port: default,
             timeout_ms: 5_000,
+            store: None,
         };
         EdgeRouter::new(&cfg, vec![])
     }

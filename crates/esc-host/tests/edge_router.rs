@@ -207,3 +207,176 @@ shop = {backend_shop}
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+/// 持久化：真二进制 + 真 TOML + 真状态文件，重启一次验证路由还在。
+///
+/// 这条测的是**宿主接线**（`[edge_router.config] store` 被透传、插件 mount 时
+/// 读它），不是插件内部逻辑（那有单测与组件级集成测试守着）。
+#[test]
+fn routes_persist_across_restart_when_store_is_set() {
+
+    let dir = temp_dir("persist");
+    let store = dir.join("edge-routes.toml");
+    let edge_port = free_port();
+    let backend_cad = spawn_backend("cad-backend");
+
+    // 证书（隧道插件是必挂的）
+    let ca = esc_common::pki::Ca::generate("persist-ca", 2).unwrap();
+    let ca_path = esc_common::pki::write_ca_cert(&dir, "ca", &ca).unwrap();
+    let pair = ca.issue_server("hub", &["127.0.0.1".to_string()], 1).unwrap();
+    let (cert, key) = esc_common::pki::write_pair(&dir, "hub", &pair).unwrap();
+    let engine = dir.join("engine.toml");
+    std::fs::write(
+        &engine,
+        format!(
+            "role = \"hub\"\nstore = \"{}\"\n\n[hub]\nlisten = \"127.0.0.1:0\"\n\n[tls]\nca_cert = \"{}\"\ncert = \"{}\"\nkey = \"{}\"\n",
+            dir.join("mappings.toml").display(),
+            ca_path.display(),
+            cert.display(),
+            key.display()
+        ),
+    )
+    .unwrap();
+
+    let host_cfg = dir.join("host.toml");
+    std::fs::write(
+        &host_cfg,
+        format!(
+            "[engine]\nconfig = \"{engine}\"\n\n[panel]\nenabled = false\n\n[edge_router]\nenabled = true\n\n[edge_router.config]\nlisten = [\"127.0.0.1:{edge_port}\"]\nstore = \"{store}\"\n\n[edge_router.config.routes]\ncad = {backend_cad}\n",
+            engine = engine.display(),
+            edge_port = edge_port,
+            store = store.display(),
+            backend_cad = backend_cad,
+        ),
+    )
+    .unwrap();
+
+    let log_path = dir.join("host.log");
+    let spawn_host = || {
+        let log = std::fs::File::create(&log_path).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_esc-host"))
+            .arg("-c")
+            .arg(&host_cfg)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("esc-host 应当能启动")
+    };
+
+    // ── 第一代：基线只有 cad ──
+    let mut child = spawn_host();
+    wait_for_log(&log_path, "边缘路由就绪", |t| t.contains("edge router mounted"));
+    assert!(http_get(edge_port, "cad.x.com", "/").contains("cad-backend"));
+
+    // 通过面板那个 HostCall 链路改路由？宿主这里没起面板，所以直接改状态文件
+    // 模拟"面板改过"—— 这不弱化测试价值：真正要验的是"启动时读状态文件"。
+    std::fs::write(
+        &store,
+        "[routes]\ncad = 2229\nshop = 2230\n",
+    )
+    .unwrap();
+
+    // 让状态文件**先于**进程退出，然后重启
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // ── 第二代：必须读到状态文件，而不是 TOML 基线 ──
+    std::fs::remove_file(&log_path).ok();
+    let mut child = spawn_host();
+    let text = wait_for_log(&log_path, "第二次启动", |t| t.contains("edge router mounted"));
+    assert!(
+        text.contains("from_store=true") || text.contains("路由表来自状态文件"),
+        "日志应说明路由来自状态文件：\n{text}"
+    );
+    // cad 现在指向 2229（没人监听）→ 502；说明用的是状态文件里的端口，不是 2228 基线
+    let resp = http_get(edge_port, "cad.x.com", "/");
+    assert!(
+        resp.contains("502") && resp.contains("2229"),
+        "应使用状态文件里的 cad=2229：{resp}"
+    );
+    // shop 也来自状态文件（基线的 TOML 里根本没有它）
+    let resp = http_get(edge_port, "shop.x.com", "/");
+    assert!(resp.contains("502") && resp.contains("2230"), "shop 应来自状态文件：{resp}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 删掉状态文件 → 回到 TOML 基线（回滚路径）。
+#[test]
+fn deleting_the_store_file_returns_to_the_baseline() {
+    let dir = temp_dir("rollback");
+    let store = dir.join("edge-routes.toml");
+    let edge_port = free_port();
+    let backend = spawn_backend("base-backend");
+
+    let ca = esc_common::pki::Ca::generate("rollback-ca", 2).unwrap();
+    let ca_path = esc_common::pki::write_ca_cert(&dir, "ca", &ca).unwrap();
+    let pair = ca.issue_server("hub", &["127.0.0.1".to_string()], 1).unwrap();
+    let (cert, key) = esc_common::pki::write_pair(&dir, "hub", &pair).unwrap();
+    let engine = dir.join("engine.toml");
+    std::fs::write(
+        &engine,
+        format!(
+            "role = \"hub\"\nstore = \"{}\"\n\n[hub]\nlisten = \"127.0.0.1:0\"\n\n[tls]\nca_cert = \"{}\"\ncert = \"{}\"\nkey = \"{}\"\n",
+            dir.join("mappings.toml").display(),
+            ca_path.display(),
+            cert.display(),
+            key.display()
+        ),
+    )
+    .unwrap();
+
+    // 状态文件故意指向一个没人监听的端口，基线指向真后端
+    std::fs::write(&store, "[routes]\ncad = 1\n").unwrap();
+    let host_cfg = dir.join("host.toml");
+    std::fs::write(
+        &host_cfg,
+        format!(
+            "[engine]\nconfig = \"{engine}\"\n\n[panel]\nenabled = false\n\n[edge_router]\nenabled = true\n\n[edge_router.config]\nlisten = [\"127.0.0.1:{edge_port}\"]\nstore = \"{store}\"\n\n[edge_router.config.routes]\ncad = {backend}\n",
+            engine = engine.display(),
+            edge_port = edge_port,
+            store = store.display(),
+            backend = backend,
+        ),
+    )
+    .unwrap();
+
+    let log_path = dir.join("host.log");
+    let spawn_host = || {
+        let log = std::fs::File::create(&log_path).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_esc-host"))
+            .arg("-c")
+            .arg(&host_cfg)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("esc-host 应当能启动")
+    };
+
+    // 第一代：状态文件生效（502，端口 1）
+    let mut child = spawn_host();
+    wait_for_log(&log_path, "就绪", |t| t.contains("edge router mounted"));
+    assert!(http_get(edge_port, "cad.x.com", "/").contains("502"));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 删掉状态文件 → 恢复到基线（200，真后端）
+    std::fs::remove_file(&store).unwrap();
+    std::fs::remove_file(&log_path).ok();
+    let mut child = spawn_host();
+    wait_for_log(&log_path, "第二次启动", |t| t.contains("edge router mounted"));
+    let resp = http_get(edge_port, "cad.x.com", "/");
+    assert!(
+        resp.contains("200") && resp.contains("base-backend"),
+        "删掉状态文件后应回到 TOML 基线：{resp}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

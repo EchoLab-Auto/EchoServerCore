@@ -43,9 +43,11 @@ use esc_control_api::ControlError;
 pub mod config;
 pub mod control;
 pub mod router;
+pub mod store;
 
 pub use config::RouterConfig;
 pub use control::Counters;
+pub use store::RouteStore;
 pub use router::{bind, first_label, spawn, EdgeRouter, Resolution, ServerHandle};
 
 // 契约类型从 `esc-control-api` 重新导出：调用方只 `use esc_plugin_edge_router::…`
@@ -120,7 +122,17 @@ impl Plugin for EdgeRouterPlugin {
             .map(|a| a.to_string())
             .collect();
 
-        let edge = EdgeRouter::new(&cfg, listeners.iter().filter_map(|l| l.local_addr().ok()).collect());
+        // `load` 会把状态文件叠加到基线路由之上；读失败 fail-closed ——
+        // 内容坏了不能装作没看见，否则用户会以为改动还在，直到某次重启后消失。
+        let binds: Vec<std::net::SocketAddr> =
+            listeners.iter().filter_map(|l| l.local_addr().ok()).collect();
+        let from_store = cfg
+            .store
+            .as_ref()
+            .map(|p| RouteStore::new(p).load().ok().flatten().is_some())
+            .unwrap_or(false);
+        let edge = EdgeRouter::load(&cfg, binds)
+            .map_err(|e| PluginMountError::Mount(format!("边缘路由无法加载路由表: {}", e.message)))?;
         let handle = router::spawn(Arc::clone(&edge), listeners)
             .map_err(|e| PluginMountError::Mount(format!("edge router 启动失败: {}", e.message)))?;
 
@@ -148,8 +160,13 @@ impl Plugin for EdgeRouterPlugin {
             listen = %addrs.join(","),
             routes = routes.len(),
             default_port = ?cfg.default_port,
+            store = cfg.store.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无，改动不落盘）".into()),
+            from_store,
             "edge router mounted"
         );
+        if from_store {
+            info!("路由表来自状态文件（覆盖了 host.toml 里的基线）");
+        }
         for r in &routes {
             info!(prefix = %r.prefix, port = r.port, "  edge route");
         }

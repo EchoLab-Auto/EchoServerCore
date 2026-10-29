@@ -7,6 +7,7 @@
 //! [edge_router]
 //! enabled = true
 //! listen  = ["0.0.0.0:2229", "0.0.0.0:80"]
+//! store   = "/var/lib/esc/edge-routes.toml"   # 可选：运行期改动的落盘位置
 //!
 //! [edge_router.routes]
 //! cad   = 2228                     # cad.任意域名      -> 127.0.0.1:2228
@@ -19,6 +20,7 @@
 //! 一个"起来了但什么都不转发"的边缘路由比没起来更难查。
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use esc_control_api::ControlError;
 use serde::Deserialize;
@@ -55,6 +57,12 @@ pub struct RouterConfig {
     pub default_port: Option<u16>,
     /// 转发超时（毫秒）。0 表示不设超时（长下载）。
     pub timeout_ms: u64,
+    /// 路由表的**状态文件**路径（可选）。
+    ///
+    /// 配了它，运行期经面板/控制面的增删就会落盘，重启后仍在；没配则改动只活
+    /// 在内存里，重启回到 `routes` 的基线。为什么是独立文件而不是回写
+    /// `host.toml` —— 见 [`crate::store`] 的模块注释。
+    pub store: Option<PathBuf>,
 }
 
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
@@ -77,6 +85,8 @@ struct RawConfig {
     default_port: Option<u16>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    store: Option<String>,
 }
 
 impl RouterConfig {
@@ -128,11 +138,20 @@ impl RouterConfig {
             return Err(ControlError::invalid("edge_router.default_port 不能是 0"));
         }
 
+        // 状态文件路径：空字符串按"未配置"处理（写成 `store = ""` 不该
+        // 变成"把路由写到当前目录下一个叫空名的文件"）。
+        let store = raw
+            .store
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Ok(Self {
             listen,
             routes,
             default_port: raw.default_port,
             timeout_ms: raw.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+            store,
         })
     }
 }

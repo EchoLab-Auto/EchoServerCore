@@ -80,6 +80,42 @@ pub trait EdgeRouteControl: Send + Sync + 'static {
 
 宿主侧取用：`Host::edge_router()`（未启用时为 `None`）。
 
+### 持久化：状态文件（可选）
+
+配了 `store` 之后，运行期的增删会落盘，重启仍在：
+
+```toml
+[edge_router.config]
+listen = ["0.0.0.0:2229"]
+store  = "/var/lib/esc/edge-routes.toml"   # 可选
+```
+
+**为什么不是回写 `host.toml`**（这是设计取舍，不是省事）：
+
+1. `esc-host.service` 有 `ReadOnlyPaths=/etc/esc`。放开它等于放弃"配置只读"这条边界；
+2. TOML 解析再序列化会丢掉人写的注释与排版 —— 配置文件是给人看的；
+3. 改坏了配置，服务可能起不来；而状态文件坏了，删掉它就回到基线。
+
+**分层语义**：`host.toml` 里的 `routes` 是**基线**，状态文件**整体覆盖**它
+（不是合并 —— 否则被删掉的基线条目会"复活"，用户永远删不干净）。
+
+```console
+$ cat /var/lib/esc/edge-routes.toml
+# 由 esc.edge-router 在运行期写入（面板或控制面增删路由时）。
+#
+# 优先级：本文件**整体覆盖** host.toml 里的 [edge_router.config.routes]。
+# 回到配置文件的基线：删掉本文件，然后重启 esc-host。
+...
+[routes]
+cad = 2228
+```
+
+- 启动时日志会标出来源：`store=... from_store=true`（覆盖了基线）
+- **想回到基线**：删掉状态文件 → 重启 `esc-host`
+- 状态文件内容坏了 → **挂载失败**（fail-closed），错误里给出"删掉它回基线"的补救办法。不静默回退，否则用户会以为自己的改动还在，直到某次重启后消失
+- 写盘是 `临时文件 → fsync → rename` 的原子替换；`upsert`/`delete` 的顺序是**先落盘、再改内存**，所以"返回成功"永远意味着内存与磁盘都生效（写盘失败时内存也不变，避免"面板显示失败、实际却生效"）
+- 没配 `store` 时改动只在内存里，`/api/edge` 的 `store` 字段是 `null`，面板据此提示
+
 ### 跨进程：`HostCall("esc.edge", …)`
 
 子进程插件（面板）经宿主服务调同一组能力：
@@ -179,7 +215,7 @@ $ curl -s -H 'Host: nope.example.com' http://127.0.0.1:2229/
 | --- | --- |
 | 只做 HTTP/1.1 | 没有 HTTP/2、没有 TLS 终结。要 HTTPS 就在前面放一层（见下）。 |
 | 只连本机 | 目标恒为 `127.0.0.1:<port>`，不是通用出网代理（顺手关掉了 SSRF 面）。 |
-| 路由表不持久化 | 运行期 `upsert_route` 只改内存，重启回到 TOML。 |
+| 持久化需显式配置 | 没配 `store` 时运行期改动只在内存里（这是刻意的：默认不写盘）。 |
 | 升级协商超时不可配 | 固定 15s（`UPGRADE_NEGOTIATION_TIMEOUT`）。它不该跟普通请求的 5 分钟共用。 |
 
 ### WebSocket / Upgrade（v2 已支持）

@@ -278,6 +278,12 @@ pub struct EdgeRouterStatus {
     /// 没有前缀的 Host 兜底到哪个端口（`None` = 直接 421）。
     #[serde(default)]
     pub default_port: Option<u16>,
+    /// 运行期改动落盘到哪个状态文件。`None` = 不持久化，重启回到配置文件的基线。
+    ///
+    /// 面板用它来提示"你刚才那条改动会不会活过重启" —— 这是本地/临时改配置
+    /// 与真实部署之间最容易让人困惑的差别，所以放在状态里而不是靠文档。
+    #[serde(default)]
+    pub store: Option<String>,
     #[serde(default)]
     pub counters: EdgeRouterCounters,
 }

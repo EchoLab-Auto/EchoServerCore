@@ -719,6 +719,7 @@ enabled = true
 
 [edge_router.config]
 listen = ["0.0.0.0:2229"]
+store = "/var/lib/esc/edge-routes.toml"
 
 [edge_router.config.routes]
 cad = 2228
@@ -731,10 +732,16 @@ panel = 8080
         assert_eq!(json["listen"][0], "0.0.0.0:2229");
         assert_eq!(json["routes"]["cad"], 2228);
         assert_eq!(json["routes"]["panel"], 8080);
+        assert_eq!(json["store"], "/var/lib/esc/edge-routes.toml");
         // 透传的东西能被插件自己的 schema 解析（这里做一次端到端校验）。
         let parsed = esc_plugin_edge_router::RouterConfig::from_json(&json)
             .expect("宿主透传的形状必须能被插件解析");
         assert_eq!(parsed.listen, vec!["0.0.0.0:2229"]);
         assert_eq!(parsed.routes.get("cad"), Some(&2228));
+        // 宿主不认识 store 的语义，但必须原样透传 —— 否则面板改了路由不会落盘。
+        assert_eq!(
+            parsed.store.as_deref(),
+            Some(std::path::Path::new("/var/lib/esc/edge-routes.toml"))
+        );
     }
 }

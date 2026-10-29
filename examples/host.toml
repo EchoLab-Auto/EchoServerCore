@@ -38,6 +38,9 @@ title  = "隧道面板"
 # # 绑 80 需要 CAP_NET_BIND_SERVICE（见 deploy/esc-host.service）
 # listen = ["0.0.0.0:2229", "0.0.0.0:80"]
 # timeout_ms = 300000
+# # 可选：运行期改动（面板/控制面增删路由）落盘到这里，重启后仍在。
+# # 目录由 systemd 的 StateDirectory=esc 保证可写。删掉本文件即回到下面的基线。
+# store = "/var/lib/esc/edge-routes.toml"
 #
 # [edge_router.config.routes]
 # cad = 2228                       # 前缀匹配：cad.任何域名 → 2228

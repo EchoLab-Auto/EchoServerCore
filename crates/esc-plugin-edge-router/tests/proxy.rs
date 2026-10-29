@@ -53,15 +53,24 @@ async fn start_backend(tag: &'static str) -> u16 {
 
 /// 起一个边缘路由（路由表见参数），返回它的地址 + 句柄。
 fn start_router(routes: &[(&str, u16)], default: Option<u16>) -> (SocketAddr, esc_plugin_edge_router::ServerHandle) {
+    start_router_with_store(routes, default, None)
+}
+
+fn start_router_with_store(
+    routes: &[(&str, u16)],
+    default: Option<u16>,
+    store: Option<&std::path::Path>,
+) -> (SocketAddr, esc_plugin_edge_router::ServerHandle) {
     let cfg = RouterConfig {
         listen: vec!["127.0.0.1:0".into()],
         routes: routes.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<_, _>>(),
         default_port: default,
         timeout_ms: 5_000,
+        store: store.map(|p| p.to_path_buf()),
     };
     let listeners = bind(&cfg).unwrap();
     let addrs: Vec<SocketAddr> = listeners.iter().filter_map(|l| l.local_addr().ok()).collect();
-    let router = EdgeRouter::new(&cfg, addrs.clone());
+    let router = EdgeRouter::load(&cfg, addrs.clone()).expect("加载路由表");
     let handle = spawn(router, listeners).unwrap();
     (handle.addrs()[0], handle)
 }
@@ -481,4 +490,121 @@ mod plugin_level {
         let resp = raw_request(listen, "shop.anywhere.io", "/", "").await;
         assert!(status_line(&resp).contains("421"), "{resp}");
     }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 持久化：面板上的改动能活过重启
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn tmpdir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "esc-edge-persist-{tag}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_edits_survive_a_restart_when_store_is_configured() {
+    let dir = tmpdir("restart");
+    let store = dir.join("edge-routes.toml");
+    let backend = start_backend("A").await;
+
+    // 第一代：基线有一条 cad，运行期加 shop 并删掉 cad 的兄弟条目
+    let (edge1, h1) = start_router_with_store(&[("cad", backend)], None, Some(&store));
+    assert!(body_of(&raw_request(edge1, "cad.x.com", "/", "").await).contains("\"tag\":\"A\""));
+    esc_plugin_edge_router::EdgeRouter::upsert_route(&h1.router(), "shop", backend).unwrap();
+    h1.shutdown().await;
+
+    // 状态文件里应该已经有两条
+    let text = std::fs::read_to_string(&store).unwrap();
+    assert!(text.contains("cad = "), "{text}");
+    assert!(text.contains("shop = "), "{text}");
+
+    // 第二代：**故意给一条不同的基线**（模拟"配置文件没跟着改"）
+    // 生效的必须是状态文件，而不是基线 —— 否则用户的改动等于白做。
+    let (edge2, h2) = start_router_with_store(&[("other", 1)], None, Some(&store));
+    let st = h2.router().snapshot();
+    assert_eq!(st.store.as_deref(), Some(store.to_str().unwrap()));
+    let prefixes: Vec<_> = st.routes.iter().map(|r| r.prefix.as_str()).collect();
+    assert!(prefixes.contains(&"cad"), "状态文件里的 cad 应生效：{st:?}");
+    assert!(prefixes.contains(&"shop"), "状态文件里的 shop 应生效：{st:?}");
+    assert!(!prefixes.contains(&"other"), "基线不该混进来：{st:?}");
+    assert!(body_of(&raw_request(edge2, "shop.x.com", "/", "").await).contains("\"tag\":\"A\""));
+    h2.shutdown().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_store_edits_are_memory_only() {
+    let backend = start_backend("A").await;
+    let (edge, handle) = start_router(&[("cad", backend)], None);
+    esc_plugin_edge_router::EdgeRouter::upsert_route(&handle.router(), "shop", backend).unwrap();
+    assert!(handle.router().snapshot().store.is_none(), "未配 store 应报告 None");
+    assert!(body_of(&raw_request(edge, "shop.x.com", "/", "").await).contains("\"tag\":\"A\""));
+    handle.shutdown().await;
+    // 没有 store 就没有任何文件被创建 —— 不能偷偷写到当前工作目录。
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn save_failure_leaves_memory_untouched() {
+    // 让状态文件指向一个**不可能写入**的路径（父路径是文件而非目录）。
+    let dir = tmpdir("failwrite");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"i am a file, not a dir").unwrap();
+    let store = blocker.join("routes.toml"); // create_dir_all 必然失败
+
+    let backend = start_backend("A").await;
+    // 注意用 `new` 而不是 `load`：`load` 会先读盘，而这个坏路径连读都会失败
+    // （ENOTDIR），那样测到的就是"加载失败"而不是"写盘失败"。本测试要验的是
+    // upsert 的原子性，所以直接构造出"内存正常、store 不可写"的状态。
+    let cfg = RouterConfig {
+        listen: vec!["127.0.0.1:0".into()],
+        routes: [("cad".to_string(), backend)].into_iter().collect(),
+        default_port: None,
+        timeout_ms: 5_000,
+        store: Some(store.clone()),
+    };
+    let listeners = esc_plugin_edge_router::bind(&cfg).unwrap();
+    let addrs: Vec<SocketAddr> = listeners.iter().filter_map(|l| l.local_addr().ok()).collect();
+    let router = EdgeRouter::new(&cfg, addrs);
+    let handle = esc_plugin_edge_router::spawn(router, listeners).unwrap();
+    let edge = handle.addrs()[0];
+
+    let err = esc_plugin_edge_router::EdgeRouter::upsert_route(&handle.router(), "shop", backend)
+        .unwrap_err();
+    assert_eq!(err.kind, esc_control_api::ErrorKind::Other, "{err:?}");
+
+    // 关键：内存里也**没有** shop —— "返回失败"必须意味着"确实没生效"
+    let prefixes: Vec<String> = handle.router().snapshot().routes.iter().map(|r| r.prefix.clone()).collect();
+    assert_eq!(prefixes, vec!["cad".to_string()], "写盘失败不该留下内存改动");
+    assert!(status_line(&raw_request(edge, "shop.x.com", "/", "").await).contains("421"));
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_is_persisted_too() {
+    let dir = tmpdir("delete");
+    let store = dir.join("routes.toml");
+    let backend = start_backend("A").await;
+    let (_edge, handle) =
+        start_router_with_store(&[("cad", backend), ("shop", backend)], None, Some(&store));
+    esc_plugin_edge_router::EdgeRouter::delete_route(&handle.router(), "shop").unwrap();
+    handle.shutdown().await;
+
+    // 重启后 shop 不该回来（这正是"整体覆盖基线"能成立的前提）
+    let (edge2, h2) = start_router_with_store(&[("cad", backend), ("shop", backend)], None, Some(&store));
+    let prefixes: Vec<String> = h2.router().snapshot().routes.iter().map(|r| r.prefix.clone()).collect();
+    assert_eq!(prefixes, vec!["cad".to_string()], "删掉的条目不该被基线复活");
+    assert!(status_line(&raw_request(edge2, "shop.x.com", "/", "").await).contains("421"));
+    h2.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

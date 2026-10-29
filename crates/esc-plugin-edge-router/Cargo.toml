@@ -17,6 +17,7 @@ hyper-util = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 
@@ -24,6 +25,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 echo-context = { workspace = true }
