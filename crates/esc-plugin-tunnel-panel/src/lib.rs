@@ -241,13 +241,17 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/mappings", get(api_list).post(api_create))
         .route("/api/mappings/{id}", post(api_update).delete(api_delete))
         .route("/api/mappings/{id}/enabled", post(api_set_enabled))
+        .route("/api/plugins", get(api_plugins))
         .route("/api/reload", post(api_reload))
         .route("/api/spokes/kick", post(api_kick))
         .route("/api/export", get(api_export))
         // ── 边缘路由（可能不存在：未启用插件时全部返回 501）────────────
         .route("/api/edge", get(api_edge_status))
         .route("/api/edge/routes", post(api_edge_upsert))
-        .route("/api/edge/routes/{prefix}", axum::routing::delete(api_edge_delete))
+        .route(
+            "/api/edge/routes/{prefix}",
+            axum::routing::delete(api_edge_delete),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -286,6 +290,9 @@ async fn api_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError>
     Ok(Json(st.backend.call(method::STATUS, Value::Null).await?))
 }
 
+async fn api_plugins(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(st.backend.call_plugins().await?))
+}
 async fn api_list(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         st.backend.call(method::MAPPING_LIST, Value::Null).await?,
@@ -380,7 +387,9 @@ async fn api_export(
 /// `GET /api/edge`：监听地址 + 路由表 + 计数器（一次拿全，前端只发一个请求）。
 async fn api_edge_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        st.backend.call_edge(method::EDGE_ROUTE_STATUS, Value::Null).await?,
+        st.backend
+            .call_edge(method::EDGE_ROUTE_STATUS, Value::Null)
+            .await?,
     ))
 }
 
@@ -391,13 +400,23 @@ async fn api_edge_upsert(
 ) -> Result<Json<Value>, ApiError> {
     // 在这里做一次形状校验：错误信息能点名"缺哪个字段"，比让引擎返回
     // "bad params for edge.route.upsert" 好读。
-    let prefix = body.get("prefix").and_then(Value::as_str).unwrap_or("").trim();
+    let prefix = body
+        .get("prefix")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     let port = body.get("port").and_then(Value::as_u64);
     if prefix.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 prefix（域名前缀）".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "缺少 prefix（域名前缀）".into(),
+        ));
     }
     let Some(port) = port else {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 port（本机端口）".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "缺少 port（本机端口）".into(),
+        ));
     };
     if port == 0 || port > 65535 {
         return Err(ApiError(

@@ -61,6 +61,21 @@ impl ControlBackend for Mock {
             )),
         }
     }
+
+    async fn call_plugins(&self) -> Result<Value, (StatusCode, String)> {
+        Ok(json!({
+            "schema_version": 1,
+            "host": "esc-host",
+            "framework": "plugin-framework",
+            "context_services": ["esc.tunnel.control"],
+            "host_services": ["esc.control", "esc.plugins"],
+            "plugins": [{
+                "id": "esc.tunnel", "name": "隧道运行时", "version": "1.2.3",
+                "kind": "tunnel", "description": "", "runtime": "in_process",
+                "enabled": true, "mounted": true, "state": "ready", "children": []
+            }]
+        }))
+    }
 }
 
 struct Running {
@@ -606,14 +621,14 @@ impl ControlBackend for EdgeMock {
                 let before = routes.len();
                 routes.retain(|(p, _)| p != prefix);
                 if routes.len() == before {
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        format!("没有这个前缀：{prefix}"),
-                    ));
+                    return Err((StatusCode::NOT_FOUND, format!("没有这个前缀：{prefix}")));
                 }
                 Ok(Value::Null)
             }
-            other => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("unexpected {other}"))),
+            other => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unexpected {other}"),
+            )),
         }
     }
 }
@@ -627,10 +642,17 @@ async fn post_json(addr: &str, path: &str, body: &Value) -> (u16, String) {
 async fn start_edge() -> (String, Arc<EdgeMock>, CancellationToken) {
     let mock = Arc::new(EdgeMock::default());
     let backend: Arc<dyn ControlBackend> = mock.clone();
-    let cfg = PanelConfig { listen: "127.0.0.1:0".into(), auth: None, ..Default::default() };
+    let cfg = PanelConfig {
+        listen: "127.0.0.1:0".into(),
+        auth: None,
+        ..Default::default()
+    };
     let token = CancellationToken::new();
     let panel = Panel::new();
-    let addr = panel.serve(backend, cfg, token.clone()).await.expect("应能绑定");
+    let addr = panel
+        .serve(backend, cfg, token.clone())
+        .await
+        .expect("应能绑定");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (addr, mock, token)
 }
@@ -646,10 +668,20 @@ async fn edge_routes_crud_maps_onto_contract_methods() {
     assert_eq!(st["routes"].as_array().unwrap().len(), 0);
     assert_eq!(st["listens"][0], "0.0.0.0:2229");
     assert_eq!(st["counters"]["upgraded"], 2);
-    assert!(mock.calls.lock().unwrap().iter().any(|(m, _)| m == method::EDGE_ROUTE_STATUS));
+    assert!(mock
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(m, _)| m == method::EDGE_ROUTE_STATUS));
 
     // 新建
-    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"prefix": "cad", "port": 2228})).await;
+    let (code, body) = post_json(
+        &addr,
+        "/api/edge/routes",
+        &json!({"prefix": "cad", "port": 2228}),
+    )
+    .await;
     assert_eq!(code, 200, "{body}");
     let created: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(created["prefix"], "cad");
@@ -692,7 +724,12 @@ async fn edge_upsert_validates_shape_before_calling_backend() {
     assert!(body.contains("port"), "{body}");
 
     // 端口越界
-    let (code, body) = post_json(&addr, "/api/edge/routes", &json!({"prefix": "cad", "port": 0})).await;
+    let (code, body) = post_json(
+        &addr,
+        "/api/edge/routes",
+        &json!({"prefix": "cad", "port": 0}),
+    )
+    .await;
     assert_eq!(code, 400, "{body}");
 
     // 三次都不该打到后端（在面板就被拦下了）
@@ -711,7 +748,11 @@ async fn edge_endpoints_report_501_when_plugin_is_not_enabled() {
     let r = start(None).await;
     for (method, path, body) in [
         ("GET", "/api/edge", None),
-        ("POST", "/api/edge/routes", Some(json!({"prefix": "cad", "port": 2228}))),
+        (
+            "POST",
+            "/api/edge/routes",
+            Some(json!({"prefix": "cad", "port": 2228})),
+        ),
         ("DELETE", "/api/edge/routes/cad", None),
     ] {
         let raw = body.map(|v| v.to_string());
@@ -733,7 +774,13 @@ async fn index_html_ships_the_edge_router_ui() {
     // 前端是一张单页；这块 UI 缺失时接口再好也没人能用。
     let r = start(None).await;
     let (_, body) = common::http(&r.addr, "GET", "/", None, None).await;
-    for needle in ["edge-card", "btn-edge-new", "form-edge", "/api/edge", "边缘路由"] {
+    for needle in [
+        "edge-card",
+        "btn-edge-new",
+        "form-edge",
+        "/api/edge",
+        "边缘路由",
+    ] {
         assert!(body.contains(needle), "页面里应包含 {needle}");
     }
     // 回归：`.inline-form { display: flex }` 会压过 UA 的 `[hidden]`，导致
@@ -742,5 +789,29 @@ async fn index_html_ships_the_edge_router_ui() {
         body.contains("[hidden] { display: none !important; }"),
         "缺少 [hidden] 兜底样式，内联表单会藏不住"
     );
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn plugin_tree_api_and_tab_are_wired() {
+    let r = start(None).await;
+    let (code, body) = common::http(&r.addr, "GET", "/api/plugins", None, None).await;
+    assert_eq!(code, 200, "{body}");
+    let tree: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(tree["plugins"][0]["id"], "esc.tunnel");
+    assert_eq!(tree["plugins"][0]["state"], "ready");
+
+    let (_, page) = common::http(&r.addr, "GET", "/", None, None).await;
+    for needle in [
+        "data-tab=\"plugins\"",
+        "tab-plugins",
+        "btn-plugins-refresh",
+        "/api/plugins",
+        "required_services",
+        "optional_services",
+        "plugin-children",
+    ] {
+        assert!(page.contains(needle), "插件树页面缺少 {needle}");
+    }
     r.token.cancel();
 }

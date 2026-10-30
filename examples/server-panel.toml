@@ -41,3 +41,11 @@ docker_socket = "/var/run/docker.sock"
 allow_actions = true
 allow_create  = true
 allow_delete  = true
+
+# ── 服务器核心插件树（只读）─────────────────────────────────────────────────
+# 服务器面板不是 esc-host 的插件；它通过隧道面板的只读 HTTP 端点获取同一份
+# 插件树快照。这里填面板自身的监听地址，不要填 esc-gateway 的外部端口。
+# plugin_tree_url = "http://127.0.0.1:8787/api/plugins"
+# 隧道面板配置了 auth 时才需要下面这项（注意：不是本文件的 auth）。
+# plugin_tree_auth = "admin:换成隧道面板的口令"
+# 不配也能正常使用其它页签；「插件树」会明确显示未配置，而不是伪造空树。

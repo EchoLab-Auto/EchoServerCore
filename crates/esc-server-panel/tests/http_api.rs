@@ -15,12 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 /// 极简 HTTP/1.1 客户端：`Connection: close` + 读到 EOF，不需要解析 chunked。
-async fn http(
-    addr: &str,
-    method: &str,
-    path: &str,
-    auth: Option<&str>,
-) -> (u16, String) {
+async fn http(addr: &str, method: &str, path: &str, auth: Option<&str>) -> (u16, String) {
     let mut sock = tokio::net::TcpStream::connect(addr)
         .await
         .unwrap_or_else(|e| panic!("connect {addr}: {e}"));
@@ -75,8 +70,8 @@ async fn start(tweak: impl FnOnce(&mut AuthConfig, &mut bool)) -> Running {
         allow_create: allow_actions,
         allow_delete: allow_actions,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
+        plugin_tree: None,
     };
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
@@ -132,16 +127,27 @@ async fn overview_reports_host_fields_and_docker_state() {
 
     let v: serde_json::Value = serde_json::from_str(&body).expect("必须是合法 JSON");
     // 主机部分
-    assert!(v["host"]["hostname"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(v["host"]["hostname"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
     assert!(v["host"]["cpu_count"].as_u64().is_some_and(|n| n >= 1));
-    assert!(v["mem"]["total_bytes"].as_u64().is_some_and(|n| n > 0), "内存总量应有值");
+    assert!(
+        v["mem"]["total_bytes"].as_u64().is_some_and(|n| n > 0),
+        "内存总量应有值"
+    );
     assert!(v["cpu"]["usage_pct"].as_f64().is_some(), "CPU% 应存在");
-    assert!(v["disks"].as_array().is_some_and(|a| !a.is_empty()), "至少有一个挂载");
+    assert!(
+        v["disks"].as_array().is_some_and(|a| !a.is_empty()),
+        "至少有一个挂载"
+    );
     assert!(v["procs"].as_array().is_some());
     assert!(v["version"].as_str().is_some());
     // Docker 部分：用的是不存在的 socket，必须是 unavailable
     assert_eq!(v["docker"]["state"], "unavailable");
-    assert!(v["docker"]["message"].as_str().unwrap_or("").contains("Docker"));
+    assert!(v["docker"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("Docker"));
     assert_eq!(v["allow_actions"], true);
     r.token.cancel();
 }
@@ -169,13 +175,7 @@ async fn docker_endpoints_degrade_to_503_when_docker_is_absent() {
     assert_eq!(code, 503);
 
     // 容器动作也用同一个 socket：应报不可用，且不能是 200
-    let (code, body) = http(
-        &r.addr,
-        "POST",
-        "/api/docker/containers/abc/start",
-        None,
-    )
-    .await;
+    let (code, body) = http(&r.addr, "POST", "/api/docker/containers/abc/start", None).await;
     assert_eq!(code, 503, "实际 {code}: {body}");
     r.token.cancel();
 }
@@ -273,6 +273,93 @@ async fn stop_uses_a_longer_timeout_than_the_grace_period() {
     // 这里补的是 API 层：一个不存在的 daemon 走完全部流程仍然是 503。
     let r = start(|_, _| {}).await;
     let (code, _) = http(&r.addr, "POST", "/api/docker/containers/abc/stop", None).await;
-    assert_eq!(code, 503, "Docker 不在时 stop 应为 503（不可用）而非 5xx 混淆");
+    assert_eq!(
+        code, 503,
+        "Docker 不在时 stop 应为 503（不可用）而非 5xx 混淆"
+    );
     r.token.cancel();
+}
+
+#[tokio::test]
+async fn plugin_tree_tab_and_unconfigured_state_are_honest() {
+    let r = start(|_, _| {}).await;
+    let (code, body) = http(&r.addr, "GET", "/", None).await;
+    assert_eq!(code, 200);
+    for needle in [
+        "tab-plugins",
+        "data-tab=\"plugins\"",
+        "/api/plugins",
+        "服务器核心插件树",
+    ] {
+        assert!(body.contains(needle), "页面缺少 {needle}");
+    }
+
+    let (code, body) = http(&r.addr, "GET", "/api/plugins", None).await;
+    assert_eq!(code, 503, "未配置上游不能伪装成空插件树：{body}");
+    assert!(
+        body.contains("plugin_tree_url"),
+        "错误应给出配置入口：{body}"
+    );
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn configured_plugin_tree_is_proxied_from_the_core_panel() {
+    use esc_server_panel::plugins::PluginTreeClient;
+
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/api/plugins",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "schema_version": 1,
+                "host": "esc-host",
+                "framework": "plugin-framework",
+                "context_services": ["esc.tunnel.control"],
+                "host_services": ["esc.control", "esc.plugins"],
+                "plugins": [{
+                    "id": "esc.tunnel", "name": "隧道运行时", "version": "1",
+                    "kind": "tunnel", "description": "", "runtime": "in_process",
+                    "enabled": true, "mounted": true, "state": "ready", "children": []
+                }]
+            }))
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(upstream, app).await;
+    });
+
+    let client =
+        PluginTreeClient::new(&format!("http://{upstream_addr}/api/plugins"), None).unwrap();
+    let state = AppState {
+        sampler: Arc::new(Sampler::new()),
+        docker: Arc::new(Docker::new("/nonexistent/docker.sock")),
+        title: "服务器面板测试".into(),
+        access: Arc::new(AccessControl::new(&AuthConfig::default())),
+        allow_actions: false,
+        allow_create: false,
+        allow_delete: false,
+        jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
+        plugin_tree: Some(client),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let token = CancellationToken::new();
+    let shutdown = token.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await;
+    });
+
+    let (code, body) = http(&addr, "GET", "/api/plugins", None).await;
+    assert_eq!(code, 200, "{body}");
+    let tree: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(tree["host"], "esc-host");
+    assert_eq!(tree["plugins"][0]["id"], "esc.tunnel");
+    token.cancel();
 }

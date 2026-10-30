@@ -280,3 +280,17 @@ curl -s -u admin:<口令> -o /dev/null -w "%{http_code}\n" \
 拿到 **401** 说明「端口通、认证在生效」；**超时**通常是云厂商安全组没放行
 （面板自己不碰防火墙）。启动日志里也会有一条 WARN 明确说「管理面已暴露到网络」，
 看到它才说明 `listen` 真的改了。
+
+## 插件树标签页
+
+「插件树」读取宿主的 `HostCall("esc.plugins", "tree", null)`，展示
+`plugin-framework` 当前注册表与作用域的真实快照：
+
+- 缩进是 `PluginScope` 的父子关系；子进程面板作为宿主直属节点列出；
+- 节点包含进程内/子进程形态、挂载与 Ready/Failed/Pending 状态、重启次数；
+- `required_services` / `optional_services` / `pending_services` 原样来自框架的
+  `Inject` 声明。它们是**服务键**，页面不会把服务键猜成插件 id；
+- 根节点同时列出 `Ctx` 服务和可供子进程调用的 HostCall 服务。
+
+对应的只读 HTTP 端点是 `GET /api/plugins`，与面板其它端点使用相同认证。
+服务器面板可以把这个端点配成自己的上游，从而展示同一份数据。

@@ -581,3 +581,23 @@ allow_delete  = false
 `restart` 取值：`no` / `always` / `unless-stopped` / `on-failure[:N]`。
 写错会 400 并列出允许值——`on-failure:x` 也曾被静默当成「不限次数」接受，
 现在会报「重试次数 'x' 不是数字」。
+
+## 服务器核心插件树标签页
+
+服务器面板仍然**不是** `esc-host` 的插件。「插件树」通过一个窄的只读 HTTP
+客户端复用隧道面板的 `GET /api/plugins`，不会获得引擎或宿主的内部句柄。
+在 `server-panel.toml` 中配置：
+
+```toml
+plugin_tree_url = "http://127.0.0.1:8787/api/plugins"
+# 隧道面板配置了 auth 时才需要：
+plugin_tree_auth = "admin:隧道面板的口令"
+```
+
+`plugin_tree_url` 应指向**隧道面板自身**的监听地址，而不是网关的外部端口。
+本机回环可以用 HTTP；非回环地址强制 HTTPS。请求有 5 秒超时、不跟随重定向，
+凭据只允许放在 `plugin_tree_auth`，不能嵌进 URL。
+
+不配置时其它功能不受影响，插件树页返回 503 并显示配置方法，不会把「未配置」
+误报成「0 个插件」。页面中的父子缩进和服务依赖都来自 `plugin-framework`
+的真实快照，具体语义见 `docs/PANEL.md`。

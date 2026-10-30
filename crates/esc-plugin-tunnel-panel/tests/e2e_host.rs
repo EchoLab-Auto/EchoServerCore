@@ -242,6 +242,33 @@ title  = "e2e 面板"
     assert_eq!(code, 200, "{body}");
     assert!(body.contains("\"role\":\"hub\""), "{body}");
 
+    // 插件树走真实的面板 → HostCall → 宿主框架快照链路。
+    let (code, body) = common::http(&addr, "GET", "/api/plugins", None, Some(&auth)).await;
+    assert_eq!(code, 200, "{body}");
+    let tree: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(tree["host"], "esc-host");
+    assert_eq!(tree["framework"], "plugin-framework");
+    assert!(tree["host_services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "esc.plugins"));
+    let plugins = tree["plugins"].as_array().unwrap();
+    let tunnel = plugins
+        .iter()
+        .find(|p| p["id"] == "esc.tunnel")
+        .expect("隧道插件");
+    assert_eq!(tunnel["runtime"], "in_process");
+    assert_eq!(tunnel["state"], "ready");
+    assert_eq!(tunnel["mounted"], true);
+    let panel = plugins
+        .iter()
+        .find(|p| p["id"] == "esc.tunnel-panel")
+        .expect("面板插件");
+    assert_eq!(panel["runtime"], "subprocess");
+    assert_eq!(panel["state"], "ready");
+    assert_eq!(panel["mounted"], true);
+
     // 2) 页面本身可访问
     let (code, page) = common::http(&addr, "GET", "/", None, Some(&auth)).await;
     assert_eq!(code, 200);

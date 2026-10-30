@@ -106,6 +106,23 @@
     border-radius: 8px; padding: 12px; max-height: 52vh; overflow: auto; white-space: pre;
   }
   .stat { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .plugin-meta { display:flex; flex-wrap:wrap; gap:6px 14px; margin:10px 0; color:var(--dim); }
+  header nav { display:flex; gap:4px; margin-left:12px; }
+  header nav button.active { color:var(--accent); border-color:#2c4b78; background:#14243a; }
+  .plugin-tree, .plugin-children { list-style:none; margin:0; padding:0; }
+  .plugin-children { margin-left:18px; padding-left:16px; border-left:1px solid #35415a; }
+  .plugin-node { padding:12px 0; border-bottom:1px solid var(--line); }
+  .plugin-children .plugin-node { border-bottom:0; }
+  .plugin-head { display:flex; align-items:center; flex-wrap:wrap; gap:7px; }
+  .plugin-head code { color:var(--accent); }
+  .plugin-desc { color:var(--dim); margin:5px 0; }
+  .plugin-deps { display:flex; flex-wrap:wrap; gap:5px; align-items:center; margin-top:6px; }
+  .dep { font:11.5px var(--mono); padding:2px 6px; border:1px solid var(--line); border-radius:5px; }
+  .dep.required { color:#f0b36a; border-color:#6a5324; }
+  .dep.optional { color:var(--dim); }
+  .dep.missing { color:var(--err); border-color:#6a2f24; }
+  .plugin-root { padding:12px 14px; margin-bottom:8px; background:var(--panel-2); border-radius:8px; }
+  .service-list { color:var(--dim); font:12px var(--mono); word-break:break-all; margin-top:5px; }
   @media (max-width: 720px) {
     .hide-sm { display: none; }
     header { padding: 12px 14px; }
@@ -117,17 +134,19 @@
 <header>
   <h1>__TITLE__</h1>
   <span class="badge role" id="role">—</span>
-  <span class="badge" id="conn">连接状态未知</span>
-  <span class="badge" id="uptime">—</span>
-  <span class="spacer"></span>
-  <button class="ghost" id="btn-refresh">刷新</button>
-  <button class="ghost" id="btn-reload" title="从磁盘重读映射表">重新加载</button>
-  <button class="ghost" id="btn-export">导出配置</button>
-  <button class="primary" id="btn-new">＋ 新建映射</button>
+  <h1>__TITLE__</h1>
+  <nav aria-label="面板页签">
+    <button class="ghost active" data-tab="tunnel">隧道</button>
+    <button class="ghost" data-tab="plugins">插件树</button>
+  </nav>
+  <span class="badge role" id="role">—</span>
+  <button class="ghost tunnel-action" id="btn-reload" title="从磁盘重读映射表">重新加载</button>
+  <button class="ghost tunnel-action" id="btn-export">导出配置</button>
+  <button class="primary tunnel-action" id="btn-new">＋ 新建映射</button>
 </header>
 
 <main>
-  <div class="card">
+  <section id="tab-tunnel">
     <div class="grid" id="summary"></div>
   </div>
 
@@ -208,8 +227,25 @@
     </table>
     <div class="empty" id="spoke-empty" hidden>暂无 spoke 连接。</div>
   </div>
-</main>
+  </section>
 
+  <section id="tab-plugins" hidden>
+    <div class="card">
+      <div class="toolbar">
+        <h2 style="margin:0">服务器核心插件树</h2>
+        <span class="badge" id="plugin-count">—</span>
+        <span class="spacer"></span>
+        <button class="ghost" id="btn-plugins-refresh">刷新</button>
+      </div>
+      <div class="hint">
+        数据来自 <code>esc-host</code> 的 <code>esc.plugins/tree</code>。
+        缩进表示框架中的父子插件；硬/软依赖是 <code>Inject</code> 声明的服务键。
+      </div>
+      <div class="empty" id="plugin-error" hidden></div>
+      <div id="plugin-tree" class="plugin-tree"></div>
+    </div>
+  </section>
+</main>
 <div class="toast" id="toast"></div>
 
 <dialog id="dlg-map">
@@ -281,7 +317,7 @@
     const n = el("div", kind || "", msg);
     box.appendChild(n);
     setTimeout(() => n.remove(), kind === "err" ? 7000 : 3500);
-  }
+  let state = { mappings: [], status: null, editing: null, exportRole: "hub", paused: false, tab: "tunnel" };
 
   async function api(path, opts) {
     const res = await fetch(path, Object.assign({
@@ -673,6 +709,102 @@
     }
   }
 
+  function pluginPill(node) {
+    const state = node.state || (node.mounted ? "ready" : "stopped");
+    const cls = state === "ready" ? "active" : state === "failed" ? "error" : state === "pending" ? "pending" : "disabled";
+    return el("span", "pill " + cls, state);
+  }
+
+  function dependencyChips(node) {
+    const box = el("div", "plugin-deps");
+    const add = (label, items, cls) => {
+      if (!items || !items.length) return;
+      box.appendChild(el("span", "hint", label));
+      for (const service of items) box.appendChild(el("code", "dep " + cls, service));
+    };
+    add("硬依赖", node.required_services, "required");
+    add("软依赖", node.optional_services, "optional");
+    add("缺失", node.pending_services, "missing");
+    return box;
+  }
+
+  function renderPluginNode(node) {
+    const item = el("li");
+    const body = el("div", "plugin-node");
+    const head = el("div", "plugin-head");
+    head.appendChild(el("strong", null, node.name || node.id));
+    head.appendChild(el("code", null, node.id));
+    head.appendChild(pluginPill(node));
+    body.appendChild(head);
+    const meta = [node.kind, node.runtime, node.version && "v" + node.version].filter(Boolean).join(" · ");
+    body.appendChild(el("div", "plugin-desc", meta));
+    if (node.description) body.appendChild(el("div", "plugin-desc", node.description));
+    if (node.runtime === "subprocess") {
+      body.appendChild(el("div", "stat", `重启 ${node.restarts || 0} 次 · 连接代际 ${node.generation || 0}`));
+    }
+    if (node.command) body.appendChild(el("div", "stat", "命令：" + node.command));
+    if (node.error) body.appendChild(el("div", "pill error", node.error));
+    body.appendChild(dependencyChips(node));
+    item.appendChild(body);
+    if (node.children && node.children.length) {
+      const children = el("ul", "plugin-children");
+      for (const child of node.children) children.appendChild(renderPluginNode(child));
+      item.appendChild(children);
+    }
+    return item;
+  }
+
+  function countPlugins(nodes) {
+    return (nodes || []).reduce((n, node) => n + 1 + countPlugins(node.children), 0);
+  }
+
+  function renderPluginTree(tree) {
+    const root = $("#plugin-tree");
+    root.textContent = "";
+    $("#plugin-error").hidden = true;
+    $("#plugin-count").textContent = countPlugins(tree.plugins) + " 个插件";
+    const host = el("div", "plugin-root");
+    const head = el("div", "plugin-head");
+    head.appendChild(el("strong", null, tree.host || "esc-host"));
+    head.appendChild(el("span", "pill active", "宿主"));
+    head.appendChild(el("code", null, tree.framework || "plugin-framework"));
+    host.appendChild(head);
+    host.appendChild(el("div", "service-list", "Ctx 服务：" + ((tree.context_services || []).join("、") || "（空）")));
+    host.appendChild(el("div", "service-list", "HostCall 服务：" + ((tree.host_services || []).join("、") || "（空）")));
+    root.appendChild(host);
+    const list = el("ul", "plugin-tree");
+    for (const node of tree.plugins || []) list.appendChild(renderPluginNode(node));
+    root.appendChild(list);
+  }
+
+  async function refreshPlugins() {
+    const box = $("#plugin-error");
+    try {
+      renderPluginTree(await api("/api/plugins"));
+    } catch (e) {
+      $("#plugin-tree").textContent = "";
+      $("#plugin-count").textContent = "不可用";
+      box.hidden = false;
+      box.textContent = "插件树读取失败：" + e.message;
+    }
+  }
+
+  function switchTab(name) {
+    state.tab = name;
+    $("#tab-tunnel").hidden = name !== "tunnel";
+    $("#tab-plugins").hidden = name !== "plugins";
+    document.querySelectorAll("header nav [data-tab]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.tab === name);
+    });
+    document.querySelectorAll(".tunnel-action").forEach((button) => { button.hidden = name !== "tunnel"; });
+    if (name === "plugins") refreshPlugins();
+  }
+
+  document.querySelectorAll("header nav [data-tab]").forEach((button) => {
+    button.onclick = () => switchTab(button.dataset.tab);
+  });
+  $("#btn-plugins-refresh").onclick = refreshPlugins;
+
   async function refresh() {
     try {
       const [st, list] = await Promise.all([api("/api/status"), api("/api/mappings")]);
@@ -685,7 +817,10 @@
     }
   }
 
-  $("#btn-refresh").onclick = () => { refresh(); refreshEdge(); };
+  $("#btn-refresh").onclick = () => {
+    if (state.tab === "plugins") refreshPlugins();
+    else { refresh(); refreshEdge(); }
+  };
   $("#btn-new").onclick = () => openEditor(null);
   $("#btn-reload").onclick = async () => {
     try { await api("/api/reload", { method: "POST" }); toast("已重新加载映射表", "ok"); refresh(); }
@@ -713,12 +848,14 @@
   $("#dlg-map").addEventListener("close", () => { state.paused = false; refresh(); });
 
   refresh();
-  refreshEdge();
-  setInterval(() => {
-    if (state.paused) return;
+    if (state.tab === "plugins") {
+      refreshPlugins();
+      return;
+    }
     refresh();
     // 边缘路由与隧道状态互不依赖；单独刷，一方失败不影响另一方。
     refreshEdge();
+  }, 3000);
   }, 3000);
 })();
 </script>

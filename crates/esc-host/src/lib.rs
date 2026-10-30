@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use echo_context::Ctx;
-use echo_plugin::{MountContext, Plugin, PluginRegistry};
+use echo_plugin::{MountContext, Plugin, PluginScope};
 use echo_plugin_host::api::InvokeContext;
 use echo_plugin_host::host_service::HostService;
 use echo_plugin_host::stdio::StdioTransport;
@@ -40,10 +40,13 @@ use tracing::{error, info, warn};
 
 use esc_control_api::{
     dispatch, dispatch_edge, ControlError, ControlRequest, ControlResponse, EdgeRouteControl,
-    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE,
+    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE, PLUGIN_TREE_SERVICE,
 };
 use esc_plugin_edge_router::EdgeRouterPlugin;
 use esc_plugin_tunnel::TunnelPlugin;
+
+pub mod plugin_tree;
+use plugin_tree::{PanelObservation, PluginTreeHostService, SharedPanelObservation};
 
 /// 隧道插件在注册表里的 id。
 pub const TUNNEL_PLUGIN_ID: &str = "esc.tunnel";
@@ -88,7 +91,10 @@ pub struct EdgeRouterSection {
 // `toml::Value` 没有 `Default`，所以手写一个（空表 = "本段没写"）。
 impl Default for EdgeRouterSection {
     fn default() -> Self {
-        Self { enabled: false, config: empty_table() }
+        Self {
+            enabled: false,
+            config: empty_table(),
+        }
     }
 }
 
@@ -179,14 +185,19 @@ impl EngineHostService {
 impl HostService for EngineHostService {
     fn call(&self, method: &str, payload: Value) -> Result<Value, (String, String)> {
         let ctl = Arc::clone(&self.ctl);
-        let req = ControlRequest { method: method.to_string(), params: payload };
+        let req = ControlRequest {
+            method: method.to_string(),
+            params: payload,
+        };
         let resp: ControlResponse = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(dispatch(ctl.as_ref(), req))
         });
         if resp.ok {
             Ok(resp.data)
         } else {
-            let err = resp.error.unwrap_or_else(|| ControlError::other("控制调用失败"));
+            let err = resp
+                .error
+                .unwrap_or_else(|| ControlError::other("控制调用失败"));
             // 用契约里的 `as_code`（不是 `{:?}`）：面板按同一份码表解析。
             Err((err.kind.as_code().to_string(), err.message))
         }
@@ -212,14 +223,19 @@ impl EdgeHostService {
 impl HostService for EdgeHostService {
     fn call(&self, method: &str, payload: Value) -> Result<Value, (String, String)> {
         let ctl = Arc::clone(&self.ctl);
-        let req = ControlRequest { method: method.to_string(), params: payload };
+        let req = ControlRequest {
+            method: method.to_string(),
+            params: payload,
+        };
         let resp: ControlResponse = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(dispatch_edge(ctl.as_ref(), req))
         });
         if resp.ok {
             Ok(resp.data)
         } else {
-            let err = resp.error.unwrap_or_else(|| ControlError::other("边缘路由控制失败"));
+            let err = resp
+                .error
+                .unwrap_or_else(|| ControlError::other("边缘路由控制失败"));
             Err((err.kind.as_code().to_string(), err.message))
         }
     }
@@ -232,8 +248,9 @@ impl HostService for EdgeHostService {
 /// 已启动的宿主。
 pub struct Host {
     ctx: Arc<Ctx>,
-    registry: PluginRegistry,
+    plugins: Arc<PluginScope>,
     panel: Option<PluginHandle>,
+    panel_observation: SharedPanelObservation,
     control: Arc<dyn TunnelControl>,
     edge_router: Option<Arc<dyn EdgeRouteControl>>,
 }
@@ -244,7 +261,8 @@ impl Host {
     /// `panel_program` 为空时用配置里的 `command`（相对路径按宿主可执行文件目录解析）。
     pub async fn start(cfg: HostConfig, panel_program: Option<PathBuf>) -> anyhow::Result<Self> {
         let ctx = Arc::new(Ctx::default());
-        let registry = PluginRegistry::default();
+        let plugins = PluginScope::root(Arc::clone(&ctx));
+        let registry = plugins.registry();
         let tunnel: Arc<dyn Plugin> = Arc::new(TunnelPlugin::new());
         registry
             .register(tunnel)
@@ -260,7 +278,11 @@ impl Host {
             registry.set_config(EDGE_ROUTER_PLUGIN_ID, cfg.edge_router_json());
         }
 
-        let errors = registry.mount_all(&MountContext::new().with_ctx(Arc::clone(&ctx)));
+        let errors = registry.mount_all(
+            &MountContext::new()
+                .with_ctx(Arc::clone(&ctx))
+                .with_tree(Arc::clone(&plugins)),
+        );
         if let Some((id, why)) = errors.first() {
             anyhow::bail!("插件 {id} 挂载失败: {why}");
         }
@@ -287,9 +309,11 @@ impl Host {
         };
 
         let supervisor = PluginSupervisor::new();
-        supervisor
-            .host_services()
-            .register(CONTROL_SERVICE, Arc::new(EngineHostService::new(Arc::clone(&control))));
+        supervisor.host_services().register(
+            CONTROL_SERVICE,
+            Arc::new(EngineHostService::new(Arc::clone(&control))),
+        );
+        let mut host_services = vec![CONTROL_SERVICE.to_string(), PLUGIN_TREE_SERVICE.to_string()];
 
         // 边缘路由控制面：只有启用了插件才注册 —— 面板据此判断能力是否存在。
         if let Some(edge) = &edge_router {
@@ -297,19 +321,50 @@ impl Host {
                 EDGE_ROUTE_SERVICE,
                 Arc::new(EdgeHostService::new(Arc::clone(edge))),
             );
-            info!(service = EDGE_ROUTE_SERVICE, "edge control service registered");
+            host_services.push(EDGE_ROUTE_SERVICE.to_string());
+            info!(
+                service = EDGE_ROUTE_SERVICE,
+                "edge control service registered"
+            );
         }
+
+        let panel_observation: SharedPanelObservation =
+            Arc::new(std::sync::Mutex::new(PanelObservation {
+                enabled: cfg.panel.enabled,
+                command: cfg.panel.command.clone(),
+                handle: None,
+                start_error: None,
+            }));
+        supervisor.host_services().register(
+            PLUGIN_TREE_SERVICE,
+            Arc::new(PluginTreeHostService::new(
+                Arc::clone(&plugins),
+                Arc::clone(&panel_observation),
+                host_services,
+            )),
+        );
 
         let mut panel = None;
         if cfg.panel.enabled {
             let program = panel_program.unwrap_or_else(|| resolve_program(&cfg.panel.command));
+            panel_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .command = program.display().to_string();
             let spec = PluginSpec {
                 plugin_id: TUNNEL_PANEL_PLUGIN_ID.to_string(),
                 config: cfg.panel_json(),
             };
-            match supervisor.start(spec, Box::new(StdioTransport::new(program.clone()))).await {
+            match supervisor
+                .start(spec, Box::new(StdioTransport::new(program.clone())))
+                .await
+            {
                 Ok(handle) => {
                     info!(program = %program.display(), "panel plugin ready");
+                    panel_observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .handle = Some(handle.clone());
                     if let Some(url) = probe_panel_url(&handle).await {
                         info!(url = %url, "web panel is up");
                     }
@@ -317,6 +372,10 @@ impl Host {
                     panel = Some(handle);
                 }
                 Err(e) => {
+                    panel_observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .start_error = Some(e.to_string());
                     // 面板起不来不应该让隧道跟着停——这正是拆成两个插件的意义。
                     warn!(error = %e, "panel plugin failed to start; tunnel keeps running");
                 }
@@ -325,7 +384,14 @@ impl Host {
             info!("panel disabled; tunnel-only mode");
         }
 
-        Ok(Self { ctx, registry, panel, control, edge_router })
+        Ok(Self {
+            ctx,
+            plugins,
+            panel,
+            panel_observation,
+            control,
+            edge_router,
+        })
     }
 
     /// 控制面句柄（测试与嵌入式用法）。
@@ -337,11 +403,23 @@ impl Host {
         self.panel.as_ref()
     }
 
+    /// 当前插件树快照（嵌入方与测试使用；子进程面板走 `esc.plugins/tree`）。
+    pub fn plugin_tree(&self) -> esc_control_api::PluginTreeSnapshot {
+        plugin_tree::snapshot(
+            &self.plugins,
+            &self.panel_observation,
+            std::iter::once(CONTROL_SERVICE.to_string())
+                .chain(std::iter::once(PLUGIN_TREE_SERVICE.to_string()))
+                .chain(
+                    self.edge_router
+                        .as_ref()
+                        .map(|_| EDGE_ROUTE_SERVICE.to_string()),
+                )
+                .collect(),
+        )
+    }
+
     /// 边缘路由控制面（未启用 `[edge_router]` 时为 `None`）。
-    ///
-    /// 暴露出来的动机：面板将来要显示"哪个域名去了哪个端口"，它需要这个句柄。
-    /// 现在没有调用方，但它是**契约的一部分**（服务已注册在 Ctx 里），所以
-    /// 保留并 `#[allow(dead_code)]`，而不是等到要用时再改公共 API。
     pub fn edge_router(&self) -> Option<Arc<dyn EdgeRouteControl>> {
         self.edge_router.as_ref().map(Arc::clone)
     }
@@ -354,7 +432,7 @@ impl Host {
             }
             info!(state = handle.state().as_str(), "panel plugin stopped");
         }
-        self.registry.unmount_all();
+        self.plugins.shutdown();
         // 隧道插件的 unmount 已经把引擎 shutdown 了；这里只保留 Ctx 供日志检查。
         let keys = self.ctx.keys();
         info!(keys = ?keys, "host stopped");
@@ -410,7 +488,11 @@ fn resolve_program(command: &str) -> PathBuf {
 async fn probe_panel_url(handle: &PluginHandle) -> Option<String> {
     for _ in 0..25 {
         let outcome = handle
-            .invoke(TUNNEL_PANEL_PLUGIN_ID, InvokeContext::default(), Value::Null)
+            .invoke(
+                TUNNEL_PANEL_PLUGIN_ID,
+                InvokeContext::default(),
+                Value::Null,
+            )
             .await;
         if let echo_plugin_host::api::InvokeOutcome::Ok { result, .. } = outcome {
             if result.get("serving").and_then(Value::as_bool) == Some(true) {
@@ -532,7 +614,10 @@ where
 }
 
 /// 读配置 → 起宿主 → 等信号 → 优雅退出（二进制入口用它）。
-pub async fn run_until_signal(cfg_path: &Path, panel_program: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_until_signal(
+    cfg_path: &Path,
+    panel_program: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let cfg = HostConfig::load(cfg_path)?;
     info!(config = %cfg_path.display(), panel = cfg.panel.enabled, "esc host starting");
     let host = Host::start(cfg, panel_program).await?;
@@ -545,7 +630,7 @@ pub async fn run_until_signal(cfg_path: &Path, panel_program: Option<PathBuf>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use echo_plugin::PluginRegistry;
     fn run(args: &[&str]) -> Invocation {
         parse_args(args.iter().copied()).expect("应当解析成功")
     }
@@ -568,9 +653,18 @@ mod tests {
 
     #[test]
     fn config_forms_are_equivalent() {
-        assert_eq!(run(&["-c", "/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
-        assert_eq!(run(&["--config", "/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
-        assert_eq!(run(&["--config=/tmp/a.toml"]), Invocation::Run("/tmp/a.toml".into()));
+        assert_eq!(
+            run(&["-c", "/tmp/a.toml"]),
+            Invocation::Run("/tmp/a.toml".into())
+        );
+        assert_eq!(
+            run(&["--config", "/tmp/a.toml"]),
+            Invocation::Run("/tmp/a.toml".into())
+        );
+        assert_eq!(
+            run(&["--config=/tmp/a.toml"]),
+            Invocation::Run("/tmp/a.toml".into())
+        );
     }
 
     #[test]
@@ -613,11 +707,7 @@ mod tests {
     /// 注册表要跟着返回：它持有 mount() 的 `Disposer`，Drop 时会撤销服务
     /// （框架语义：注册即副作用、必须可逆）。只返回句柄的话，注册表一
     /// 出作用域服务就消失了。
-    async fn mount_edge_router() -> (
-        Arc<dyn EdgeRouteControl>,
-        Arc<Ctx>,
-        PluginRegistry,
-    ) {
+    async fn mount_edge_router() -> (Arc<dyn EdgeRouteControl>, Arc<Ctx>, PluginRegistry) {
         let ctx = Arc::new(Ctx::default());
         let registry = PluginRegistry::default();
         let plugin: Arc<dyn Plugin> = Arc::new(EdgeRouterPlugin::new());
@@ -668,8 +758,11 @@ mod tests {
         assert_eq!(st["routes"].as_array().unwrap().len(), 2, "{st}");
 
         // 4) delete
-        svc.call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "prefix": "panel" }))
-            .unwrap();
+        svc.call(
+            method::EDGE_ROUTE_DELETE,
+            serde_json::json!({ "prefix": "panel" }),
+        )
+        .unwrap();
         let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
         assert_eq!(st["routes"].as_array().unwrap().len(), 1, "{st}");
     }
@@ -691,7 +784,10 @@ mod tests {
 
         // 删不存在的 → not_found（→ 404）
         let (code, msg) = svc
-            .call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "prefix": "nope" }))
+            .call(
+                method::EDGE_ROUTE_DELETE,
+                serde_json::json!({ "prefix": "nope" }),
+            )
             .unwrap_err();
         assert_eq!(code, "not_found", "{msg}");
 

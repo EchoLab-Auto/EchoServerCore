@@ -11,6 +11,7 @@ use anyhow::Context;
 use esc_panel_auth::{AccessControl, AuthConfig};
 use esc_server_panel::api::{router, AppState};
 use esc_server_panel::docker::Docker;
+use esc_server_panel::plugins::PluginTreeClient;
 use esc_server_panel::sys::{self, Sampler};
 use serde::Deserialize;
 
@@ -46,9 +47,12 @@ struct Config {
     /// （比如值班同学）可能确实只需要启停现有容器。
     #[serde(default = "default_true")]
     allow_create: bool,
-    /// 是否允许删除容器 / 镜像。不可撤销，所以单独一个开关。
     #[serde(default = "default_true")]
     allow_delete: bool,
+    /// 隧道面板的插件树端点，例如 http://127.0.0.1:8787/api/plugins。
+    plugin_tree_url: Option<String>,
+    /// 隧道面板自己的 Basic 凭据（不是服务器面板的 auth）。
+    plugin_tree_auth: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -123,7 +127,21 @@ impl Config {
                 self.listen
             ));
         }
-        self.auth_config().validate()
+        self.auth_config().validate()?;
+        match self.plugin_tree_url.as_deref() {
+            Some(url) => {
+                PluginTreeClient::new(url, self.plugin_tree_auth.as_deref())?;
+            }
+            None if self
+                .plugin_tree_auth
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()) =>
+            {
+                return Err("设置了 plugin_tree_auth，但缺少 plugin_tree_url".into());
+            }
+            None => {}
+        }
+        Ok(())
     }
 }
 
@@ -228,13 +246,19 @@ async fn main() -> anyhow::Result<()> {
 
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("读取配置文件 {} 失败", path.display()))?;
-    let cfg: Config = toml::from_str(&raw)
-        .with_context(|| format!("解析配置文件 {} 失败", path.display()))?;
-    cfg.validate().map_err(|e| anyhow::anyhow!("配置无效：{e}"))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("解析配置文件 {} 失败", path.display()))?;
+    cfg.validate()
+        .map_err(|e| anyhow::anyhow!("配置无效：{e}"))?;
+    let plugin_tree = cfg
+        .plugin_tree_url
+        .as_deref()
+        .map(|url| PluginTreeClient::new(url, cfg.plugin_tree_auth.as_deref()))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("插件树上游配置无效：{e}"))?;
 
     let docker = Docker::new(&cfg.docker_socket);
     if !docker.socket_exists() {
-        // 不是错误：没有 Docker 的机器也能用面板看主机指标。
         tracing::info!(
             socket = %cfg.docker_socket,
             "未发现 Docker socket，容器相关功能将显示为「未安装」"
@@ -250,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
         allow_create: cfg.allow_create,
         allow_delete: cfg.allow_delete,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
+        plugin_tree,
     };
 
     if !cfg.is_loopback_only() {
@@ -351,8 +376,7 @@ allow_create = false
         // 曾经踩过的坑：`auth = ""` 被当成 Some("")，于是预期的凭据变成一个
         // **空口令账号**——看起来「关了认证」，实际是谁也进不去（静默锁死）。
         // 现在它应当等价于「没配 auth」，于是回环检查照旧生效。
-        let loopback: Config =
-            toml::from_str("listen = \"127.0.0.1:18788\"\nauth = \"\"").unwrap();
+        let loopback: Config = toml::from_str("listen = \"127.0.0.1:18788\"\nauth = \"\"").unwrap();
         assert!(loopback.validate().is_ok(), "回环 + 空 auth 应允许");
         assert!(
             loopback.auth_config().auth.is_none(),
@@ -406,6 +430,26 @@ allow_cidrs = ["10.0.0.0/33"]
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn plugin_tree_upstream_is_optional_but_validated() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.plugin_tree_url.is_none());
+        assert!(cfg.validate().is_ok());
+
+        let cfg: Config = toml::from_str(
+            "plugin_tree_url = \"http://127.0.0.1:8787/api/plugins\"\nplugin_tree_auth = \"admin:pw\"",
+        )
+        .unwrap();
+        assert!(cfg.validate().is_ok());
+
+        let cfg: Config = toml::from_str("plugin_tree_auth = \"admin:pw\"").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("plugin_tree_url"));
+
+        let cfg: Config =
+            toml::from_str("plugin_tree_url = \"http://core.example/api/plugins\"").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("HTTPS"));
     }
 
     #[test]

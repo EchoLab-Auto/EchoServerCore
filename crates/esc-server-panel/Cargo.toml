@@ -11,6 +11,7 @@ description = "Standalone web panel for host metrics and Docker container manage
 esc-panel-auth = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

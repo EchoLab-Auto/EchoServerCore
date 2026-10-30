@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use esc_panel_auth::{AccessControl, Denied};
 
 use crate::docker::{CreateSpec, Docker, DockerError, Jobs};
+use crate::plugins::PluginTreeClient;
 use crate::sys::{self, Sampler};
 use crate::web;
 
@@ -35,6 +36,8 @@ pub struct AppState {
     pub allow_delete: bool,
     /// 后台任务（拉镜像等）。
     pub jobs: Arc<Jobs>,
+    /// `None` = 未配置服务器核心上游；插件树标签页会明确显示配置方法。
+    pub plugin_tree: Option<PluginTreeClient>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -43,15 +46,16 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/overview", get(api_overview))
         .route("/api/host", get(api_host))
-        .route("/api/docker/containers", get(api_containers).post(api_create_container))
+        .route("/api/plugins", get(api_plugins))
+        .route(
+            "/api/docker/containers",
+            get(api_containers).post(api_create_container),
+        )
         .route(
             "/api/docker/containers/{id}",
             get(api_container_detail).delete(api_remove_container),
         )
-        .route(
-            "/api/docker/containers/{id}/logs",
-            get(api_container_logs),
-        )
+        .route("/api/docker/containers/{id}/logs", get(api_container_logs))
         .route(
             "/api/docker/containers/{id}/stats",
             get(api_container_stats),
@@ -62,7 +66,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/docker/images", get(api_images))
         .route("/api/docker/images/pull", post(api_pull_image))
-        .route("/api/docker/images/{name}", axum::routing::delete(api_remove_image))
+        .route(
+            "/api/docker/images/{name}",
+            axum::routing::delete(api_remove_image),
+        )
         .route("/api/docker/networks", get(api_networks))
         .route("/api/docker/jobs", get(api_jobs))
         .route("/api/docker/jobs/{id}", get(api_job))
@@ -70,10 +77,7 @@ pub fn router(state: AppState) -> Router {
             "/api/docker/containers/{id}/detail",
             get(api_container_detail_full),
         )
-        .route(
-            "/api/docker/containers/{id}/rename",
-            post(api_rename),
-        )
+        .route("/api/docker/containers/{id}/rename", post(api_rename))
         .route(
             "/api/docker/containers/{id}/restart-policy",
             post(api_set_restart),
@@ -83,7 +87,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// 认证 / 白名单 / 限速，全部委托给共享的 `esc-panel-auth`。
-async fn guard(State(st): State<AppState>, headers: HeaderMap, req: Request, next: Next) -> Response {
+async fn guard(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
     // 只认 socket 来源，不看 X-Forwarded-For。
     let peer: Option<IpAddr> = req
         .extensions()
@@ -102,9 +111,28 @@ async fn guard(State(st): State<AppState>, headers: HeaderMap, req: Request, nex
 async fn index(State(st): State<AppState>) -> Html<String> {
     Html(web::index_html(&st.title))
 }
-
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn api_plugins(State(st): State<AppState>) -> Response {
+    let Some(client) = st.plugin_tree else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "未配置服务器核心插件树上游。请在 server-panel.toml 设置 plugin_tree_url = \"http://127.0.0.1:8787/api/plugins\"；若隧道面板有认证，再设置 plugin_tree_auth = \"user:password\"。"
+            })),
+        )
+            .into_response();
+    };
+    match client.fetch().await {
+        Ok(tree) => Json(tree).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 /// 一次拿到「主机 + Docker 摘要」，前端每 3 秒轮询这一个端点就够了。
@@ -507,7 +535,11 @@ fn docker_error(e: DockerError, context: &str) -> Response {
         DockerError::Protocol(_) => StatusCode::BAD_GATEWAY,
     };
     tracing::warn!(context, error = %e, "Docker 请求失败");
-    (status, Json(json!({ "error": e.to_string(), "context": context }))).into_response()
+    (
+        status,
+        Json(json!({ "error": e.to_string(), "context": context })),
+    )
+        .into_response()
 }
 
 /// 采样任务 panic 时的兜底：宁可给一份「全 0 + 说明」，也不要把接口打成 500
@@ -570,14 +602,23 @@ mod tests {
             allow_create: !readonly,
             allow_delete: !readonly,
             jobs: Arc::new(Jobs::new()),
+            plugin_tree: None,
         }
     }
 
     #[test]
     fn router_builds_without_serving() {
-        // 只为覆盖 router() 这个构造函数：路由表拼错（比如 axum 0.8 的 {id} 语法）
-        // 会在这里 panic，而不是等到部署后 404。
+        // 路由表拼错（比如 axum 0.8 的 {id} 语法）应在这里暴露，而不是部署后 404。
         let _ = router(state(false, "/nonexistent.sock"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_plugin_tree_is_not_an_empty_tree() {
+        let response = api_plugins(State(state(false, "/nonexistent.sock"))).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
@@ -586,7 +627,6 @@ mod tests {
         assert_eq!(s.host.hostname, "unknown");
         assert_eq!(s.mem.total_bytes, 0);
         assert!(s.disks.is_empty());
-        // 能被序列化（前端拿到的永远是合法 JSON）
         assert!(serde_json::to_value(&s).is_ok());
     }
 }

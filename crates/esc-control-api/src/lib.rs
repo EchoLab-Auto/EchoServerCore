@@ -5,6 +5,7 @@
 
 pub mod dispatch;
 pub mod model;
+pub mod plugin_tree;
 
 pub use dispatch::{
     dispatch, dispatch_edge, method, ControlRequest, ControlResponse, EdgeRouteControl,
@@ -14,4 +15,7 @@ pub use model::{
     ControlError, EdgeRoute, EdgeRouteUpsert, EdgeRouterCounters, EdgeRouterStatus, EngineStatus,
     ErrorKind, ExportedConfig, Mapping, MappingState, MappingStats, MappingUpsert, MappingView,
     Role, SpokeView,
+};
+pub use plugin_tree::{
+    PluginTreeNode, PluginTreeSnapshot, PLUGIN_TREE_METHOD, PLUGIN_TREE_SERVICE,
 };

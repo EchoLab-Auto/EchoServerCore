@@ -160,7 +160,21 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 @media(max-width:720px){
-  main{padding:12px 12px 40px}
+.plugin-root{padding:14px 16px;margin-bottom:10px;background:var(--bg3);border:1px solid var(--line);border-radius:9px}
+.plugin-tree,.plugin-children{list-style:none;margin:0;padding:0}
+.plugin-children{margin-left:18px;padding-left:16px;border-left:1px solid #2b3a4d}
+.plugin-node{padding:13px 0;border-bottom:1px solid var(--line)}
+.plugin-children .plugin-node{border-bottom:0}
+.plugin-head{display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.plugin-head code{color:var(--info)}
+.plugin-desc{color:var(--fg2);margin:5px 0;font-size:12.5px}
+.plugin-deps{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:7px}
+.dep{font:11.5px var(--mono);padding:2px 6px;border:1px solid var(--line);border-radius:5px}
+.dep.required{color:#e5c07b;border-color:#6a5324}.dep.optional{color:var(--fg3)}.dep.missing{color:var(--err);border-color:#6a2f24}
+.plugin-service{color:var(--fg2);font:12px var(--mono);word-break:break-all;margin-top:6px}
+.plugin-error{white-space:pre-wrap;text-align:left}
+
+@media(max-width:720px){
   header{padding:10px 12px;gap:8px}
   nav{order:3;width:100%;margin:0}
   .trunc{max-width:160px}
@@ -178,6 +192,7 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
     <button data-tab="overview" class="on">概览</button>
     <button data-tab="containers">容器</button>
     <button data-tab="images">镜像</button>
+    <button data-tab="plugins">插件树</button>
   </nav>
   <span class="pill" id="p-host">…</span>
   <span class="pill" id="p-docker"><span class="dot off"></span>Docker</span>
@@ -301,6 +316,19 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
     </div>
     <p class="hint">删除镜像是不可撤销的（会连同依赖它的容器一起受影响）。</p>
   </div>
+
+  <!-- ══════════ 服务器核心插件树 ══════════ -->
+  <div class="tab" id="tab-plugins">
+    <div class="toolbar">
+      <h2>服务器核心插件树 <span class="n" id="plugin-count"></span></h2>
+      <span class="sp"><button id="btn-refresh-plugins">刷新</button></span>
+    </div>
+    <p class="hint">
+      与隧道面板读取同一份 <code>esc-host</code> 快照。缩进表示父子插件；依赖是框架 <code>Inject</code> 声明的服务键。
+    </p>
+    <div id="plugin-error" class="banner err plugin-error" style="display:none"></div>
+    <div class="card" id="plugin-tree" style="padding:10px 16px"></div>
+  </div>
 </main>
 
 <div id="modal">
@@ -412,6 +440,57 @@ const S = {
 document.querySelectorAll("nav button").forEach((b) => {
   b.onclick = () => switchTab(b.dataset.tab);
 });
+function pluginDeps(node) {
+  const group = (label, items, cls) => !items || !items.length ? "" :
+    `<span class="dim">${label}</span>` + items.map((s) => `<code class="dep ${cls}">${h(s)}</code>`).join("");
+  return `<div class="plugin-deps">${group("硬依赖", node.required_services, "required")}${group("软依赖", node.optional_services, "optional")}${group("缺失", node.pending_services, "missing")}</div>`;
+}
+
+function pluginNodeHtml(node) {
+  const state = node.state || (node.mounted ? "ready" : "stopped");
+  const meta = [node.kind, node.runtime, node.version && "v" + node.version].filter(Boolean).join(" · ");
+  const processMeta = node.runtime === "subprocess" ?
+    `<div class="plugin-desc">重启 ${Number(node.restarts || 0)} 次 · 连接代际 ${Number(node.generation || 0)}</div>` : "";
+  const children = (node.children || []).map(pluginNodeHtml).join("");
+  return `<li><div class="plugin-node">
+    <div class="plugin-head"><strong>${h(node.name || node.id)}</strong><code>${h(node.id)}</code><span class="chip">${h(state)}</span></div>
+    <div class="plugin-desc">${h(meta)}</div>
+    ${node.description ? `<div class="plugin-desc">${h(node.description)}</div>` : ""}
+    ${processMeta}
+    ${node.command ? `<div class="plugin-desc mono">命令：${h(node.command)}</div>` : ""}
+    ${node.error ? `<div class="banner err">${h(node.error)}</div>` : ""}
+    ${pluginDeps(node)}
+  </div>${children ? `<ul class="plugin-children">${children}</ul>` : ""}</li>`;
+}
+
+function pluginCount(nodes) {
+  return (nodes || []).reduce((n, node) => n + 1 + pluginCount(node.children), 0);
+}
+
+function renderPluginTree(tree) {
+  $("plugin-count").textContent = pluginCount(tree.plugins) + " 个插件";
+  $("plugin-error").style.display = "none";
+  $("plugin-tree").innerHTML = `<div class="plugin-root">
+    <div class="plugin-head"><strong>${h(tree.host || "esc-host")}</strong><span class="chip">宿主</span><code>${h(tree.framework || "plugin-framework")}</code></div>
+    <div class="plugin-service">Ctx 服务：${h((tree.context_services || []).join("、") || "（空）")}</div>
+    <div class="plugin-service">HostCall 服务：${h((tree.host_services || []).join("、") || "（空）")}</div>
+  </div><ul class="plugin-tree">${(tree.plugins || []).map(pluginNodeHtml).join("")}</ul>`;
+}
+
+async function loadPlugins() {
+  const r = await api("/api/plugins");
+  if (!r.ok) {
+    $("plugin-count").textContent = "不可用";
+    $("plugin-tree").innerHTML = "";
+    $("plugin-error").textContent = errText(r);
+    $("plugin-error").style.display = "flex";
+    return;
+  }
+  renderPluginTree(r.data || {});
+}
+
+$("btn-refresh-plugins").onclick = loadPlugins;
+
 function switchTab(name) {
   S.tab = name;
   document.querySelectorAll("nav button").forEach((b) =>
@@ -420,6 +499,7 @@ function switchTab(name) {
     t.classList.toggle("on", t.id === "tab-" + name));
   if (name === "containers") loadContainers();
   if (name === "images") { loadImages(); loadJobs(); }
+  if (name === "plugins") loadPlugins();
 }
 
 /* ══════════════════════ 概览轮询 ══════════════════════ */
