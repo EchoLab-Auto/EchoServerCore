@@ -601,3 +601,9 @@ plugin_tree_auth = "admin:隧道面板的口令"
 不配置时其它功能不受影响，插件树页返回 503 并显示配置方法，不会把「未配置」
 误报成「0 个插件」。页面中的父子缩进和服务依赖都来自 `plugin-framework`
 的真实快照，具体语义见 `docs/PANEL.md`。
+
+## ui-frame 组件化前端
+
+本面板与隧道面板共用 `panel-ui/` 的 Vue 3 工程及 ui-frame 主题。容器、镜像和
+插件树均使用真实组件渲染，静态 JS/CSS 由本进程提供且嵌入二进制。源码与重建
+步骤见 `panel-ui/README.md`。

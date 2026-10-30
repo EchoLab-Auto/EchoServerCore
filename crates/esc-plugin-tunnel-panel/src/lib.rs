@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -237,6 +237,7 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/ui/{*path}", get(ui_asset))
         .route("/api/status", get(api_status))
         .route("/api/mappings", get(api_list).post(api_create))
         .route("/api/mappings/{id}", post(api_update).delete(api_delete))
@@ -280,6 +281,20 @@ async fn auth_middleware(
 
 async fn index(State(st): State<AppState>) -> Html<String> {
     Html(web::index_html(&st.title))
+}
+
+async fn ui_asset(Path(path): Path<String>) -> Response {
+    match web::asset(&path) {
+        Some(web::Asset::Css(body)) => {
+            ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], body).into_response()
+        }
+        Some(web::Asset::JavaScript(body)) => (
+            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn healthz() -> &'static str {

@@ -285,14 +285,12 @@ async fn plugin_tree_tab_and_unconfigured_state_are_honest() {
     let r = start(|_, _| {}).await;
     let (code, body) = http(&r.addr, "GET", "/", None).await;
     assert_eq!(code, 200);
-    for needle in [
-        "tab-plugins",
-        "data-tab=\"plugins\"",
-        "/api/plugins",
-        "服务器核心插件树",
-    ] {
-        assert!(body.contains(needle), "页面缺少 {needle}");
-    }
+    assert!(body.contains("/ui/server.js"));
+    assert!(body.contains("id=\"app\""));
+    let (code, shared) = http(&r.addr, "GET", "/ui/panel.js", None).await;
+    assert_eq!(code, 200);
+    assert!(shared.contains("/api/plugins"));
+    assert!(shared.contains("服务器核心插件树"));
 
     let (code, body) = http(&r.addr, "GET", "/api/plugins", None).await;
     assert_eq!(code, 503, "未配置上游不能伪装成空插件树：{body}");

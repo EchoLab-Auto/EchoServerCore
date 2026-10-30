@@ -770,48 +770,35 @@ async fn edge_endpoints_report_501_when_plugin_is_not_enabled() {
 }
 
 #[tokio::test]
-async fn index_html_ships_the_edge_router_ui() {
-    // 前端是一张单页；这块 UI 缺失时接口再好也没人能用。
+async fn ui_frame_entry_and_assets_are_served() {
     let r = start(None).await;
-    let (_, body) = common::http(&r.addr, "GET", "/", None, None).await;
-    for needle in [
-        "edge-card",
-        "btn-edge-new",
-        "form-edge",
-        "/api/edge",
-        "边缘路由",
-    ] {
-        assert!(body.contains(needle), "页面里应包含 {needle}");
-    }
-    // 回归：`.inline-form { display: flex }` 会压过 UA 的 `[hidden]`，导致
-    // 表单初始就显示、保存后也收不起来。这条兜底样式必须存在。
-    assert!(
-        body.contains("[hidden] { display: none !important; }"),
-        "缺少 [hidden] 兜底样式，内联表单会藏不住"
-    );
+    let (_, page) = common::http(&r.addr, "GET", "/", None, None).await;
+    assert!(page.contains("/ui/tunnel.js"));
+    let (code, css) = common::http(&r.addr, "GET", "/ui/panel.css", None, None).await;
+    assert_eq!(code, 200);
+    assert!(css.contains(".nm-tree"), "应包含 ui-frame 的树组件样式");
+    let (code, js) = common::http(&r.addr, "GET", "/ui/panel.js", None, None).await;
+    assert_eq!(code, 200);
+    assert!(js.contains("nm-tree"), "应包含真实的 ui-frame 组件");
+    let (code, entry) = common::http(&r.addr, "GET", "/ui/tunnel.js", None, None).await;
+    assert_eq!(code, 200);
+    assert!(entry.contains("/api/mappings"));
+    assert!(entry.contains("/api/edge"));
     r.token.cancel();
 }
 
 #[tokio::test]
-async fn plugin_tree_api_and_tab_are_wired() {
+async fn plugin_tree_api_is_wired_to_the_component_panel() {
     let r = start(None).await;
     let (code, body) = common::http(&r.addr, "GET", "/api/plugins", None, None).await;
     assert_eq!(code, 200, "{body}");
     let tree: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(tree["plugins"][0]["id"], "esc.tunnel");
     assert_eq!(tree["plugins"][0]["state"], "ready");
-
-    let (_, page) = common::http(&r.addr, "GET", "/", None, None).await;
-    for needle in [
-        "data-tab=\"plugins\"",
-        "tab-plugins",
-        "btn-plugins-refresh",
-        "/api/plugins",
-        "required_services",
-        "optional_services",
-        "plugin-children",
-    ] {
-        assert!(page.contains(needle), "插件树页面缺少 {needle}");
-    }
+    let (code, shared) = common::http(&r.addr, "GET", "/ui/panel.js", None, None).await;
+    assert_eq!(code, 200);
+    assert!(shared.contains("/api/plugins"));
+    assert!(shared.contains("required_services"));
+    assert!(shared.contains("optional_services"));
     r.token.cancel();
 }

@@ -294,3 +294,10 @@ curl -s -u admin:<口令> -o /dev/null -w "%{http_code}\n" \
 
 对应的只读 HTTP 端点是 `GET /api/plugins`，与面板其它端点使用相同认证。
 服务器面板可以把这个端点配成自己的上游，从而展示同一份数据。
+
+## ui-frame 组件化前端
+
+隧道面板与服务器面板共用 `panel-ui/` 的 Vue 3 + TypeScript 工程，按钮、卡片、
+页签、弹窗、输入控件、进度条与插件树均使用 `@echolab-auto/ui-frame`。
+组件库以固定 commit 的 Git submodule 引入；构建产物嵌入 Rust 二进制，运行时
+无需 Node 或 CDN。前端源码修改、类型检查、重建和浏览器烟测见 `panel-ui/README.md`。

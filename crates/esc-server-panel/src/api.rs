@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/ui/{*path}", get(ui_asset))
         .route("/api/overview", get(api_overview))
         .route("/api/host", get(api_host))
         .route("/api/plugins", get(api_plugins))
@@ -111,6 +112,20 @@ async fn guard(
 async fn index(State(st): State<AppState>) -> Html<String> {
     Html(web::index_html(&st.title))
 }
+async fn ui_asset(Path(path): Path<String>) -> Response {
+    match web::asset(&path) {
+        Some(web::Asset::Css(body)) => {
+            ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], body).into_response()
+        }
+        Some(web::Asset::JavaScript(body)) => (
+            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }

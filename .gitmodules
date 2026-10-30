@@ -1,0 +1,3 @@
+[submodule "panel-ui/vendor/ui-frame"]
+	path = panel-ui/vendor/ui-frame
+	url = git@github.com:EchoLab-Auto/ui-frame.git
