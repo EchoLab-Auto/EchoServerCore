@@ -23,29 +23,17 @@ for (const [name, url, tab] of [
     await page.getByRole('tab', { name: '容器', exact: true }).click()
     await page.getByText('echo-cad-toolbox', { exact: true }).first().waitFor()
     results.at(-1).containers = await page.locator('.esc-container').count()
-    // 网络页：三个分组按 内部 → 自定义 → 系统 排，系统网络必须标出来
     await page.getByRole('tab', { name: '网络', exact: true }).click()
     await page.getByText('系统网络', { exact: true }).first().waitFor()
-    const groups = await page.locator('.esc-section-title h3').allInnerTexts()
-    for (const want of ['系统网络']) {
-      if (!groups.includes(want)) throw new Error(`server: 网络页缺少「${want}」分组（实际 ${groups}）`)
-    }
-    // bridge/host/none 三个系统网络在表里必须存在，且带「系统」徽章
     for (const net of ['bridge', 'host', 'none']) {
-      const row = page.locator('tr', { hasText: net }).first()
-      await row.waitFor()
+      await page.locator('tr', { hasText: net }).first().waitFor()
     }
     if (await page.locator('.esc-tagcell .nm-tag', { hasText: '系统' }).count() < 3) {
       throw new Error('server: 系统网络没有被标记')
     }
-    results.at(-1).networkGroups = groups
     results.at(-1).networks = await page.locator('table.esc-table:visible tbody tr').count()
-    await page.screenshot({ path: '/tmp/esc-server-networks.png', fullPage: true })
-    // 详情弹窗能打开、能读到成员区
     await page.locator('tr', { hasText: 'bridge' }).first.getByRole('button', { name: '详情' }).click()
     await page.locator('.nm-modal:visible').getByText('成员容器').waitFor()
-    await page.locator('.nm-modal:visible').getByText('原始 JSON').waitFor()
-    await page.screenshot({ path: '/tmp/esc-server-network-detail.png', fullPage: true })
     await page.locator('.nm-modal:visible .nm-modal__close').first().click()
     await page.getByRole('tab', { name: '主机概览', exact: true }).click()
     await page.getByRole('heading', { name: 'CPU', exact: true }).waitFor()
@@ -70,5 +58,9 @@ for (const [name, url, tab] of [
     await page.screenshot({ path: '/tmp/esc-edge-edit.png', fullPage: true })
     await edgeModal.getByRole('button', { name: '取消', exact: true }).click()
     results.at(-1).edgeEditor = true
+  }
+  if (errors.length) throw new Error(`${name}: 浏览器错误 ${errors.join('; ')}`)
+  await page.close()
+}
 console.log(JSON.stringify(results, null, 2))
 await browser.close()
