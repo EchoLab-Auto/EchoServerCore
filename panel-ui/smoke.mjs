@@ -32,7 +32,7 @@ for (const [name, url, tab] of [
       throw new Error('server: 系统网络没有被标记')
     }
     results.at(-1).networks = await page.locator('table.esc-table:visible tbody tr').count()
-    await page.locator('tr', { hasText: 'bridge' }).first.getByRole('button', { name: '详情' }).click()
+    await page.locator('tr', { hasText: 'bridge' }).first().getByRole('button', { name: '详情' }).click()
     await page.locator('.nm-modal:visible').getByText('成员容器').waitFor()
     await page.locator('.nm-modal:visible .nm-modal__close').first().click()
     await page.getByRole('tab', { name: '主机概览', exact: true }).click()
