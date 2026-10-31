@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use esc_panel_auth::{AccessControl, Denied};
 
-use crate::docker::{CreateSpec, Docker, DockerError, Jobs};
+use crate::docker::{CreateSpec, Docker, DockerError, Jobs, NewNetwork};
 use crate::plugins::PluginTreeClient;
 use crate::sys::{self, Sampler};
 use crate::web;
@@ -71,7 +71,22 @@ pub fn router(state: AppState) -> Router {
             "/api/docker/images/{name}",
             axum::routing::delete(api_remove_image),
         )
-        .route("/api/docker/networks", get(api_networks))
+        .route(
+            "/api/docker/networks",
+            get(api_networks).post(api_create_network),
+        )
+        .route(
+            "/api/docker/networks/{id}",
+            get(api_network_detail).delete(api_remove_network),
+        )
+        .route(
+            "/api/docker/networks/{id}/connect",
+            post(api_connect_network),
+        )
+        .route(
+            "/api/docker/networks/{id}/disconnect",
+            post(api_disconnect_network),
+        )
         .route("/api/docker/jobs", get(api_jobs))
         .route("/api/docker/jobs/{id}", get(api_job))
         .route(
@@ -364,10 +379,130 @@ async fn api_set_restart(
     }
 }
 
+/// 网络列表。
+///
+/// 同时返回两份：`networks` 是完整形状（驱动 / 网段 / internal / 是否系统网络），
+/// `names` 只有名字。后者是历史行为的兜底 —— 「创建容器」的下拉框和任何外部
+/// 脚本都按 `names` 取值，不能让这次扩展把它们打断。
 async fn api_networks(State(st): State<AppState>) -> Response {
-    match st.docker.networks().await {
-        Ok(list) => Json(json!({ "networks": list })).into_response(),
+    match st.docker.networks_detail().await {
+        Ok(list) => {
+            let names: Vec<&str> = list.iter().map(|n| n.name.as_str()).collect();
+            Json(json!({ "networks": list, "names": names })).into_response()
+        }
         Err(e) => docker_error(e, "networks"),
+    }
+}
+
+/// 单个网络 + 它上面的成员容器。
+///
+/// 成员必须走这个端点：`GET /networks` 的返回里没有 `Containers` 字段，
+/// 列表页拿不到「谁接在上面」。
+async fn api_network_detail(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    match st.docker.network(&id).await {
+        Ok((network, containers)) => {
+            Json(json!({ "network": network, "containers": containers })).into_response()
+        }
+        Err(e) => docker_error(e, "network-detail"),
+    }
+}
+
+async fn api_create_network(State(st): State<AppState>, Json(body): Json<NewNetwork>) -> Response {
+    if !st.allow_create {
+        return forbidden("面板配置不允许创建网络（allow_create = false）");
+    }
+    // 先校验再记日志：拒掉的请求不该在日志里留下「要建 xxx」的痕迹。
+    if let Err(m) = body.validate() {
+        return bad_request(&m);
+    }
+    tracing::info!(
+        name = %body.name.trim(),
+        internal = body.internal,
+        subnet = body.subnet.as_deref().unwrap_or("(自动)"),
+        "面板请求创建网络"
+    );
+    match st.docker.create_network(&body).await {
+        Ok((id, warning)) => {
+            Json(json!({ "ok": true, "id": id, "warning": warning })).into_response()
+        }
+        Err(e) => docker_error(e, "network-create"),
+    }
+}
+
+async fn api_remove_network(State(st): State<AppState>, Path(id): Path<String>) -> Response {
+    if !st.allow_delete {
+        return forbidden("面板配置不允许删除（allow_delete = false）");
+    }
+    // 删网络不可撤销，还会打断依赖它的容器间通信 —— 用 warn 留痕。
+    tracing::warn!(%id, "面板请求删除网络");
+    match st.docker.remove_network(&id).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "network-remove"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkLinkBody {
+    /// 容器 ID 或容器名，Docker 自己解析两者。
+    container: String,
+    /// 接入时的固定 IPv4（留空由 Docker 分配）。
+    #[serde(default)]
+    ipv4: Option<String>,
+    /// 断开时是否强制。
+    ///
+    /// 默认 **false**：运行中的容器被断开最后一个网络后会彻底失去网络，
+    /// 这种后果必须由使用者显式确认，不能靠前端的默认值决定。
+    #[serde(default)]
+    force: bool,
+}
+
+/// 把容器接入网络。
+///
+/// 走 `allow_actions` 而不是 `allow_create`：它不新增任何东西，改的是
+/// 既有容器的网络归属 —— 与「启停容器」同一档风险。
+async fn api_connect_network(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<NetworkLinkBody>,
+) -> Response {
+    if !st.allow_actions {
+        return forbidden("面板配置为只读（allow_actions = false）");
+    }
+    let container = body.container.trim();
+    if container.is_empty() {
+        return bad_request("container 不能为空");
+    }
+    tracing::info!(%id, %container, "面板请求把容器接入网络");
+    match st
+        .docker
+        .connect_network(&id, container, body.ipv4.as_deref())
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "network-connect"),
+    }
+}
+
+async fn api_disconnect_network(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<NetworkLinkBody>,
+) -> Response {
+    if !st.allow_actions {
+        return forbidden("面板配置为只读（allow_actions = false）");
+    }
+    let container = body.container.trim();
+    if container.is_empty() {
+        return bad_request("container 不能为空");
+    }
+    tracing::info!(%id, %container, force = body.force, "面板请求把容器从网络断开");
+    match st
+        .docker
+        .disconnect_network(&id, container, body.force)
+        .await
+    {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => docker_error(e, "network-disconnect"),
     }
 }
 

@@ -44,6 +44,35 @@ async fn http(addr: &str, method: &str, path: &str, auth: Option<&str>) -> (u16,
     (status, body)
 }
 
+/// 带 JSON body 的 `http()`：写端点要用它，否则 axum 的 `Json` 提取器
+/// 会先因为缺 Content-Type 回一个 415，测不到我们自己的逻辑。
+async fn http_json(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+    let mut sock = tokio::net::TcpStream::connect(addr)
+        .await
+        .unwrap_or_else(|e| panic!("connect {addr}: {e}"));
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("无法解析状态行: {text}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
 fn basic(user_pass: &str) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(user_pass)
@@ -60,6 +89,29 @@ async fn start(tweak: impl FnOnce(&mut AuthConfig, &mut bool)) -> Running {
     let mut allow_actions = true;
     tweak(&mut auth, &mut allow_actions);
 
+    launch(auth, allow_actions, allow_actions, allow_actions).await
+}
+
+/// 起一个面板，**三档权限各给各的**。
+///
+/// `start()` 把它们绑成同一个开关（老测试只需要全开或全关）；网络这块要验证
+/// 「允许读、允许建、但不允许删」这类组合，所以需要一个更细的入口。
+async fn start_perm(allow_actions: bool, allow_create: bool, allow_delete: bool) -> Running {
+    launch(
+        AuthConfig::default(),
+        allow_actions,
+        allow_create,
+        allow_delete,
+    )
+    .await
+}
+
+async fn launch(
+    auth: AuthConfig,
+    allow_actions: bool,
+    allow_create: bool,
+    allow_delete: bool,
+) -> Running {
     let state = AppState {
         sampler: Arc::new(Sampler::new()),
         // 指向不存在的 socket：稳定复现「没装 Docker」
@@ -67,11 +119,12 @@ async fn start(tweak: impl FnOnce(&mut AuthConfig, &mut bool)) -> Running {
         title: "服务器面板测试".into(),
         access: Arc::new(AccessControl::new(&auth)),
         allow_actions,
-        allow_create: allow_actions,
-        allow_delete: allow_actions,
+        allow_create,
+        allow_delete,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
         plugin_tree: None,
     };
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let token = CancellationToken::new();
@@ -88,8 +141,6 @@ async fn start(tweak: impl FnOnce(&mut AuthConfig, &mut bool)) -> Running {
         token,
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn index_is_served_with_title_and_escaping() {
@@ -360,4 +411,138 @@ async fn configured_plugin_tree_is_proxied_from_the_core_panel() {
     assert_eq!(tree["host"], "esc-host");
     assert_eq!(tree["plugins"][0]["id"], "esc.tunnel");
     token.cancel();
+}
+
+// ── Docker 网络 ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn network_reads_degrade_to_503_when_docker_is_absent() {
+    let r = start(|_, _| {}).await;
+    for path in ["/api/docker/networks", "/api/docker/networks/bridge"] {
+        let (code, body) = http(&r.addr, "GET", path, None).await;
+        // 缺 Docker 是 503（此环境没这个功能），不能是 500（我们的 bug）
+        assert_eq!(code, 503, "{path} 实际 {code}: {body}");
+        assert!(body.contains("Docker 不可用"), "{path}: {body}");
+    }
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn creating_a_network_needs_allow_create() {
+    let r = start_perm(true, false, true).await;
+    let (code, body) =
+        http_json(&r.addr, "POST", "/api/docker/networks", r#"{"name":"x-net"}"#).await;
+    assert_eq!(code, 403, "allow_create=false 应拒绝创建网络，实际 {code}: {body}");
+    assert!(body.contains("allow_create"), "{body}");
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn deleting_a_network_needs_allow_delete_and_reads_do_not() {
+    let r = start_perm(true, true, false).await;
+
+    let (code, body) = http(&r.addr, "DELETE", "/api/docker/networks/abc", None).await;
+    assert_eq!(code, 403, "allow_delete=false 应拒绝删除网络，实际 {code}: {body}");
+    assert!(body.contains("不允许删除"), "{body}");
+
+    // 同一组合下读接口不受影响（Docker 缺席所以是 503，但**不是** 403）
+    let (code, _) = http(&r.addr, "GET", "/api/docker/networks", None).await;
+    assert_eq!(code, 503, "只有写操作该被权限闸拦住");
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn network_link_operations_follow_allow_actions() {
+    let r = start_perm(false, true, true).await;
+
+    for action in ["connect", "disconnect"] {
+        let (code, body) = http_json(
+            &r.addr,
+            "POST",
+            &format!("/api/docker/networks/abc/{action}"),
+            r#"{"container":"web"}"#,
+        )
+        .await;
+        assert_eq!(
+            code, 403,
+            "allow_actions=false 应拒绝 {action}，实际 {code}: {body}"
+        );
+    }
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn invalid_network_names_are_rejected_before_docker_is_touched() {
+    // 这个面板的 socket 不存在：任何真的打到 Docker 的请求都会变成 503。
+    // 因此「拿到 400」本身就证明校验发生在 socket 之前。
+    let r = start_perm(true, true, true).await;
+
+    for bad in ["", "   ", "-leading", "has space", "中文名"] {
+        let (code, body) = http_json(
+            &r.addr,
+            "POST",
+            "/api/docker/networks",
+            &serde_json::json!({ "name": bad }).to_string(),
+        )
+        .await;
+        assert_eq!(code, 400, "非法网络名 {bad:?} 应被拒，实际 {code}: {body}");
+        assert!(!body.contains("Docker 不可用"), "不该走到 Docker 那一层：{body}");
+    }
+
+    // 合法入参则应继续走到 Docker —— 于是表现为 503，说明前面的 400 不是运气
+    let (code, body) = http_json(
+        &r.addr,
+        "POST",
+        "/api/docker/networks",
+        r#"{"name":"ok-net","internal":true,"subnet":"172.30.0.0/24","gateway":"172.30.0.1"}"#,
+    )
+    .await;
+    assert_eq!(code, 503, "合法请求应到达 Docker 层，实际 {code}: {body}");
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn bad_subnets_are_rejected_with_an_explanation() {
+    let r = start_perm(true, true, true).await;
+
+    for (subnet, why) in [
+        ("172.30.0.0/16", "前缀过大"),
+        ("172.30.0.0/30", "前缀过小"),
+        ("172.30.0.7/24", "不是网络地址"),
+        ("nonsense", "格式错误"),
+    ] {
+        let (code, body) = http_json(
+            &r.addr,
+            "POST",
+            "/api/docker/networks",
+            &serde_json::json!({ "name": "n1", "subnet": subnet }).to_string(),
+        )
+        .await;
+        assert_eq!(code, 400, "{why}：{subnet} 应被拒，实际 {code}: {body}");
+    }
+
+    // 网关跑出子网之外
+    let (code, body) = http_json(
+        &r.addr,
+        "POST",
+        "/api/docker/networks",
+        r#"{"name":"n1","subnet":"172.30.0.0/24","gateway":"10.0.0.1"}"#,
+    )
+    .await;
+    assert_eq!(code, 400, "网关不在子网内应被拒，实际 {code}: {body}");
+    r.token.cancel();
+}
+
+#[tokio::test]
+async fn network_link_without_a_container_is_a_400() {
+    let r = start_perm(true, true, true).await;
+    let (code, body) = http_json(
+        &r.addr,
+        "POST",
+        "/api/docker/networks/abc/connect",
+        r#"{"container":"   "}"#,
+    )
+    .await;
+    assert_eq!(code, 400, "空容器标识应被拒，实际 {code}: {body}");
+    r.token.cancel();
 }

@@ -44,6 +44,13 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .esc-container-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .esc-container-title { font-weight: 600; }
 .esc-container-meta { margin: 8px 0; font-size: 12px; color: var(--nm-color-text-secondary); }
+/* 网络页：属性列里几个徽章要能换行 */
+.esc-tagcell { display: flex; flex-wrap: wrap; gap: 5px; }
+/* 内部网络的解释框：它是白色的正文段落里最容易被跳过的提示，所以加个底 */
+.esc-note { margin: 15px 0 0; padding: 11px 14px; border-left: 3px solid var(--nm-color-warning, #d97706);
+  background: var(--nm-color-bg); border-radius: 0 6px 6px 0; font-size: 13px; line-height: 1.7; }
+.esc-details { margin-top: 18px; }
+.esc-details summary { cursor: pointer; }
 .esc-progress { margin: 8px 0; }
 .esc-statline { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; margin: 9px 0; }
 .esc-flash { position: fixed; z-index: 3000; bottom: 24px; left: 50%; transform: translateX(-50%); width: min(600px, calc(100vw - 32px)); }

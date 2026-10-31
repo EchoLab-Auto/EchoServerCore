@@ -15,9 +15,13 @@
 //! | POST | `/containers/{id}/{start,stop,restart,pause,unpause}` | 启停 |
 //! | GET | `/containers/{id}/logs` | 日志（解码复用流） |
 //! | GET | `/containers/{id}/stats?stream=false` | 实时资源 |
+//! | GET | `/networks`、`/networks/{id}` | 网络列表 / 网络 + 成员 |
+//! | POST | `/networks/create`、`/networks/{id}/{connect,disconnect}` | 建网络 / 接入断开 |
+//! | DELETE | `/networks/{id}` | 删网络 |
 //!
-//! **刻意不实现**：创建/删除容器、exec、镜像 pull、volume/network 管理。
-//! 面板的定位是「看不正常的东西并把它拉起来」，不是替代 Docker CLI；每多一个
+//! **刻意不实现**：exec、volume 管理、网络驱动 overlay/macvlan/ipvlan、
+//! 修改已存在网络的子网、批量 prune。面板的定位是「看不正常的东西并把它
+//! 拉起来」，外加少量「隔离一组容器」的网络操作，不是替代 Docker CLI；每多一个
 //! 写操作就多一个能被滥用的入口，而删容器/起特权容器等于直接给 root。
 
 use std::path::{Path, PathBuf};
@@ -437,17 +441,119 @@ impl Docker {
         Ok(decode_multiplexed(&body))
     }
 
-    /// 网络列表（创建容器时选）。
-    pub async fn networks(&self) -> Result<Vec<String>, DockerError> {
+    /// 网络列表（完整形状）。一次 `GET /networks` 就够，**不含成员容器**。
+    ///
+    /// 成员的坑：`GET /networks` 的返回里没有 `Containers` 字段（实测 Docker
+    /// 29.8.2），只有 `GET /networks/{id}` 才有。所以列表页看不到成员，
+    /// 想知道「谁接在上面」得按需调 [`Docker::network`]。
+    pub async fn networks_detail(&self) -> Result<Vec<NetworkInfo>, DockerError> {
         let raw: Value = self.get_json("/networks").await?;
-        Ok(raw
+        let arr = raw
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|n| n.get("Name").and_then(Value::as_str).map(str::to_string))
-                    .collect()
+            .ok_or_else(|| DockerError::Protocol("网络列表不是数组".into()))?;
+        Ok(arr.iter().map(NetworkInfo::from_api).collect())
+    }
+
+    /// 单个网络 + 它上面的成员容器。
+    pub async fn network(&self, id: &str) -> Result<(NetworkInfo, Vec<NetworkMember>), DockerError> {
+        Self::check_id(id)?;
+        let raw: Value = self.get_json(&format!("/networks/{}", enc(id))).await?;
+        Ok((
+            NetworkInfo::from_api(&raw),
+            NetworkMember::list_from(&raw),
+        ))
+    }
+
+    /// 创建网络。返回 (id, warning)；`warning` 非空时 Docker 想说点什么
+    /// （比如网段和已有网络重叠），前端要显示出来而不是吞掉。
+    pub async fn create_network(&self, spec: &NewNetwork) -> Result<(String, String), DockerError> {
+        let body = spec.to_api()?;
+        let (status, raw) = self
+            .request_with_timeout("POST", "/networks/create", Some(&body), ACTION_TIMEOUT)
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(DockerError::Failed {
+                status,
+                message: error_message(&raw),
+            });
+        }
+        let v: Value = serde_json::from_slice(&raw)
+            .map_err(|e| DockerError::Protocol(format!("创建网络的响应无法解析：{e}")))?;
+        Ok((
+            v.get("Id").and_then(Value::as_str).unwrap_or("").to_string(),
+            v.get("Warning").and_then(Value::as_str).unwrap_or("").to_string(),
+        ))
+    }
+
+    /// 删除网络。预定义网络（bridge/host/none）Docker 会返回 403，原样透传。
+    pub async fn remove_network(&self, id: &str) -> Result<(), DockerError> {
+        Self::check_id(id)?;
+        let (status, body) = self
+            .request_with_timeout("DELETE", &format!("/networks/{}", enc(id)), None, ACTION_TIMEOUT)
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(DockerError::Failed {
+                status,
+                message: error_message(&body),
             })
-            .unwrap_or_default())
+        }
+    }
+
+    /// 把容器接入网络。`ipv4` 可指定固定地址（留空由 Docker 分配）。
+    ///
+    /// 注意：`Container` 字段既接受容器 ID 也接受名字，Docker 自己解析。
+    pub async fn connect_network(
+        &self,
+        net: &str,
+        container: &str,
+        ipv4: Option<&str>,
+    ) -> Result<(), DockerError> {
+        Self::check_id(net)?;
+        Self::check_id(container)?;
+        let mut body = json!({ "Container": container.trim() });
+        if let Some(ip) = ipv4.map(str::trim).filter(|s| !s.is_empty()) {
+            body["EndpointConfig"] = json!({ "IPAMConfig": { "IPv4Address": ip } });
+        }
+        let path = format!("/networks/{}/connect", enc(net));
+        let (status, raw) = self
+            .request_with_timeout("POST", &path, Some(body.to_string().as_bytes()), ACTION_TIMEOUT)
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(DockerError::Failed {
+                status,
+                message: error_message(&raw),
+            })
+        }
+    }
+
+    /// 把容器从网络断开。`force` 会连「容器正在运行」也照断——Docker 默认
+    /// 拒绝断开运行中容器的最后一个网络（容器会变成完全没网），
+    /// 所以这个开关必须由使用者显式给出，不能默认 true。
+    pub async fn disconnect_network(
+        &self,
+        net: &str,
+        container: &str,
+        force: bool,
+    ) -> Result<(), DockerError> {
+        Self::check_id(net)?;
+        Self::check_id(container)?;
+        let body = json!({ "Container": container.trim(), "Force": force });
+        let path = format!("/networks/{}/disconnect", enc(net));
+        let (status, raw) = self
+            .request_with_timeout("POST", &path, Some(body.to_string().as_bytes()), ACTION_TIMEOUT)
+            .await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(DockerError::Failed {
+                status,
+                message: error_message(&raw),
+            })
+        }
     }
 
     async fn get_json(&self, path: &str) -> Result<Value, DockerError> {
@@ -843,6 +949,354 @@ impl Image {
             created: v.get("Created").and_then(Value::as_i64).unwrap_or(0),
         }
     }
+}
+
+// ── 网络 ─────────────────────────────────────────────────────────────────────
+
+/// 一个网络的静态信息。字段名与 `GET /networks` 的 JSON 对齐。
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkInfo {
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    pub scope: String,
+    pub created: String,
+    /// **internal 网络**：没有通往宿主外部的路由，容器只能与本网络内成员通信，
+    /// `-p` 端口映射也不生效。这是本功能最容易被误解的属性，所以单独拎出来。
+    pub internal: bool,
+    pub attachable: bool,
+    pub ingress: bool,
+    pub ipv6: bool,
+    /// bridge / host / none / ingress：Docker 不允许删，也不让随便接入。
+    /// 在解析阶段就标出来，前端直接把按钮置灰，不用等一个 403 再解释。
+    pub system: bool,
+    pub subnets: Vec<Subnet>,
+    pub labels: Vec<(String, String)>,
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Subnet {
+    pub subnet: String,
+    pub gateway: String,
+}
+
+/// 网络上的一个成员容器。只有 `GET /networks/{id}` 有这份数据，
+/// 列表接口（`GET /networks`）返回的对象里**没有** `Containers` 字段。
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkMember {
+    pub id: String,
+    pub name: String,
+    pub ipv4: String,
+    pub ipv6: String,
+    pub mac: String,
+}
+
+/// 创建网络的入参。**驱动固定 bridge**：overlay 要 swarm，macvlan/ipvlan
+/// 要指定父网卡和 vlan id，都不是「在面板点两下」能讲清楚的东西，
+/// 逼用户去 CLI 反而更安全。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewNetwork {
+    pub name: String,
+    #[serde(default)]
+    pub internal: bool,
+    /// IPv4 CIDR。留空 = 让 Docker 自己挑一个不冲突的网段（最常用）。
+    #[serde(default)]
+    pub subnet: Option<String>,
+    #[serde(default)]
+    pub gateway: Option<String>,
+    #[serde(default)]
+    pub ipv6: bool,
+}
+
+impl NetworkInfo {
+    fn from_api(v: &Value) -> Self {
+        let name = v
+            .get("Name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ingress = v.get("Ingress").and_then(Value::as_bool).unwrap_or(false);
+        // Labels / Options 是 map，排序后输出：HashMap 顺序不稳定，
+        // 不排的话前端每刷新一次顺序都可能变。
+        let pairs = |key: &str| -> Vec<(String, String)> {
+            let mut list: Vec<(String, String)> = v
+                .get(key)
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            list.sort();
+            list
+        };
+        Self {
+            id: v.get("Id").and_then(Value::as_str).unwrap_or("").to_string(),
+            system: ingress || matches!(name.as_str(), "bridge" | "host" | "none"),
+            name,
+            driver: v
+                .get("Driver")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            scope: v
+                .get("Scope")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            created: v
+                .get("Created")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            internal: v.get("Internal").and_then(Value::as_bool).unwrap_or(false),
+            attachable: v
+                .get("Attachable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ingress,
+            // EnableIPv6 是老字段；EnableIPv4 才是 28.x 之后加的 ——
+            // 两者都缺也不能让整个列表 500，取默认值就好。
+            ipv6: v.get("EnableIPv6").and_then(Value::as_bool).unwrap_or(false),
+            subnets: v
+                .get("IPAM")
+                .and_then(|i| i.get("Config"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|c| Subnet {
+                            subnet: c
+                                .get("Subnet")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            gateway: c
+                                .get("Gateway")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                        .filter(|s| !s.subnet.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            labels: pairs("Labels"),
+            options: pairs("Options"),
+        }
+    }
+}
+impl NetworkMember {
+    /// 从 `GET /networks/{id}` 的 `Containers` 对象里取出成员。
+    ///
+    /// 这些成员**只含运行中的容器** —— Docker 不给已停止容器分配 endpoint，
+    /// 所以「网络上没成员」不等于「没容器用过它」。
+    /// 按名字排序：HashMap 迭代顺序不稳定，不排的话前端每刷新一次就重排一次。
+    fn list_from(v: &Value) -> Vec<NetworkMember> {
+        let mut members: Vec<NetworkMember> = v
+            .get("Containers")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .map(|(cid, m)| NetworkMember {
+                        id: cid.clone(),
+                        name: m
+                            .get("Name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        ipv4: m
+                            .get("IPv4Address")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        ipv6: m
+                            .get("IPv6Address")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        mac: m
+                            .get("MacAddress")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        members.sort_by(|a, b| a.name.cmp(&b.name));
+        members
+    }
+}
+
+impl NewNetwork {
+    /// 校验在**本机**做完，不依赖 Docker 报错。
+    ///
+    /// 两个理由：一是有话可说（「前缀必须 /24–/29」比 Docker 的
+    /// "invalid subnet" 有用得多）；二是非法请求根本不该打到 daemon ——
+    /// 每一条都是白跑的 syscall，还可能留下半个半成品网络。
+    pub fn validate(&self) -> Result<(), String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("网络名不能为空".into());
+        }
+        if name.len() > 63 {
+            return Err(format!("网络名最长 63 字符，当前 {}", name.len()));
+        }
+        let first = name.chars().next().unwrap_or(' ');
+        if !first.is_ascii_alphanumeric() {
+            return Err("网络名必须以字母或数字开头".into());
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        {
+            return Err(format!("网络名含非法字符 {bad:?}（只允许字母、数字与 _ . -）"));
+        }
+
+        let subnet = self.subnet.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let gateway = self
+            .gateway
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let Some(subnet) = subnet else {
+            // 不指定网段时 Docker 自己挑，这是最常见的用法。
+            if gateway.is_some() {
+                return Err("填了网关就必须同时填子网".into());
+            }
+            return Ok(());
+        };
+
+        let (net, prefix) = parse_cidr(subnet).ok_or_else(|| {
+            format!("子网 {subnet:?} 不是合法的 IPv4 CIDR（例：172.30.0.0/24）")
+        })?;
+        if !(24..=29).contains(&prefix) {
+            return Err(format!(
+                "子网前缀必须在 /24–/29 之间，收到 /{prefix}：太大一次吃掉整个地址池，\
+                 太小装不下几个容器"
+            ));
+        }
+        let mask = prefix_mask(prefix);
+        if net & !mask != 0 {
+            return Err(format!(
+                "子网 {subnet} 不是网络地址（主机位必须为 0），应写成 {}/{prefix}",
+                format_ipv4(net & mask)
+            ));
+        }
+        if let Some(gw) = gateway {
+            let g = parse_ipv4(gw)
+                .ok_or_else(|| format!("网关 {gw:?} 不是合法的 IPv4 地址"))?;
+            if g & mask != net & mask {
+                return Err(format!(
+                    "网关 {gw} 不在子网 {}/{prefix} 里",
+                    format_ipv4(net)
+                ));
+            }
+            if g & !mask == 0 {
+                return Err(format!(
+                    "网关不能是网络地址 {gw}（那是网段本身，不能分配给接口）"
+                ));
+            }
+            if g == net | !mask {
+                return Err(format!("网关不能是广播地址 {gw}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn to_api(&self) -> Result<Vec<u8>, DockerError> {
+        self.validate()
+            .map_err(|m| DockerError::Failed { status: 400, message: m })?;
+        let mut body = json!({
+            "Name": self.name.trim(),
+            // 驱动固定 bridge，见结构体注释。
+            "Driver": "bridge",
+            "Internal": self.internal,
+            "EnableIPv6": self.ipv6,
+            // Attachable 只对 overlay/swarm 有意义，bridge 上恒 false。
+            "Attachable": false,
+            // 撞名时让 Docker 直接拒绝，而不是静默返回那个已有的网络 ——
+            // 否则「创建成功」的提示会骗人。
+            "CheckDuplicate": true,
+            // 打个标记，方便日后从 CLI 一眼看出哪些是面板建的。
+            "Labels": { "esc.server-panel": "1" },
+        });
+        if let Some(subnet) = self
+            .subnet
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut cfg = json!({ "Subnet": subnet });
+            if let Some(gw) = self
+                .gateway
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cfg["Gateway"] = json!(gw);
+            }
+            body["IPAM"] = json!({ "Driver": "default", "Config": [cfg] });
+        }
+        serde_json::to_vec(&body)
+            .map_err(|e| DockerError::Protocol(format!("构造创建网络的请求失败：{e}")))
+    }
+}
+
+/// 解析点分十进制 IPv4。故意严格：`010` 这种带前导零的写法 Docker 也会拒，
+/// 我们提前拒掉，错误信息还能说清是哪一段。
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let mut parts = s.split('.');
+    let mut acc: u32 = 0;
+    for _ in 0..4 {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if p.len() > 1 && p.starts_with('0') {
+            return None;
+        }
+        let v: u32 = p.parse().ok()?;
+        if v > 255 {
+            return None;
+        }
+        acc = (acc << 8) | v;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(acc)
+}
+
+fn parse_cidr(s: &str) -> Option<(u32, u8)> {
+    let (ip, prefix) = s.split_once('/')?;
+    let ip = parse_ipv4(ip.trim())?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    Some((ip, prefix))
+}
+
+fn prefix_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn format_ipv4(n: u32) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        (n >> 24) & 0xff,
+        (n >> 16) & 0xff,
+        (n >> 8) & 0xff,
+        n & 0xff
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2015,5 +2469,203 @@ mod tests {
             matches!(err, DockerError::Unavailable(_)),
             "连不上 socket 应是 Unavailable（面板据此显示「未安装」），实际 {err}"
         );
+    }
+
+    // ── 网络 ─────────────────────────────────────────────────────────────────
+
+    fn net(name: &str, extra: Value) -> NetworkInfo {
+        let mut v = json!({ "Name": name, "Id": "abc123", "Driver": "bridge", "Scope": "local" });
+        for (k, val) in extra.as_object().cloned().unwrap_or_default() {
+            v[k] = val;
+        }
+        NetworkInfo::from_api(&v)
+    }
+
+    #[test]
+    fn network_info_parses_a_full_payload() {
+        let n = NetworkInfo::from_api(&json!({
+            "Name": "proj_default",
+            "Id": "9f1c2d3e4f",
+            "Created": "2026-10-31T13:32:33.648003388+08:00",
+            "Driver": "bridge",
+            "Scope": "local",
+            "Internal": true,
+            "Attachable": false,
+            "EnableIPv6": true,
+            "Ingress": false,
+            "IPAM": { "Driver": "default", "Config": [
+                { "Subnet": "172.31.240.0/24", "Gateway": "172.31.240.1" }
+            ]},
+            "Labels": { "com.docker.compose.project": "proj", "esc.server-panel": "1" },
+            "Options": {}
+        }));
+        assert_eq!(n.name, "proj_default");
+        assert_eq!(n.driver, "bridge");
+        assert!(n.internal, "Internal 必须原样带出来");
+        assert!(n.ipv6);
+        assert!(!n.system, "自定义网络不是系统网络");
+        assert_eq!(n.subnets.len(), 1);
+        assert_eq!(n.subnets[0].subnet, "172.31.240.0/24");
+        assert_eq!(n.subnets[0].gateway, "172.31.240.1");
+        assert_eq!(n.labels.len(), 2);
+        // 排序后输出，顺序稳定
+        assert_eq!(n.labels[0].0, "com.docker.compose.project");
+    }
+
+    #[test]
+    fn network_info_survives_an_empty_payload() {
+        // 不同 Docker 版本的字段会少；缺字段不能让整个列表 500。
+        let n = NetworkInfo::from_api(&json!({}));
+        assert_eq!(n.name, "");
+        assert_eq!(n.driver, "");
+        assert!(!n.internal);
+        assert!(!n.system);
+        assert!(n.subnets.is_empty());
+        assert!(n.labels.is_empty());
+    }
+
+    #[test]
+    fn predefined_networks_are_flagged_system() {
+        for name in ["bridge", "host", "none"] {
+            assert!(net(name, json!({})).system, "{name} 应标记为系统网络");
+        }
+        // 自定义网络即便有像 bridge 的前缀也不是系统网络
+        assert!(!net("mybridge", json!({})).system);
+        // ingress 网络（swarm）同样不可删
+        assert!(net("ingress", json!({ "Ingress": true })).system);
+    }
+
+    #[test]
+    fn ipv4_and_cidr_parsing_is_strict() {
+        assert_eq!(parse_ipv4("172.31.240.1"), Some(0xAC1F_F001));
+        assert_eq!(parse_ipv4("0.0.0.0"), Some(0));
+        // 前导零会让 Docker 也困惑，直接拒
+        assert!(parse_ipv4("172.31.240.010").is_none());
+        assert!(parse_ipv4("172.31.240").is_none(), "三段不是合法 IPv4");
+        assert!(parse_ipv4("172.31.240.256").is_none());
+        assert!(parse_ipv4("172.31.240.1.5").is_none());
+        assert!(parse_ipv4("a.b.c.d").is_none());
+
+        assert_eq!(parse_cidr("10.0.0.0/8"), Some((0x0A00_0000, 8)));
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+        assert!(parse_cidr("10.0.0.0").is_none());
+        assert_eq!(format_ipv4(0xAC1F_F000), "172.31.240.0");
+    }
+
+    fn spec(name: &str, internal: bool, subnet: Option<&str>, gateway: Option<&str>) -> NewNetwork {
+        NewNetwork {
+            name: name.into(),
+            internal,
+            subnet: subnet.map(str::to_string),
+            gateway: gateway.map(str::to_string),
+            ipv6: false,
+        }
+    }
+
+    #[test]
+    fn network_name_rules_are_enforced_before_reaching_docker() {
+        assert!(spec("ok-name_1.2", false, None, None).validate().is_ok());
+        assert!(spec("", false, None, None).validate().is_err());
+        assert!(spec("   ", false, None, None).validate().is_err());
+        assert!(spec("-leading", false, None, None).validate().is_err());
+        assert!(spec("has space", false, None, None).validate().is_err());
+        assert!(spec("中文名", false, None, None).validate().is_err());
+        assert!(
+            spec(&"a".repeat(64), false, None, None).validate().is_err(),
+            "超过 63 字符应被拒"
+        );
+        assert!(spec(&"a".repeat(63), false, None, None).validate().is_ok());
+    }
+
+    #[test]
+    fn subnet_rules_keep_the_address_pool_sane() {
+        // 前缀限制：太大一次吃掉整个池，太小装不下几个容器
+        assert!(spec("n", false, Some("172.30.0.0/16"), None).validate().is_err());
+        assert!(spec("n", false, Some("172.30.0.0/30"), None).validate().is_err());
+        assert!(spec("n", false, Some("172.30.0.0/24"), None).validate().is_ok());
+        assert!(spec("n", false, Some("172.30.0.0/29"), None).validate().is_ok());
+        // 必须是网络地址
+        let err = spec("n", false, Some("172.30.0.7/24"), None)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("172.30.0.0/24"), "应提示正确写法，实际：{err}");
+        // 格式错误
+        assert!(spec("n", false, Some("172.30.0.0"), None).validate().is_err());
+        assert!(spec("n", false, Some("not-a-subnet/24"), None).validate().is_err());
+    }
+
+    #[test]
+    fn gateway_must_live_inside_the_subnet() {
+        assert!(spec("n", false, Some("172.30.0.0/24"), Some("172.30.0.1"))
+            .validate()
+            .is_ok());
+        assert!(spec("n", false, Some("172.30.0.0/24"), Some("172.31.0.1"))
+            .validate()
+            .is_err());
+        // 网关不能是网络地址本身
+        assert!(spec("n", false, Some("172.30.0.0/24"), Some("172.30.0.0"))
+            .validate()
+            .is_err());
+        // 也不能是广播地址
+        assert!(spec("n", false, Some("172.30.0.0/24"), Some("172.30.0.255"))
+            .validate()
+            .is_err());
+        // 只给网关不给子网 = 说不清，拒
+        assert!(spec("n", false, None, Some("172.30.0.1")).validate().is_err());
+    }
+
+    #[test]
+    fn create_body_only_carries_ipam_when_a_subnet_is_given() {
+        // 留空 = 让 Docker 自己挑网段，这是最常用的路径：body 里不能出现 IPAM，
+        // 否则 Docker 会按空 Config 处理而报错。
+        let body: Value =
+            serde_json::from_slice(&spec("auto-net", true, None, None).to_api().unwrap()).unwrap();
+        assert_eq!(body["Name"], "auto-net");
+        assert_eq!(body["Driver"], "bridge");
+        assert_eq!(body["Internal"], true);
+        assert_eq!(body["CheckDuplicate"], true, "撞名必须被拒，不能静默返回已有网络");
+        assert!(body.get("IPAM").is_none(), "没给子网时不该带 IPAM");
+        assert_eq!(body["Labels"]["esc.server-panel"], "1");
+
+        let body: Value =
+            serde_json::from_slice(&spec("sub-net", false, Some("172.30.0.0/24"), Some("172.30.0.1"))
+                .to_api()
+                .unwrap())
+            .unwrap();
+        assert_eq!(body["IPAM"]["Config"][0]["Subnet"], "172.30.0.0/24");
+        assert_eq!(body["IPAM"]["Config"][0]["Gateway"], "172.30.0.1");
+    }
+
+    #[test]
+    fn create_body_refuses_invalid_input_instead_of_calling_docker() {
+        let err = spec("bad name", false, None, None).to_api().unwrap_err();
+        assert!(
+            matches!(err, DockerError::Failed { status: 400, .. }),
+            "非法入参应是 400，实际 {err:?}"
+        );
+    }
+
+    #[test]
+    fn network_members_are_parsed_and_sorted_by_name() {
+        let members = NetworkMember::list_from(&json!({
+            "Containers": {
+                "bbb": { "Name": "zeta", "IPv4Address": "172.17.0.4/16", "MacAddress": "aa:bb" },
+                "aaa": { "Name": "alpha", "IPv4Address": "172.17.0.3/16", "MacAddress": "cc:dd" }
+            }
+        }));
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].name, "alpha", "应按名字排序，不用 map 的顺序");
+        assert_eq!(members[0].ipv4, "172.17.0.3/16");
+        assert_eq!(members[1].name, "zeta");
+        // id 用的是 Containers 的 key（容器短 ID）
+        assert_eq!(members[1].id, "bbb");
+    }
+
+    #[test]
+    fn network_without_members_yields_an_empty_list() {
+        // 列表接口（GET /networks）就没有 Containers 字段，不能因此报错
+        assert!(NetworkMember::list_from(&json!({ "Name": "bridge" })).is_empty());
+        assert!(NetworkMember::list_from(&json!({ "Containers": {} })).is_empty());
+        assert!(NetworkMember::list_from(&json!({})).is_empty());
     }
 }

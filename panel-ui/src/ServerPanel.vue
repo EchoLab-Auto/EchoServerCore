@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import Networks from './Networks.vue'
 import PluginTree from './PluginTree.vue'
 import { api, bytes, duration, flash, flashKind, flashText, json, stateVariant, tabItems } from './ui'
 
@@ -12,6 +13,7 @@ const networks = ref<string[]>([])
 const filter = ref('')
 const error = ref('')
 const plugins = ref<InstanceType<typeof PluginTree>>()
+const networksPanel = ref<InstanceType<typeof Networks>>()
 const creating = ref(false)
 const pulling = ref(false)
 const pullImage = ref('')
@@ -86,7 +88,7 @@ async function setRestart() {
 async function openCreate() {
   createForm.value = { image: 'nginx:alpine', name: '', cmd: '', env: '', ports: '', binds: '', restart: 'unless-stopped', network: '', auto_start: true }
   creating.value = true
-  try { networks.value = (await api('/api/docker/networks')).networks || [] } catch { networks.value = [] }
+  try { networks.value = (await api('/api/docker/networks')).names || [] } catch { networks.value = [] }
 }
 async function createContainer() {
   const f = createForm.value
@@ -108,6 +110,7 @@ async function removeImage(name: string) {
 watch(tab, value => {
   if (value === 'containers') loadContainers()
   if (value === 'images') { loadImages(); loadJobs() }
+  if (value === 'networks') networksPanel.value?.load()
   if (value === 'plugins') plugins.value?.load()
 })
 onMounted(() => {
@@ -121,8 +124,15 @@ onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer) })
 <template>
   <div class="esc-app">
     <header class="esc-header"><h1>服务器面板</h1><NeumorphismTag v-if="overview" :variant="overview.docker?.state === 'ok' ? 'success' : 'warning'">Docker {{ overview.docker?.state }}</NeumorphismTag><NeumorphismTag v-if="overview && !allowActions && !allowCreate && !allowDelete">只读</NeumorphismTag><span class="esc-spacer" /><NeumorphismButton size="small" @click="loadOverview">刷新</NeumorphismButton><span class="subtitle">主机指标与 Docker 管理 · ui-frame</span></header>
-    <NeumorphismTabs v-model="tab" class="esc-tabs" :tabs="tabItems([['overview','主机概览'],['containers','容器'],['images','镜像'],['plugins','插件树']])" />
+    <NeumorphismTabs v-model="tab" class="esc-tabs" :tabs="tabItems([['overview','主机概览'],['containers','容器'],['images','镜像'],['networks','网络'],['plugins','插件树']])" />
     <NeumorphismAlert v-if="error" type="error" title="面板连接失败" :message="error" />
+    <Networks
+      v-show="tab === 'networks'"
+      ref="networksPanel"
+      :allow-create="allowCreate"
+      :allow-actions="allowActions"
+      :allow-delete="allowDelete"
+    />
     <PluginTree v-show="tab === 'plugins'" ref="plugins" />
 
     <main v-if="overview" v-show="tab === 'overview'">

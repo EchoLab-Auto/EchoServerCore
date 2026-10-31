@@ -22,9 +22,11 @@ esc-server-panel ── 主机指标 + Docker 管理（:2224）   ← 本文
 | 磁盘 | 每个真实块设备的挂载点/设备/类型/使用率，`tmpfs`/`overlay` 等伪文件系统已过滤 |
 | Docker | 容器列表（状态灯、镜像、端口映射、Compose 项目分组、整栈启停）、启停/重启/暂停、**创建**、**删除**、**详情**、**改名**、**改重启策略**、增量日志、实时资源 |
 | 镜像 | 列表（标签/ID/大小/时间）、拉取（后台任务 + 进度）、删除 |
+| Docker 网络 | 列表（按 内部/自定义/系统 分组，标出驱动与网段）、详情与成员容器、**创建**、**删除**、容器**接入/断开** |
 | 进程 | Top 20（按 CPU 降序），PID/名称/CPU%/RSS/线程/用户/命令行 |
 
-页面每 3 秒轮询一次主机指标，每 6 秒刷新一次容器列表。单文件前端，没有构建步骤。
+页面每 3 秒轮询一次主机指标，每 6 秒刷新一次容器列表。前端是 Vue 3 + Vite
+构建的（见文末「ui-frame 组件化前端」），产物嵌进二进制，运行时不需要 Node。
 
 ## 为什么不做成 `esc-host` 的插件
 
@@ -94,9 +96,9 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
 | `max_auth_failures` | `8` | 同一来源在窗口内的失败次数上限，超出 429 |
 | `auth_fail_window_secs` | `60` | 失败计数窗口 |
 | `docker_socket` | `/var/run/docker.sock` | Docker socket 路径 |
-| `allow_actions` | `true` | 启停 / 重启 / 暂停 / 改名 / 改重启策略 |
-| `allow_create` | `true` | 创建容器、拉镜像 |
-| `allow_delete` | `true` | 删除容器 / 镜像（不可撤销，单独一道闸） |
+| `allow_actions` | `true` | 启停 / 重启 / 暂停 / 改名 / 改重启策略；把容器接入或断开网络 |
+| `allow_create` | `true` | 创建容器、拉镜像；创建 Docker 网络 |
+| `allow_delete` | `true` | 删除容器 / 镜像 / 网络（不可撤销，单独一道闸） |
 
 未知键会**报错**而不是忽略——`allow_action = false` 这种拼写错误如果被静默
 忽略，会变成「我明明关了啊」的谜案。
@@ -122,7 +124,12 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
 | GET | `/api/docker/containers/{id}/detail` | 结构化详情（env/挂载/网络/重启策略…） |
 | POST | `/api/docker/containers/{id}/rename` | `{"name": "..."}` |
 | POST | `/api/docker/containers/{id}/restart-policy` | `{"policy": "unless-stopped"}` |
-| GET | `/api/docker/networks` | 网络名列表（创建时选） |
+| GET | `/api/docker/networks` | 网络列表：`{"networks": [...], "names": [...]}` |
+| GET | `/api/docker/networks/{id}` | 单个网络 + 成员容器 |
+| POST | `/api/docker/networks` | 创建网络（body 见下） |
+| DELETE | `/api/docker/networks/{id}` | 删除网络 |
+| POST | `/api/docker/networks/{id}/connect` | `{"container": "...", "ipv4": "..."}`（ipv4 可省） |
+| POST | `/api/docker/networks/{id}/disconnect` | `{"container": "...", "force": false}` |
 | POST | `/api/docker/images/pull` | `{"image": "nginx:alpine"}` → 立刻返回 `{"job": "..."}` |
 | DELETE | `/api/docker/images/{name}` | 删除镜像 |
 | GET | `/api/docker/jobs` | 后台任务列表 |
@@ -131,15 +138,28 @@ openssl rand -base64 24 | tr -d '/+=' | cut -c1-28
 Docker 不可用时这些端点返回 **503**（服务不可用），而不是 500——前者说
 「这个功能在此环境不存在」，后者说「我们写错了」。
 
-### 刻意不提供的操作
+### 能力边界：做到了哪，以及刻意没做什么
 
-**create / rm / exec / pull / volume / network** 一概没有。允许清单在
-`docker.rs` 的 `ALLOWED_ACTIONS` 里，有一条测试专门锁住它——想加东西必须
-改测试并解释。
+**有的**：容器启停/重启/暂停、创建、删除、改名、改重启策略、日志、结构化详情；
+镜像拉取与删除；**网络查看、创建、删除、容器接入/断开**。
 
-理由：面板的定位是「看见不对的东西并把它拉起来」。每多一个写操作就多一个
-可被滥用的入口，而「删容器」和「起一个特权容器」在效果上都比「重启」严重
-得多，却只省一次 SSH。
+**刻意没有的**：
+
+| 不做 | 为什么 |
+|---|---|
+| `exec` | 等于给面板一个 root shell，没有任何收敛的余地 |
+| volume 管理 | 删卷就是删数据，收益远小于风险；请用 CLI |
+| 改容器网络以外的运行参数 | 等价于重建容器，面板假装能改只会让人误以为改成了 |
+| 网络驱动 overlay / macvlan / ipvlan | overlay 要 swarm，另两个要指定父网卡与 vlan，都不是「点两下」能讲清的东西 |
+| 修改已存在网络的子网 | Docker 本身就不支持；重建才是唯一路径 |
+| 批量 prune | 一条命令删一堆东西，和面板「看清楚再动手」的定位冲突 |
+
+容器动作的允许清单在 `docker.rs` 的 `ALLOWED_ACTIONS` 里，有一条测试专门
+锁住它——想加东西必须改测试并解释。
+
+理由：面板的定位是「看见不对的东西并把它拉起来」，外加少量「隔离一组容器」
+的网络操作。每多一个写操作就多一个可被滥用的入口，而「删容器」和「起一个
+特权容器」在效果上都比「重启」严重得多，却只省一次 SSH。
 
 ## 安全模型
 
@@ -253,6 +273,9 @@ curl --unix-socket /var/run/docker.sock http://d/containers/json?all=1 | head -c
 | 所有指标都是 0 | 看页头有没有采样失败横幅，再看日志里的 ERROR |
 | 容器动作返回 403 | 配置了 `allow_actions = false` |
 | 容器动作返回 503 | Docker 不可用（未安装或 daemon 挂了） |
+| 删除网络返回 403 | 预定义网络（bridge/host/none），或仍有容器接在上面 |
+| 创建网络返回「already exists」 | 撞名。Docker 不会覆盖，换个名字 |
+| 网络列表看不到自己的容器 | 已停止的容器不再有 endpoint，Docker 就不报它了 |
 
 ## 与隧道面板的关系
 
@@ -514,6 +537,81 @@ Docker 的 `since` 有两个坑，都踩到了：
   拉不动**，而 docker 的报错只会说 `failed to do request ... i/o timeout`，
   完全指不到这里。
 
+### 网络管理（2026-10-31 补齐）
+
+面板的「网络」标签页把 Docker 网络从「创建容器时的一排名字」变成了可查看、
+可管理的对象。
+
+**列表**按三组排列，顺序就是运维关心的顺序：
+
+| 分组 | 内容 | 能做 |
+|---|---|---|
+| 内部网络 | `--internal` 创建的，`internal: true` | 详情 / 接入 / 删除 |
+| 自定义网络 | compose 建的 `*_default`、手建的普通网络 | 同上 |
+| 系统网络 | `bridge` / `host` / `none` / ingress | 只能看 |
+
+系统网络在**解析阶段**就被标出来（`NetworkInfo::system`），前端直接把按钮
+置灰、后端也不会发那条注定 403 的请求。
+
+**internal 网络到底是什么**（这是最容易被误解的一点）：Docker 不给它配
+NAT 与默认路由，于是
+
+- 容器**没有外网出口**；
+- `-p 8080:80` 这种端口映射**不生效**（宿主根本没有到它的转发路径）；
+- 容器只能与同一网络内的成员通信 —— 这正是「隔离一组服务」想要的效果。
+
+实测对照（同一镜像，只看 `/proc/net/route`）：
+
+```
+--network <internal>   dst=00FC1FAC gw=00000000      ← 只有直连路由，无默认网关
+--network bridge       dst=00000000 gw=010011AC      ← 有默认网关
+```
+
+**创建**只支持 `bridge` 驱动，参数是名字 / 是否 internal / 子网 / 网关 / IPv6：
+
+```json
+{ "name": "isolated-net", "internal": true, "subnet": "172.30.0.0/24", "gateway": "172.30.0.1" }
+```
+
+校验全在本机做完，不靠 Docker 报错：
+
+| 规则 | 原因 |
+|---|---|
+| 名字 1–63 字符，字母数字开头，只允许 `_ . -` | Docker 的限制；提前拒能说清是哪一条 |
+| 子网前缀必须 `/24`–`/29` | 太大一次吃掉整个地址池，太小装不下几个容器 |
+| 子网必须是网络地址（主机位为 0） | 报错时直接给出正确写法：`172.30.0.7/24` → 「应写成 172.30.0.0/24」 |
+| 网关必须落在子网内，且不是网络/广播地址 | 这两个地址不能分配给接口 |
+| 只填网关不填子网 | 说不清意图，拒 |
+
+子网**留空**是最常用的路径：不带 `IPAM` 字段，让 Docker 自己挑一个不与现有
+网络冲突的网段（实测在建了 8 个网络的机器上会自动挑 172.23.0.0/16）。
+
+**接入 / 断开**容器走 `allow_actions` 而不是 `allow_create` —— 它不新增东西，
+改的是既有的网络归属，与「启停容器」同一档风险。
+
+- 接入立即生效，**容器不重启**，网络栈会短暂中断；
+- 断开时 `force` 默认 `false`：Docker 默认拒绝摘掉运行中容器的最后一个网络
+  （摘掉之后它彻底没网），所以面板把它做成详情页里一个显式的「强制断开」开关，
+  而不是藏在二次确认里。
+
+**删除**是不可撤销的，所以 UI 上要**手打网络名**才解锁「永久删除」按钮
+（比删容器的一步 `confirm()` 更重）。Docker 还有两道天然保护：
+预定义网络拒绝删除（403 `is a pre-defined network`），有成员时拒绝删除
+（403 `has active endpoints`）。
+
+### 网络列表为什么同时返回 `networks` 和 `names`
+
+`GET /api/docker/networks` 原来返回 `{"networks": ["bridge", ...]}`，扩成完整
+对象数组会打断所有按名字取值的调用方 —— 首当其冲的是「创建容器」弹窗里的
+网络下拉。所以响应里同时给出：
+
+```json
+{ "networks": [{"name": "bridge", "driver": "...", "internal": false, ...}], "names": ["bridge", ...] }
+```
+
+前端下拉继续用 `names`，网络页用 `networks`。这是**故意保留的冗余**，不是
+忘了删：留着它，外部脚本和未来新增的调用点都不会因为这次扩展而碎掉。
+
 ### 整栈启停
 
 容器列表按 Compose 项目分组，组头带「全部启动 / 全部停止」。批量操作是
@@ -559,7 +657,12 @@ allow_delete  = false
 | GET | `/api/docker/images` | 镜像列表 |
 | POST | `/api/docker/images/pull` | `{"image": "..."}` → `{"job": "..."}` |
 | DELETE | `/api/docker/images/{name}` | 删除镜像 |
-| GET | `/api/docker/networks` | 网络名列表 |
+| GET | `/api/docker/networks` | 网络列表（含 `names` 兜底） |
+| GET | `/api/docker/networks/{id}` | 网络 + 成员容器 |
+| POST | `/api/docker/networks` | 创建网络 |
+| DELETE | `/api/docker/networks/{id}` | 删除网络 |
+| POST | `/api/docker/networks/{id}/connect` | 接入容器 |
+| POST | `/api/docker/networks/{id}/disconnect` | 断开容器 |
 | GET | `/api/docker/jobs` · `/api/docker/jobs/{id}` | 后台任务状态 |
 
 创建容器的 body（全部字段可选，除 `image`）：
