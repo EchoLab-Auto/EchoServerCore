@@ -251,7 +251,7 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/edge/routes", post(api_edge_upsert))
         .route(
             "/api/edge/routes/{prefix}",
-            axum::routing::delete(api_edge_delete),
+            post(api_edge_update).delete(api_edge_delete),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -424,7 +424,7 @@ async fn api_edge_upsert(
     if prefix.is_empty() {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "缺少 prefix（域名前缀）".into(),
+            "缺少 prefix（域名前缀或完整域名）".into(),
         ));
     }
     let Some(port) = port else {
@@ -439,14 +439,39 @@ async fn api_edge_upsert(
             format!("port 必须在 1..=65535，拿到 {port}"),
         ));
     }
-    Ok(Json(
-        st.backend
-            .call_edge(
-                method::EDGE_ROUTE_UPSERT,
-                json!({ "prefix": prefix, "port": port }),
-            )
-            .await?,
-    ))
+    Ok(Json(call_edge_upsert(&st, None, prefix, port).await?))
+}
+
+/// `POST /api/edge/routes/{prefix}`：编辑已有路由；路径里的旧键是权威的。
+async fn api_edge_update(
+    State(st): State<AppState>,
+    Path(old_prefix): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let prefix = body.get("prefix").and_then(Value::as_str).unwrap_or("").trim();
+    let port = body.get("port").and_then(Value::as_u64);
+    if prefix.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 prefix（域名前缀或完整域名）".into()));
+    }
+    let Some(port) = port else {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "缺少 port（本机端口）".into()));
+    };
+    if port == 0 || port > 65535 {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("port 必须在 1..=65535，拿到 {port}")));
+    }
+    Ok(Json(call_edge_upsert(&st, Some(old_prefix), prefix, port).await?))
+}
+
+async fn call_edge_upsert(
+    st: &AppState,
+    old_prefix: Option<String>,
+    prefix: &str,
+    port: u64,
+) -> Result<Value, ApiError> {
+    Ok(st.backend.call_edge(
+        method::EDGE_ROUTE_UPSERT,
+        json!({ "prefix": prefix, "port": port, "old_prefix": old_prefix }),
+    ).await?)
 }
 
 /// `DELETE /api/edge/routes/{prefix}`：删掉一条路由。

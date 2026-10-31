@@ -213,8 +213,19 @@ impl EdgeRouter {
     /// 与契约里的 [`EdgeRouteControl::upsert_route`] 是同一个语义，这里用
     /// 拆开的 (prefix, port) 方便内部调用与测试；trait 实现直接转调。
     pub fn upsert_route(&self, prefix: &str, port: u16) -> Result<EdgeRoute, ControlError> {
+        self.upsert_route_with_old(prefix, port, None)
+    }
+
+    fn upsert_route_with_old(
+        &self,
+        prefix: &str,
+        port: u16,
+        old_prefix: Option<&str>,
+    ) -> Result<EdgeRoute, ControlError> {
         let prefix = prefix.trim().to_ascii_lowercase();
+        let old_prefix = old_prefix.map(|p| p.trim().to_ascii_lowercase());
         let ok = !prefix.is_empty()
+            && prefix.len() <= 253
             && prefix.chars().all(|c| {
                 c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
             })
@@ -232,6 +243,11 @@ impl EdgeRouter {
         // 串行化「读-改-写盘-替换」全过程，避免两个并发变更互相覆盖。
         let _gate = self.write_gate.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = self.routes.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(old) = &old_prefix {
+            if old != &prefix && next.remove(old).is_none() {
+                return Err(ControlError::not_found(format!("没有这个路由：{old}")));
+            }
+        }
         next.insert(prefix.clone(), port);
 
         // **先落盘、再改内存**：这样"返回成功"永远意味着内存与磁盘都生效。
@@ -583,8 +599,7 @@ impl EdgeRouteControl for EdgeRouter {
     }
 
     async fn upsert_route(&self, spec: EdgeRouteUpsert) -> Result<EdgeRoute, ControlError> {
-        // 复用 inherent 方法（同一套校验），不重复实现规则。
-        self.upsert_route(&spec.prefix, spec.port)
+        self.upsert_route_with_old(&spec.prefix, spec.port, spec.old_prefix.as_deref())
     }
 
     async fn delete_route(&self, prefix: &str) -> Result<(), ControlError> {
@@ -939,6 +954,30 @@ mod tests {
         // 删不存在的要报 not_found（而不是静默成功）。
         let err = r.delete_route("cad").unwrap_err();
         assert_eq!(err.kind, esc_control_api::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn control_edit_renames_and_persists_full_domain() {
+        let dir = std::env::temp_dir().join(format!("esc-edge-edit-{}", std::process::id()));
+        let path = dir.join("routes.toml");
+        let cfg = crate::config::RouterConfig::from_json(&serde_json::json!({
+            "listen": ["127.0.0.1:0"], "routes": {"cad": 2228}, "store": path
+        })).unwrap();
+        let r = EdgeRouter::new(&cfg, vec![]);
+        EdgeRouteControl::upsert_route(&*r, EdgeRouteUpsert {
+            prefix: "CAD.Example.COM".into(), port: 8080, old_prefix: Some("cad".into()),
+        }).await.unwrap();
+        assert!(matches!(r.resolve("cad.other.com"), Resolution::Unrouted { .. }));
+        assert!(matches!(r.resolve("cad.example.com"), Resolution::Backend { port: 8080, .. }));
+        let err = EdgeRouteControl::upsert_route(&*r, EdgeRouteUpsert {
+            prefix: "new.example.com".into(), port: 8080, old_prefix: Some("missing".into()),
+        }).await.unwrap_err();
+        assert_eq!(err.kind, esc_control_api::ErrorKind::NotFound);
+        assert_eq!(r.routes().len(), 1, "改名失败不应留下半成品");
+        let saved = std::fs::read_to_string(dir.join("routes.toml")).unwrap();
+        assert!(saved.contains("\"cad.example.com\" = 8080"));
+        assert!(!saved.lines().any(|line| line.starts_with("cad =")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

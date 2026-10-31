@@ -17,9 +17,10 @@ const exportData = ref<any>(null)
 const editingEdge = ref(false)
 const form = ref<any>({})
 const edgeForm = ref({ prefix: '', port: 2228 })
+const edgeOriginalPrefix = ref('')
+const savingEdge = ref(false)
 const plugins = ref<InstanceType<typeof PluginTree>>()
 let timer: ReturnType<typeof setInterval> | undefined
-
 async function loadTunnel(quiet = false) {
   try {
     const [s, m] = await Promise.all([api('/api/status'), api('/api/mappings')])
@@ -72,11 +73,24 @@ function downloadExport() {
   const a = document.createElement('a'); a.href = url; a.download = exportData.value.filename; a.click()
   URL.revokeObjectURL(url)
 }
+function openEdge(route: any = null) {
+  edgeOriginalPrefix.value = route?.prefix || ''
+  edgeForm.value = { prefix: route?.prefix || '', port: route?.port || 2228 }
+  editingEdge.value = true
+}
+function edgeAddress(prefix: string) {
+  return prefix.includes('.') ? prefix : `${prefix}.<任意域名>`
+}
 async function saveEdge() {
+  if (savingEdge.value) return
+  savingEdge.value = true
   try {
-    await json('POST', '/api/edge/routes', { prefix: edgeForm.value.prefix.trim(), port: Number(edgeForm.value.port) })
-    editingEdge.value = false; edgeForm.value.prefix = ''; flash('边缘路由已保存'); await loadEdge()
-  } catch (e) { flash((e as Error).message, 'error') }
+    const old = edgeOriginalPrefix.value
+    await json('POST', old ? `/api/edge/routes/${encodeURIComponent(old)}` : '/api/edge/routes', {
+      prefix: edgeForm.value.prefix.trim(), port: Number(edgeForm.value.port),
+    })
+    editingEdge.value = false; edgeOriginalPrefix.value = ''; flash('边缘路由已保存'); await loadEdge()
+  } catch (e) { flash((e as Error).message, 'error') } finally { savingEdge.value = false }
 }
 async function removeEdge(prefix: string) {
   if (!confirm(`确定删除边缘路由「${prefix}」？`)) return
@@ -139,12 +153,12 @@ onBeforeUnmount(() => clearInterval(timer))
         </tbody></table></div>
       </NeumorphismCard>
 
-      <div class="esc-section-title"><h2>边缘路由</h2><NeumorphismTag v-if="edge" variant="success">已启用</NeumorphismTag><span class="esc-spacer" /><NeumorphismButton v-if="edge" size="small" variant="primary" @click="editingEdge = true">＋ 新建路由</NeumorphismButton></div>
+      <div class="esc-section-title"><h2>边缘路由</h2><NeumorphismTag v-if="edge" variant="success">已启用</NeumorphismTag><span class="esc-spacer" /><NeumorphismButton v-if="edge" size="small" variant="primary" @click="openEdge()">＋ 新建路由</NeumorphismButton></div>
       <NeumorphismAlert v-if="edgeUnavailable" type="info" title="边缘路由未启用" :message="edgeUnavailable" />
       <NeumorphismCard v-if="edge">
-        <p class="esc-hint">按 HTTP Host 的第一段分流。监听：{{ (edge.listens || []).join('、') }}</p>
+        <p class="esc-hint">支持域名前缀或完整域名，完整域名优先。监听：{{ (edge.listens || []).join('、') }}。改动自动持久化，重启后仍有效。</p>
         <div v-if="!edge.routes?.length" class="esc-empty">还没有边缘路由</div>
-        <div v-else class="esc-table-wrap"><table class="esc-table"><thead><tr><th>域名前缀</th><th>本机端口</th><th>操作</th></tr></thead><tbody><tr v-for="r in edge.routes" :key="r.prefix"><td class="mono">{{ r.prefix }}</td><td class="mono">127.0.0.1:{{ r.port }}</td><td><NeumorphismButton size="small" @click="removeEdge(r.prefix)">删除</NeumorphismButton></td></tr></tbody></table></div>
+        <div v-else class="esc-table-wrap"><table class="esc-table"><thead><tr><th>匹配类型</th><th>域名 / 前缀</th><th>匹配示例</th><th>转发到</th><th>操作</th></tr></thead><tbody><tr v-for="r in edge.routes" :key="r.prefix"><td><NeumorphismTag size="small">{{ r.prefix.includes('.') ? '完整域名' : '前缀' }}</NeumorphismTag></td><td class="mono">{{ r.prefix }}</td><td class="mono">{{ edgeAddress(r.prefix) }}</td><td class="mono">127.0.0.1:{{ r.port }}</td><td><div class="esc-actions"><NeumorphismButton size="small" @click="openEdge(r)">编辑</NeumorphismButton><NeumorphismButton size="small" @click="removeEdge(r.prefix)">删除</NeumorphismButton></div></td></tr></tbody></table></div>
         <dl class="esc-kv"><dt>请求 / 代理</dt><dd>{{ edge.counters?.requests || 0 }} / {{ edge.counters?.proxied || 0 }}</dd><dt>未路由 / 上游错误</dt><dd>{{ edge.counters?.unrouted || 0 }} / {{ edge.counters?.upstream_errors || 0 }}</dd><dt>Upgrade</dt><dd>{{ edge.counters?.upgraded || 0 }}</dd></dl>
       </NeumorphismCard>
 
@@ -157,7 +171,7 @@ onBeforeUnmount(() => clearInterval(timer))
     <NeumorphismModal v-model="editing" :title="form.id ? '编辑映射' : '新建映射'" :footer="false">
       <div class="esc-form"><NeumorphismInput v-model="form.name" label="服务名" placeholder="hub 与 spoke 两侧一致" required /><div class="esc-form-row"><NeumorphismInput v-model="form.listen" label="公网监听（Hub）" placeholder="0.0.0.0:2222" /><NeumorphismInput v-model="form.local" label="本地目标（Spoke）" placeholder="127.0.0.1:8080" /></div><NeumorphismInput v-model="form.spoke" label="固定 Spoke（可选）" /><NeumorphismInput v-model="form.note" label="备注" /><div class="esc-check"><NeumorphismSwitch v-model="form.enabled" />启用此映射</div><div class="esc-actions"><NeumorphismButton variant="primary" :loading="saving" @click="saveMapping">保存</NeumorphismButton><NeumorphismButton @click="editing = false">取消</NeumorphismButton></div></div>
     </NeumorphismModal>
-    <NeumorphismModal v-model="editingEdge" title="新建边缘路由" :footer="false"><div class="esc-form"><NeumorphismInput v-model="edgeForm.prefix" label="域名前缀" placeholder="cad" required /><NeumorphismInputNumber v-model="edgeForm.port" label="转发到本机端口" :min="1" :max="65535" /><div class="esc-actions"><NeumorphismButton variant="primary" @click="saveEdge">保存</NeumorphismButton><NeumorphismButton @click="editingEdge = false">取消</NeumorphismButton></div></div></NeumorphismModal>
+    <NeumorphismModal v-model="editingEdge" :title="edgeOriginalPrefix ? '编辑边缘路由' : '新建边缘路由'" :footer="false"><div class="esc-form"><NeumorphismInput v-model="edgeForm.prefix" label="域名前缀或完整域名" placeholder="cad 或 cad.example.com" required /><p class="esc-hint">前缀 <code>cad</code> 匹配 <code>cad.任意域名</code>；完整域名 <code>cad.example.com</code> 只匹配该域名，优先于前缀。不要填写协议、端口或路径。</p><NeumorphismInputNumber v-model="edgeForm.port" label="转发到本机端口" :min="1" :max="65535" /><div class="esc-actions"><NeumorphismButton variant="primary" :loading="savingEdge" @click="saveEdge">保存</NeumorphismButton><NeumorphismButton :disabled="savingEdge" @click="editingEdge = false">取消</NeumorphismButton></div></div></NeumorphismModal>
     <NeumorphismModal v-model="exporting" title="导出静态配置" :footer="false"><div class="esc-form"><NeumorphismSelect v-model="exportRole" label="角色" :options="[{label:'Hub',value:'hub'},{label:'Spoke',value:'spoke'}]" /><pre class="esc-code">{{ exportData?.toml || '读取中…' }}</pre><div class="esc-actions"><NeumorphismButton :disabled="!exportData" @click="downloadExport">下载 TOML</NeumorphismButton><NeumorphismButton @click="exporting = false">关闭</NeumorphismButton></div></div></NeumorphismModal>
     <NeumorphismAlert v-if="flashText" class="esc-flash" :type="flashKind" :message="flashText" />
   </div>

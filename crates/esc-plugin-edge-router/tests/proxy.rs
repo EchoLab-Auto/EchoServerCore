@@ -481,6 +481,7 @@ mod plugin_level {
         ctl.upsert_route(esc_plugin_edge_router::EdgeRouteUpsert {
             prefix: "shop".into(),
             port: backend,
+            old_prefix: None,
         })
         .await
         .unwrap();

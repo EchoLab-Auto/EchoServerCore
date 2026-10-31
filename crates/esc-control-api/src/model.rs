@@ -246,6 +246,9 @@ pub struct EdgeRouteUpsert {
     pub prefix: String,
     #[serde(default)]
     pub port: u16,
+    /// 编辑前的路由键；改名时与写入新键在同一次原子替换中完成。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_prefix: Option<String>,
 }
 
 /// 边缘路由的计数器。

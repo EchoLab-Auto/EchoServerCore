@@ -610,7 +610,15 @@ impl ControlBackend for EdgeMock {
             method::EDGE_ROUTE_UPSERT => {
                 let prefix = params.get("prefix").and_then(Value::as_str).unwrap_or("");
                 let port = params.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                let old_prefix = params.get("old_prefix").and_then(Value::as_str);
                 let mut routes = self.routes.lock().unwrap();
+                if let Some(old) = old_prefix {
+                    let before = routes.len();
+                    routes.retain(|(p, _)| p != old);
+                    if routes.len() == before {
+                        return Err((StatusCode::NOT_FOUND, format!("没有这个路由：{old}")));
+                    }
+                }
                 routes.retain(|(p, _)| p != prefix);
                 routes.push((prefix.to_string(), port));
                 Ok(json!({"prefix": prefix, "port": port}))
@@ -693,15 +701,32 @@ async fn edge_routes_crud_maps_onto_contract_methods() {
     assert_eq!(st["routes"].as_array().unwrap().len(), 1);
     assert_eq!(st["routes"][0]["prefix"], "cad");
 
-    // 删除
-    let (code, _) = common::http(&addr, "DELETE", "/api/edge/routes/cad", None, None).await;
+    // 编辑：完整域名可直接填写；路径中的旧键优先于 body。
+    let (code, body) = post_json(
+        &addr,
+        "/api/edge/routes/cad",
+        &json!({"prefix": "cad.example.com", "port": 8080, "old_prefix": "tampered"}),
+    ).await;
+    assert_eq!(code, 200, "{body}");
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.last().unwrap().1["old_prefix"], "cad");
+    }
+    let (_, body) = common::http(&addr, "GET", "/api/edge", None, None).await;
+    let st: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["routes"].as_array().unwrap().len(), 1);
+    assert_eq!(st["routes"][0]["prefix"], "cad.example.com");
+    assert_eq!(st["routes"][0]["port"], 8080);
+
+    // 删除完整域名
+    let (code, _) = common::http(&addr, "DELETE", "/api/edge/routes/cad.example.com", None, None).await;
     assert_eq!(code, 200);
     let (_, body) = common::http(&addr, "GET", "/api/edge", None, None).await;
     let st: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(st["routes"].as_array().unwrap().len(), 0);
 
     // 再删同一个 → 后端的 not_found 应被翻成 404（不是 500/502）
-    let (code, body) = common::http(&addr, "DELETE", "/api/edge/routes/cad", None, None).await;
+    let (code, body) = common::http(&addr, "DELETE", "/api/edge/routes/cad.example.com", None, None).await;
     assert_eq!(code, 404, "{body}");
     assert!(body.contains("cad"), "错误里应点名前缀：{body}");
 

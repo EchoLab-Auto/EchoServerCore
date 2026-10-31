@@ -56,9 +56,19 @@ for (const [name, url, tab] of [
     await page.getByRole('button', { name: '＋ 新建映射', exact: true }).click()
     await page.locator('.nm-modal').waitFor()
     await page.getByRole('button', { name: '取消', exact: true }).click()
-  }
-  if (errors.length) throw new Error(`${name}: 浏览器错误 ${errors.join('; ')}`)
-  await page.close()
-}
+    await page.getByRole('button', { name: '＋ 新建路由', exact: true }).click()
+    const edgeModal = page.locator('.nm-modal:visible')
+    await edgeModal.getByLabel('域名前缀或完整域名').fill('cad.example.com')
+    await edgeModal.getByText('只匹配该域名，优先于前缀', { exact: false }).waitFor()
+    await page.screenshot({ path: '/tmp/esc-edge-create.png', fullPage: true })
+    await edgeModal.getByRole('button', { name: '取消', exact: true }).click()
+    const cadRow = page.locator('tr', { has: page.locator('td.mono', { hasText: /^cad$/ }) })
+    await cadRow.getByRole('button', { name: '编辑', exact: true }).click()
+    await edgeModal.getByRole('heading', { name: '编辑边缘路由', exact: true }).waitFor()
+    if (await edgeModal.getByLabel('域名前缀或完整域名').inputValue() !== 'cad') throw new Error('编辑没有回填路由键')
+    if (await edgeModal.getByLabel('转发到本机端口').inputValue() !== '2228') throw new Error('编辑没有回填端口')
+    await page.screenshot({ path: '/tmp/esc-edge-edit.png', fullPage: true })
+    await edgeModal.getByRole('button', { name: '取消', exact: true }).click()
+    results.at(-1).edgeEditor = true
 console.log(JSON.stringify(results, null, 2))
 await browser.close()
