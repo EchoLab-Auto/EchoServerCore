@@ -76,7 +76,7 @@ pub fn snapshot(
     PluginTreeSnapshot {
         schema_version: 1,
         host: "esc-host".into(),
-        framework: "plugin-framework".into(),
+        framework: "echo-fabric-arch".into(),
         context_services: root.ctx().keys(),
         host_services,
         plugins,

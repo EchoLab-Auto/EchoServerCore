@@ -62,15 +62,18 @@ hyper = { version = "1.12", default-features = false, features = ["http1", "serv
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 # 插件框架：宿主 / 插件契约 / 插件侧运行时。
 #
+# 仓库原名 plugin-framework，2026-11 更名为 echo-fabric-arch（同一 git 历史，
+# 老 tag 与 commit 都还在，所以换了 URL 不影响已钉住的版本）。
+#
 # 钉在 tag 上（框架 README 的推荐做法）。`v0.11.1` = commit a16b3e5，记在这里
 # 是为了万一 tag 被移动时还能追溯到底跑的哪份代码。
 # 注意：这些 crate 的 package version 恒为 0.1.0（仓库发布号走 git tag），
 # 所以 `version = "0.1.0"` 之类的约束毫无意义，必须靠 tag 钉住。
-echo-context = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
-echo-plugin = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
-echo-plugin-api = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
-echo-plugin-host = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/plugin-framework.git", tag = "v0.11.1" }
+echo-context = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.1" }
+echo-plugin = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.1" }
+echo-plugin-api = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.1" }
+echo-plugin-host = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.1" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.1" }
 async-trait = "0.1"
 base64 = "0.22"
 

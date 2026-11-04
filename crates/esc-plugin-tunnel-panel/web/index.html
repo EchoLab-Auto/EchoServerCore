@@ -767,7 +767,7 @@
     const head = el("div", "plugin-head");
     head.appendChild(el("strong", null, tree.host || "esc-host"));
     head.appendChild(el("span", "pill active", "宿主"));
-    head.appendChild(el("code", null, tree.framework || "plugin-framework"));
+    head.appendChild(el("code", null, tree.framework || "echo-fabric-arch"));
     host.appendChild(head);
     host.appendChild(el("div", "service-list", "Ctx 服务：" + ((tree.context_services || []).join("、") || "（空）")));
     host.appendChild(el("div", "service-list", "HostCall 服务：" + ((tree.host_services || []).join("、") || "（空）")));

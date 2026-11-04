@@ -14,7 +14,7 @@
 # 必须 >= workspace 的 rust-version（1.98），否则构建直接失败。
 FROM rust:1.99-slim-bookworm AS builder
 
-# 构建期需要的工具。git 是必须的：workspace 里有 git 依赖（plugin-framework），
+# 构建期需要的工具。git 是必须的：workspace 里有 git 依赖（echo-fabric-arch），
 # cargo 解析整个 workspace 时要能 clone 到它们——即使本 crate 不用。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config git ca-certificates \

@@ -66,7 +66,7 @@ impl ControlBackend for Mock {
         Ok(json!({
             "schema_version": 1,
             "host": "esc-host",
-            "framework": "plugin-framework",
+            "framework": "echo-fabric-arch",
             "context_services": ["esc.tunnel.control"],
             "host_services": ["esc.control", "esc.plugins"],
             "plugins": [{

@@ -471,7 +471,7 @@ function renderPluginTree(tree) {
   $("plugin-count").textContent = pluginCount(tree.plugins) + " 个插件";
   $("plugin-error").style.display = "none";
   $("plugin-tree").innerHTML = `<div class="plugin-root">
-    <div class="plugin-head"><strong>${h(tree.host || "esc-host")}</strong><span class="chip">宿主</span><code>${h(tree.framework || "plugin-framework")}</code></div>
+    <div class="plugin-head"><strong>${h(tree.host || "esc-host")}</strong><span class="chip">宿主</span><code>${h(tree.framework || "echo-fabric-arch")}</code></div>
     <div class="plugin-service">Ctx 服务：${h((tree.context_services || []).join("、") || "（空）")}</div>
     <div class="plugin-service">HostCall 服务：${h((tree.host_services || []).join("、") || "（空）")}</div>
   </div><ul class="plugin-tree">${(tree.plugins || []).map(pluginNodeHtml).join("")}</ul>`;

@@ -179,7 +179,7 @@ users_file = "/var/lib/esc-gateway/gateway-users.toml"
 
 ### 构建时需要网络
 
-workspace 里有 git 依赖（`plugin-framework`），即使 `esc-gateway` 不用它，
+workspace 里有 git 依赖（`echo-fabric-arch`），即使 `esc-gateway` 不用它，
 `cargo fetch` 也会去 clone。国内构建要传两个 build-arg：
 
 | build-arg | 用什么 | 说明 |

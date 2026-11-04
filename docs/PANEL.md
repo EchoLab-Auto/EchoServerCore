@@ -284,7 +284,7 @@ curl -s -u admin:<口令> -o /dev/null -w "%{http_code}\n" \
 ## 插件树标签页
 
 「插件树」读取宿主的 `HostCall("esc.plugins", "tree", null)`，展示
-`plugin-framework` 当前注册表与作用域的真实快照：
+`echo-fabric-arch` 当前注册表与作用域的真实快照：
 
 - 缩进是 `PluginScope` 的父子关系；子进程面板作为宿主直属节点列出；
 - 节点包含进程内/子进程形态、挂载与 Ready/Failed/Pending 状态、重启次数；

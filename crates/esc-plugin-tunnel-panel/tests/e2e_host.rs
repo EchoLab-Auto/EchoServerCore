@@ -247,7 +247,7 @@ title  = "e2e 面板"
     assert_eq!(code, 200, "{body}");
     let tree: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(tree["host"], "esc-host");
-    assert_eq!(tree["framework"], "plugin-framework");
+    assert_eq!(tree["framework"], "echo-fabric-arch");
     assert!(tree["host_services"]
         .as_array()
         .unwrap()

@@ -702,7 +702,7 @@ plugin_tree_auth = "admin:隧道面板的口令"
 凭据只允许放在 `plugin_tree_auth`，不能嵌进 URL。
 
 不配置时其它功能不受影响，插件树页返回 503 并显示配置方法，不会把「未配置」
-误报成「0 个插件」。页面中的父子缩进和服务依赖都来自 `plugin-framework`
+误报成「0 个插件」。页面中的父子缩进和服务依赖都来自 `echo-fabric-arch`
 的真实快照，具体语义见 `docs/PANEL.md`。
 
 ## ui-frame 组件化前端
