@@ -602,3 +602,88 @@ ERROR echo_plugin_host::supervisor: plugin handshake failed
 顺带一个 sed 的坑：改 `host.toml` 时我用
 `s|.../esc-plugin-panel$|...|` 没匹配上——因为行尾还有一对双引号。
 `$` 锚定的是行尾而非字符串结尾，**用 `cat -A` 看行尾**比猜快。
+
+## 2026-11-05：cloud2 追平 22 个 commit（框架改名 / 异步宿主服务 / 前端收拢）
+
+### 更新前的实际状态（值得记一笔）
+
+`/opt/src/EchoServerCore` 检出在 `16b379d`（10-27），而**运行中的二进制**是
+10-31 构建的——它已经带了边缘路由与 `store` 落盘。也就是说**源码树比运行的
+二进制旧**：有人在中途把工作区退回了一个旧 commit。
+
+后果是「看源码判断线上行为」会得出错误结论。以后先比对：
+
+```bash
+ls -la /usr/local/bin/esc-host          # 二进制时间
+git -C /opt/src/EchoServerCore log -1   # 源码时间
+curl -s localhost:18787/api/plugins | python3 -c 'import sys,json;print(json.load(sys.stdin)["framework"])'
+```
+
+最后那条最直接：它自报的 `framework` 字段能立刻说明跑的是哪一代。
+
+### 更新内容
+
+`16b379d → a65d1d7`，22 个 commit：
+
+- 边缘路由：WebSocket/Upgrade 透传、完整域名匹配、面板增删改、**路由持久化**
+- 面板：ui-frame 组件重建（这两个面板是全新的）、Docker 网络标签页、插件树
+- 框架：`plugin-framework` → `echo-fabric-arch`，v0.11.1 → **v0.14.0**
+  （异步宿主服务、调用者身份、插件树快照、就绪探测、协议去领域化）
+- 前端：`panel-ui/` → `crates/esc-panel-web/`（产物从两份变一份）
+
+### 步骤
+
+```bash
+# 1. 备份（二进制 + 配置 + 路由状态）
+TS=$(date +%Y%m%d-%H%M%S); BK=/root/esc-backup-$TS; mkdir -p "$BK"
+cp -a /usr/local/bin/esc-host /usr/local/bin/esc "$BK"/
+cp -a /usr/local/libexec/esc/* "$BK"/
+cp -a /etc/esc/{host,engine,gateway,server-panel}.toml "$BK"/
+cp -a /var/lib/esc/edge-routes.toml "$BK"/
+
+# 2. 取源码。注意 origin 是 gh-proxy 包装，fetch 直连 GitHub 也走它
+cd /opt/src/EchoServerCore
+git fetch https://github.com/EchoLab-Auto/EchoServerCore.git main:refs/remotes/gh/main
+git merge --ff-only gh/main
+
+# 3. 构建（约 3 分钟；框架依赖要从 GitHub 拉 v0.14.0）
+cargo build --release --locked --bin esc-host --bin esc-plugin-tunnel-panel \
+      --bin esc-server-panel --bin esc
+
+# 4. 安装：先 .new 再原子 mv——直接 cp 到运行中的二进制上会 ETXTBSY
+for p in esc-host:... esc:... esc-plugin-tunnel-panel:... esc-server-panel:...; do
+  cp -f src dst.new && chmod 755 dst.new && mv -f dst.new dst
+done
+
+# 5. 重启（:2222 上的隧道会断 3-6 秒，spoke 自动重连）
+systemctl restart esc-host.service
+systemctl restart esc-server-panel.service
+```
+
+### 验证结果（全部通过）
+
+| 项 | 结果 |
+|---|---|
+| 边缘路由 `cad.evencewu.asia` / `echolab.evencewu.asia`（`:2229`） | 200 / 200 |
+| 隧道数据面 `:2222` → 4090:8080 | 200 |
+| 隧道面板 `:18787` / 服务器面板 `:18788` | 200 / 200 |
+| 网关 `:2223` / `:2224`（未认证） | 401 / 401 |
+| 插件树 `framework` 字段 | `echo-fabric-arch`（更新前是 `plugin-framework`） |
+| 插件树节点 | `esc.tunnel` / `esc.edge-router`（in_process）+ `esc.tunnel-panel`（subprocess），全部 `ready` |
+| 路由从 store 恢复 | 日志 `from_store=true routes=2`，两条路由都在 |
+| 前端资源（两面板 × panel.css/panel.js/入口 js） | 全 200 且 content-type 正确 |
+| 浏览器烟测（Playwright，两个面板） | 卡片全渲染、4xx/5xx 0 条、JS 错误 0 条 |
+| 内存 | esc-host 7.0 MB / 面板子进程 5.1 MB / 服务器面板 4.6 MB |
+
+### 回滚
+
+```bash
+BK=$(cat /root/.last-esc-backup)      # 本次是 /root/esc-backup-20261105-162729
+cp -a "$BK"/esc-host /usr/local/bin/
+cp -a "$BK"/esc /usr/local/bin/
+cp -a "$BK"/esc-plugin-tunnel-panel "$BK"/esc-server-panel /usr/local/libexec/esc/
+systemctl restart esc-host.service esc-server-panel.service
+```
+
+配置与路由状态没有改动，回滚不需要动它们。
+
