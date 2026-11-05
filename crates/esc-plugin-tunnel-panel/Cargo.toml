@@ -14,6 +14,8 @@ name = "esc-plugin-tunnel-panel"
 path = "src/main.rs"
 
 [dependencies]
+# 静态前端（Vue 3 产物，编译期嵌入；与另一个面板共用一份）
+esc-panel-web = { workspace = true }
 esc-control-api = { workspace = true }
 esc-panel-auth = { workspace = true }
 echo-plugin-sdk = { workspace = true }

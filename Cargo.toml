@@ -14,6 +14,7 @@ members = [
     "crates/esc-plugin-tunnel-panel",
     "crates/esc-plugin-edge-router",
     "crates/esc-host",
+    "crates/esc-panel-web",
 
 ]
 
@@ -86,6 +87,7 @@ esc-gateway = { path = "crates/esc-gateway" }
 esc-engine = { path = "crates/esc-engine" }
 esc-plugin-tunnel = { path = "crates/esc-plugin-tunnel" }
 esc-plugin-edge-router = { path = "crates/esc-plugin-edge-router" }
+esc-panel-web = { path = "crates/esc-panel-web" }
 esc-hub = { path = "crates/esc-hub" }
 esc-spoke = { path = "crates/esc-spoke" }
 

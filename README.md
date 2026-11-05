@@ -274,7 +274,11 @@ crates/
   esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
   esc-plugin-tunnel/ 进程内插件：把引擎注册进宿主的 Ctx
   esc-plugin-edge-router/  进程内插件：按域名前缀把请求分到本机不同端口
-  esc-plugin-tunnel-panel/  子进程插件：axum + 单文件前端，只认契约
+  esc-plugin-tunnel-panel/  子进程插件：axum + 前端，只认契约
+  esc-server-panel/  独立进程：主机指标 + Docker 管理面板
+  esc-gateway/       独立进程：认证反向代理（面板前面）
+  esc-panel-auth/    两个面板共用的访问控制（Basic + 白名单 + 限速）
+  esc-panel-web/     两个面板共用的静态前端（Vue 3 产物，编译期嵌入）
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
   esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）

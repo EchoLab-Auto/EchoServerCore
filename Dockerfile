@@ -56,6 +56,7 @@ COPY crates/esc-plugin-tunnel/Cargo.toml        crates/esc-plugin-tunnel/
 COPY crates/esc-plugin-tunnel-panel/Cargo.toml  crates/esc-plugin-tunnel-panel/
 COPY crates/esc-server-panel/Cargo.toml crates/esc-server-panel/
 COPY crates/esc-gateway/Cargo.toml      crates/esc-gateway/
+COPY crates/esc-panel-web/Cargo.toml    crates/esc-panel-web/
 
 # 给每个 crate 造一个空的 lib/main，让 `cargo fetch` 能解析出完整依赖图。
 # 这一步只为把「拉依赖」缓存成独立层——它不产出可用的二进制。

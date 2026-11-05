@@ -285,12 +285,9 @@ async fn index(State(st): State<AppState>) -> Html<String> {
 
 async fn ui_asset(Path(path): Path<String>) -> Response {
     match web::asset(&path) {
-        Some(web::Asset::Css(body)) => {
-            ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], body).into_response()
-        }
-        Some(web::Asset::JavaScript(body)) => (
-            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-            body,
+        Some(asset) => (
+            [(header::CONTENT_TYPE, asset.content_type())],
+            asset.body(),
         )
             .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),

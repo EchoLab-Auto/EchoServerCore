@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Standalone web panel for host metrics and Docker container management"
 
 [dependencies]
+# 静态前端（Vue 3 产物，编译期嵌入；与另一个面板共用一份）
+esc-panel-web = { workspace = true }
 esc-panel-auth = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

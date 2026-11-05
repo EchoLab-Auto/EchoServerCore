@@ -681,6 +681,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "esc-panel-web"
+version = "0.1.0"
+
+[[package]]
 name = "esc-plugin-edge-router"
 version = "0.1.0"
 dependencies = [
@@ -728,6 +732,7 @@ dependencies = [
  "esc-engine",
  "esc-host",
  "esc-panel-auth",
+ "esc-panel-web",
  "serde",
  "serde_json",
  "tokio",
@@ -744,6 +749,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "esc-panel-auth",
+ "esc-panel-web",
  "libc",
  "reqwest",
  "serde",

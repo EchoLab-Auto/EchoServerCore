@@ -1,0 +1,17 @@
+[package]
+name = "esc-panel-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Static frontend assets for the server-core web panels (Vue 3, embedded at compile time)"
+
+# 刻意**零依赖**：这个 crate 只做两件事——把前端产物嵌进二进制、把路由路径
+# 映射到对应资源。它不认识 axum、不认识 HTTP、不认识任何一个面板的业务。
+# 加依赖会让"两个面板共用一份前端"这件事变成"两个面板共用一份依赖图"。
+[dependencies]
+
+[dev-dependencies]
+
+[build-dependencies]
