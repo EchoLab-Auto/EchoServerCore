@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    # ── 底座：跨模块复用的库与契约 ──────────────────────────────────────
-    "crates/esc-common",       # 配置 / TLS / 线协议 / yamux / PKI
-    "crates/esc-control-api",  # 控制面契约（DTO + 方法名 + trait）
-    "crates/esc-engine",       # 隧道内核（hub / spoke，可编程）
-    "crates/esc-panel-auth",   # 面板与网关共用的访问控制
+    # ── 底座：跨模块复用的库与契约（module-server-core）─────────────────
+    "crates/modules/core/esc-common",       # 配置 / TLS / 线协议 / yamux / PKI
+    "crates/modules/core/esc-control-api",  # 控制面契约（DTO + 方法名 + trait）
+    "crates/modules/core/esc-engine",       # 隧道内核（hub / spoke，可编程）
+    "crates/modules/core/esc-panel-auth",   # 面板与网关共用的访问控制
 
     # ── 宿主 ───────────────────────────────────────────────────────────
     "crates/esc-host",         # 组合根：Ctx + 插件挂载 + HostCall 服务
@@ -87,12 +87,12 @@ async-trait = "0.1"
 base64 = "0.22"
 
 # ── 内部 crate ───────────────────────────────────────────────────────
-esc-common = { path = "crates/esc-common" }
-esc-control-api = { path = "crates/esc-control-api" }
-esc-panel-auth = { path = "crates/esc-panel-auth" }
+esc-common = { path = "crates/modules/core/esc-common" }
+esc-control-api = { path = "crates/modules/core/esc-control-api" }
+esc-panel-auth = { path = "crates/modules/core/esc-panel-auth" }
 esc-server-panel = { path = "crates/modules/panel/esc-server-panel" }
 esc-gateway = { path = "crates/modules/gateway/esc-gateway" }
-esc-engine = { path = "crates/esc-engine" }
+esc-engine = { path = "crates/modules/core/esc-engine" }
 esc-plugin-tunnel = { path = "crates/modules/tunnel/esc-plugin-tunnel" }
 esc-plugin-edge-router = { path = "crates/modules/edge-router/esc-plugin-edge-router" }
 esc-panel-web = { path = "crates/modules/panel/esc-panel-web" }

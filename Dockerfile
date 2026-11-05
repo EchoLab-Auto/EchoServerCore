@@ -44,20 +44,21 @@ RUN mkdir -p /root/.cargo \
 
 # 先只拷依赖清单，利用层缓存：改业务代码时不必重新拉依赖。
 COPY Cargo.toml Cargo.lock ./
-# 底座
-COPY crates/esc-common/Cargo.toml       crates/esc-common/
-COPY crates/esc-control-api/Cargo.toml  crates/esc-control-api/
-COPY crates/esc-engine/Cargo.toml       crates/esc-engine/
-COPY crates/esc-panel-auth/Cargo.toml   crates/esc-panel-auth/
-# 宿主 / 独立进程 / CLI
+# 底座（module-server-core）
+COPY crates/modules/core/esc-common/Cargo.toml      crates/modules/core/esc-common/
+COPY crates/modules/core/esc-control-api/Cargo.toml crates/modules/core/esc-control-api/
+COPY crates/modules/core/esc-engine/Cargo.toml      crates/modules/core/esc-engine/
+COPY crates/modules/core/esc-panel-auth/Cargo.toml  crates/modules/core/esc-panel-auth/
+# 宿主
 COPY crates/esc-host/Cargo.toml         crates/esc-host/
-COPY crates/modules/gateway/esc-gateway/Cargo.toml crates/modules/gateway/esc-gateway/
+# CLI
 COPY crates/esc-cli/Cargo.toml          crates/esc-cli/
 COPY crates/esc-hub/Cargo.toml          crates/esc-hub/
 COPY crates/esc-spoke/Cargo.toml        crates/esc-spoke/
 # 模块（一个模块一个目录）
 COPY crates/modules/tunnel/esc-plugin-tunnel/Cargo.toml            crates/modules/tunnel/esc-plugin-tunnel/
 COPY crates/modules/edge-router/esc-plugin-edge-router/Cargo.toml  crates/modules/edge-router/esc-plugin-edge-router/
+COPY crates/modules/gateway/esc-gateway/Cargo.toml                 crates/modules/gateway/esc-gateway/
 COPY crates/modules/panel/esc-plugin-tunnel-panel/Cargo.toml       crates/modules/panel/esc-plugin-tunnel-panel/
 COPY crates/modules/panel/esc-server-panel/Cargo.toml              crates/modules/panel/esc-server-panel/
 COPY crates/modules/panel/esc-panel-web/Cargo.toml                 crates/modules/panel/esc-panel-web/

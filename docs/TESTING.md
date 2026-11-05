@@ -204,8 +204,8 @@ SAN: IP Address:127.0.0.1, DNS:localhost
 
 | 层 | 文件 | 证明了什么 |
 |---|---|---|
-| 引擎单测 | `crates/esc-engine/src/{store,config}.rs` | 映射表 CRUD / 冲突校验 / 原子落盘；旧 hub.toml、spoke.toml 仍能解析；内联 `[[mapping]]` 优先于 `[[service]]` |
-| 引擎集成 | `crates/esc-engine/tests/runtime_mapping.rs` | **spoke 已连接时加映射 → 现有连接被立即授权**（不需要重连）→ 数据穿过隧道 → 停用后端口释放 → 删除后记录消失 |
+| 引擎单测 | `crates/modules/core/esc-engine/src/{store,config}.rs` | 映射表 CRUD / 冲突校验 / 原子落盘；旧 hub.toml、spoke.toml 仍能解析；内联 `[[mapping]]` 优先于 `[[service]]` |
+| 引擎集成 | `crates/modules/core/esc-engine/tests/runtime_mapping.rs` | **spoke 已连接时加映射 → 现有连接被立即授权**（不需要重连）→ 数据穿过隧道 → 停用后端口释放 → 删除后记录消失 |
 | 插件 | `crates/modules/tunnel/esc-plugin-tunnel/src/lib.rs` | mount 后 `Ctx` 里出现 `esc.tunnel.control`；配置非法时挂载 fail-closed；引擎启动失败时调用方拿到明确错误而不是挂住 |
 | 面板 HTTP | `crates/modules/panel/esc-plugin-tunnel-panel/tests/http_api.rs` | 每个 REST 端点对应正确的契约方法；URL 里的 `id` 覆盖 body；Basic 认证缺失即 401 且**不会**触达后端；非回环 + 无口令被配置校验拒绝 |
 | 端到端 | `crates/modules/panel/esc-plugin-tunnel-panel/tests/e2e_host.rs` | 真子进程面板 + 真宿主 + 真引擎 + 真 spoke：HTTP 建映射 → 端口绑定 → 字节往返；宿主退出后面板进程消失 |

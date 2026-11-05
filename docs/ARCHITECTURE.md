@@ -48,37 +48,38 @@
 
 ```
 crates/
-  ── 底座：跨插件复用 ───────────────────────────────────────────────
-  esc-common/        配置、TLS、线协议、yamux 驱动、PKI
-  esc-control-api/   控制面契约（DTO + 方法名 + 信封 + trait）
-  esc-engine/        可编程内核
-      hub/           动态公网监听：运行时 add/remove、每映射计数器
-      spoke.rs       可变服务表 + 变配置自动重新握手
-      store.rs       映射表（TOML 持久化，原子写）
-      config.rs      兼容旧 hub.toml/spoke.toml 的引擎配置
-      pipe.rs        带计数的双向搬运（替代 copy_bidirectional）
-  esc-panel-auth/    面板与网关共用的访问控制（Basic + 白名单 + 限速）
-
-  ── 宿主与独立进程 ─────────────────────────────────────────────────
+  ── 宿主与 CLI ───────────────────────────────────────────────────
   esc-host/          组合根（宿主二进制 + 可复用 lib）
-  esc-gateway/       独立进程：认证反向代理（面板前面，:2223/:2224）
-
-  ── CLI ───────────────────────────────────────────────────────────
   esc-cli/           `esc` 二进制（hub / spoke / check / pki）
   esc-hub/           `esc hub` 的薄封装（行为不变）
   esc-spoke/         `esc spoke` 的薄封装（行为不变）
 
   ── 模块：一个模块一个目录，目录里放属于它的 crate ──────────────────
   modules/
+    core/                      module-server-core（底座：跨模块复用）
+      esc-common/              配置、TLS、线协议、yamux 驱动、PKI
+      esc-control-api/         控制面契约（DTO + 方法名 + 信封 + trait）
+      esc-engine/              可编程内核（hub / spoke，可编程）
+      esc-panel-auth/          面板与网关共用的访问控制（Basic + 白名单 + 限速）
     tunnel/
-      esc-plugin-tunnel/          进程内插件：把引擎注册进 Ctx
+      esc-plugin-tunnel/       进程内插件：把引擎注册进 Ctx
     edge-router/
-      esc-plugin-edge-router/     进程内插件：按域名前缀把请求分到本机不同端口
+      esc-plugin-edge-router/  进程内插件：按域名前缀把请求分到本机不同端口
+    gateway/
+      esc-gateway/             独立进程：认证反向代理（面板前面，:2223/:2224）
     panel/
-      esc-plugin-tunnel-panel/    子进程插件：端口映射面板（:2223）
-      esc-server-panel/           独立进程：主机指标 + Docker 管理面板（:2224）
-      esc-panel-web/              两个面板共用的静态前端（Vue 3 产物）
+      esc-plugin-tunnel-panel/ 子进程插件：端口映射面板（:2223）
+      esc-server-panel/        独立进程：主机指标 + Docker 管理面板（:2224）
+      esc-panel-web/           两个面板共用的静态前端（Vue 3 产物）
 ```
+
+**底座也收进模块**：`modules/core/`（`module-server-core`）里放四个跨模块
+复用的 crate——它们被 3~7 个 crate 依赖，但没有一个是"某个模块的私产"。
+目录表达的是"一起改的东西放一起"，不是"是不是插件"。
+
+**一个插件 ≠ 一个 crate 的充要关系**：`esc-plugin-edge-router` 这个 crate 里
+只定义了一个 `EdgeRouterPlugin`，但框架不要求 1:1 —— 同一个 crate 定义多个
+插件、或者插件实现在别的 crate 里，都合法。
 
 `modules/panel/` 里放三个 crate 而不是一个，因为它们是**同一族**：一个子进程
 插件（隧道面板）、一个同族独立进程（服务器面板）、以及只被这两个用的前端。
@@ -93,20 +94,20 @@ crates/
 依赖方向（只能向下）：
 
 ```
-esc-cli ──▶ esc-hub / esc-spoke ──▶ esc-engine ──▶ esc-common
-                                              └──▶ esc-control-api
+esc-cli ──▶ esc-hub / esc-spoke ──▶ modules/core/esc-engine ──▶ modules/core/esc-common
+                                                        └──▶ modules/core/esc-control-api
 
-esc-host ──▶ modules/tunnel/esc-plugin-tunnel ──▶ esc-engine
-        ├──▶ modules/edge-router/esc-plugin-edge-router ──▶ esc-control-api
-        └──▶ esc-control-api
+esc-host ──▶ modules/tunnel/esc-plugin-tunnel ──▶ modules/core/esc-engine
+        ├──▶ modules/edge-router/esc-plugin-edge-router ──▶ modules/core/esc-control-api
+        └──▶ modules/core/esc-control-api
 
-modules/panel/esc-plugin-tunnel-panel ──▶ esc-control-api   ← 不认识隧道实现
-                                      ├──▶ esc-panel-auth
+modules/panel/esc-plugin-tunnel-panel ──▶ modules/core/esc-control-api   ← 不认识隧道实现
+                                      ├──▶ modules/core/esc-panel-auth
                                       └──▶ modules/panel/esc-panel-web
 
-modules/panel/esc-server-panel ──▶ esc-panel-auth
+modules/panel/esc-server-panel ──▶ modules/core/esc-panel-auth
                               └──▶ modules/panel/esc-panel-web
-esc-gateway ──▶ esc-panel-auth
+modules/gateway/esc-gateway ──▶ modules/core/esc-panel-auth
 ```
 
 `esc-gateway` 与服务器面板都只依赖 `esc-panel-auth`：它们物理上无法调用引擎

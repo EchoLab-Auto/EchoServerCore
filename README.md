@@ -269,22 +269,19 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 
 ```
 crates/
-  ── 底座（跨插件复用）──────────────────────────────────────────
-  esc-common/        配置、TLS、线协议、yamux 驱动、PKI
-  esc-engine/        可编程内核：动态端口绑定 / 注册表 / 映射表 / 计数管道
-  esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
-  esc-panel-auth/    面板与网关共用的访问控制（Basic + 白名单 + 限速）
-
-  ── 宿主 ──────────────────────────────────────────────────────
+  ── 宿主与 CLI ────────────────────────────────────────────────
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
-
-  ── CLI ────────────────────────────────────────────────────────
   esc-cli/           单个二进制 esc，子命令 hub / spoke / check / pki
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
   esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）
 
   ── 模块（一个模块一个目录，目录里放属于它的 crate）──────────────
   modules/
+    core/            module-server-core（底座：跨模块复用）
+                     esc-common/          配置、TLS、线协议、yamux 驱动、PKI
+                     esc-control-api/     控制面契约（DTO + 方法名 + 信封 + trait）
+                     esc-engine/          可编程内核（hub / spoke）
+                     esc-panel-auth/      面板与网关共用的访问控制
     tunnel/          esc-plugin-tunnel/          进程内：把引擎注册进 Ctx
     edge-router/     esc-plugin-edge-router/     进程内：按域名前缀分流到本机端口
     gateway/         esc-gateway/                独立进程：认证反向代理
