@@ -51,29 +51,29 @@ COPY crates/esc-engine/Cargo.toml       crates/esc-engine/
 COPY crates/esc-panel-auth/Cargo.toml   crates/esc-panel-auth/
 # 宿主 / 独立进程 / CLI
 COPY crates/esc-host/Cargo.toml         crates/esc-host/
-COPY crates/esc-gateway/Cargo.toml      crates/esc-gateway/
+COPY crates/modules/gateway/esc-gateway/Cargo.toml crates/modules/gateway/esc-gateway/
 COPY crates/esc-cli/Cargo.toml          crates/esc-cli/
 COPY crates/esc-hub/Cargo.toml          crates/esc-hub/
 COPY crates/esc-spoke/Cargo.toml        crates/esc-spoke/
-# 插件（一个插件一个目录）
-COPY crates/plugins/tunnel/esc-plugin-tunnel/Cargo.toml            crates/plugins/tunnel/esc-plugin-tunnel/
-COPY crates/plugins/edge-router/esc-plugin-edge-router/Cargo.toml  crates/plugins/edge-router/esc-plugin-edge-router/
-COPY crates/plugins/panel/esc-plugin-tunnel-panel/Cargo.toml       crates/plugins/panel/esc-plugin-tunnel-panel/
-COPY crates/plugins/panel/esc-server-panel/Cargo.toml              crates/plugins/panel/esc-server-panel/
-COPY crates/plugins/panel/esc-panel-web/Cargo.toml                 crates/plugins/panel/esc-panel-web/
+# 模块（一个模块一个目录）
+COPY crates/modules/tunnel/esc-plugin-tunnel/Cargo.toml            crates/modules/tunnel/esc-plugin-tunnel/
+COPY crates/modules/edge-router/esc-plugin-edge-router/Cargo.toml  crates/modules/edge-router/esc-plugin-edge-router/
+COPY crates/modules/panel/esc-plugin-tunnel-panel/Cargo.toml       crates/modules/panel/esc-plugin-tunnel-panel/
+COPY crates/modules/panel/esc-server-panel/Cargo.toml              crates/modules/panel/esc-server-panel/
+COPY crates/modules/panel/esc-panel-web/Cargo.toml                 crates/modules/panel/esc-panel-web/
 
 # 给每个 crate 造一个空的 lib/main，让 `cargo fetch` 能解析出完整依赖图。
 # 这一步只为把「拉依赖」缓存成独立层——它不产出可用的二进制。
 # 注意两处通配都要覆盖**两层**：crates/*/ 是平铺的 crate，
-# crates/plugins/*/*/ 是插件目录里的 crate（crates/plugins/<插件>/<crate>/）。
-RUN for d in crates/*/ crates/plugins/*/*/; do \
+# crates/modules/*/*/ 是模块目录里的 crate（crates/modules/<模块>/<crate>/）。
+RUN for d in crates/*/ crates/modules/*/*/; do \
       [ -f "$d/Cargo.toml" ] || continue; \
       mkdir -p "$d/src"; \
       [ -f "$d/src/lib.rs" ] || echo "" > "$d/src/lib.rs"; \
     done \
- && for b in crates/esc-cli crates/esc-host crates/esc-gateway \
-             crates/plugins/panel/esc-server-panel \
-             crates/plugins/panel/esc-plugin-tunnel-panel; do \
+ && for b in crates/esc-cli crates/esc-host crates/modules/gateway/esc-gateway \
+             crates/modules/panel/esc-server-panel \
+             crates/modules/panel/esc-plugin-tunnel-panel; do \
       mkdir -p "$b/src"; \
       [ -f "$b/src/main.rs" ] || echo "fn main(){}" > "$b/src/main.rs"; \
     done \

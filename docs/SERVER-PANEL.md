@@ -707,9 +707,9 @@ plugin_tree_auth = "admin:隧道面板的口令"
 
 ## ui-frame 组件化前端
 
-本面板与隧道面板共用 `crates/plugins/panel/esc-panel-web/` 的 Vue 3 工程及 ui-frame 主题。
+本面板与隧道面板共用 `crates/modules/panel/esc-panel-web/` 的 Vue 3 工程及 ui-frame 主题。
 容器、镜像和插件树均使用真实组件渲染，静态 JS/CSS 由本进程提供且嵌入二进制。
 
 两个面板的产物只有一份（公共 chunk `panel.js` / `panel.css` 完全共享），各自
 只声明自己是哪个入口（`tunnel.js` / `server.js`）。源码与重建步骤见
-`crates/plugins/panel/esc-panel-web/ui/README.md`。
+`crates/modules/panel/esc-panel-web/ui/README.md`。

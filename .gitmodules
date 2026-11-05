@@ -1,3 +1,3 @@
-[submodule "crates/plugins/panel/esc-panel-web/ui/vendor/ui-frame"]
-	path = crates/plugins/panel/esc-panel-web/ui/vendor/ui-frame
+[submodule "crates/modules/panel/esc-panel-web/ui/vendor/ui-frame"]
+	path = crates/modules/panel/esc-panel-web/ui/vendor/ui-frame
 	url = git@github.com:EchoLab-Auto/ui-frame.git

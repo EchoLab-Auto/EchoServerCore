@@ -42,9 +42,9 @@
 
 ## crate 地图
 
-目录按**归属**分组：跨插件复用的放顶层，**插件独占的放进 `plugins/<插件名>/`**。
-这条规则让「哪些代码属于哪个插件」从名字看不出来变成目录结构能看出来 ——
-改一个插件时不用在 14 个平铺目录里找。
+目录按**归属**分组：跨模块复用的放顶层，**模块独占的放进 `modules/<模块名>/`**。
+这条规则让「哪些代码属于哪个模块」从名字看不出来变成目录结构能看出来 ——
+改一个模块时不用在 14 个平铺目录里找。
 
 ```
 crates/
@@ -68,8 +68,8 @@ crates/
   esc-hub/           `esc hub` 的薄封装（行为不变）
   esc-spoke/         `esc spoke` 的薄封装（行为不变）
 
-  ── 插件：一个插件一个目录，目录里放属于它的 crate ──────────────────
-  plugins/
+  ── 模块：一个模块一个目录，目录里放属于它的 crate ──────────────────
+  modules/
     tunnel/
       esc-plugin-tunnel/          进程内插件：把引擎注册进 Ctx
     edge-router/
@@ -80,10 +80,10 @@ crates/
       esc-panel-web/              两个面板共用的静态前端（Vue 3 产物）
 ```
 
-`plugins/panel/` 里放三个 crate 而不是一个，因为它们是**同一族**：一个子进程
+`modules/panel/` 里放三个 crate 而不是一个，因为它们是**同一族**：一个子进程
 插件（隧道面板）、一个同族独立进程（服务器面板）、以及只被这两个用的前端。
 
-`esc-panel-auth` 没有放进 `plugins/panel/`：它同时被 `esc-gateway` 用，
+`esc-panel-auth` 没有放进 `modules/panel/`：它同时被 `esc-gateway` 用，
 归属不唯一，所以留在顶层。
 
 **一个插件 ≠ 一个 crate 的充要关系**：`esc-plugin-edge-router` 这个 crate 里
@@ -96,16 +96,16 @@ crates/
 esc-cli ──▶ esc-hub / esc-spoke ──▶ esc-engine ──▶ esc-common
                                               └──▶ esc-control-api
 
-esc-host ──▶ plugins/tunnel/esc-plugin-tunnel ──▶ esc-engine
-        ├──▶ plugins/edge-router/esc-plugin-edge-router ──▶ esc-control-api
+esc-host ──▶ modules/tunnel/esc-plugin-tunnel ──▶ esc-engine
+        ├──▶ modules/edge-router/esc-plugin-edge-router ──▶ esc-control-api
         └──▶ esc-control-api
 
-plugins/panel/esc-plugin-tunnel-panel ──▶ esc-control-api   ← 不认识隧道实现
+modules/panel/esc-plugin-tunnel-panel ──▶ esc-control-api   ← 不认识隧道实现
                                       ├──▶ esc-panel-auth
-                                      └──▶ plugins/panel/esc-panel-web
+                                      └──▶ modules/panel/esc-panel-web
 
-plugins/panel/esc-server-panel ──▶ esc-panel-auth
-                              └──▶ plugins/panel/esc-panel-web
+modules/panel/esc-server-panel ──▶ esc-panel-auth
+                              └──▶ modules/panel/esc-panel-web
 esc-gateway ──▶ esc-panel-auth
 ```
 
@@ -333,7 +333,7 @@ ErrorKind::http_status() -> u16           // 400 / 404 / 409 / 409 / 503 / 502
 | 想做的事 | 改哪里 |
 |---|---|
 | 加一个控制方法 | `esc-control-api`：加方法名 + `TunnelControl` 方法 + `dispatch` 分支 → 引擎实现 → 面板加 HTTP 路由 |
-| 换前端 | 只改 `crates/plugins/panel/esc-plugin-tunnel-panel/web/index.html`（单文件，无构建步骤） |
+| 换前端 | 只改 `crates/modules/panel/esc-plugin-tunnel-panel/web/index.html`（单文件，无构建步骤） |
 | 换个面板实现（别的语言） | 讲同一套 `HostCall("esc.control", method, params)` 即可，宿主不用改 |
 | 加一个新插件（比如证书签发 UI） | 写一个 `PluginHandler` 子进程插件 + 在宿主里 `supervisor.start(...)`；它通过 `HostCall` 拿数据 |
 | 换隧道实现 | 在 Ctx 里注册同一个 `ServiceKey<Arc<dyn TunnelControl>>`，面板完全不用知道 |

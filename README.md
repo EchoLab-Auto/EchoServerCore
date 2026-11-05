@@ -275,27 +275,27 @@ crates/
   esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
   esc-panel-auth/    面板与网关共用的访问控制（Basic + 白名单 + 限速）
 
-  ── 宿主与独立进程 ──────────────────────────────────────────────
+  ── 宿主 ──────────────────────────────────────────────────────
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
-  esc-gateway/       独立进程：认证反向代理（面板前面）
 
   ── CLI ────────────────────────────────────────────────────────
   esc-cli/           单个二进制 esc，子命令 hub / spoke / check / pki
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
   esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）
 
-  ── 插件（一个插件一个目录，目录里放属于它的 crate）──────────────
-  plugins/
+  ── 模块（一个模块一个目录，目录里放属于它的 crate）──────────────
+  modules/
     tunnel/          esc-plugin-tunnel/          进程内：把引擎注册进 Ctx
     edge-router/     esc-plugin-edge-router/     进程内：按域名前缀分流到本机端口
+    gateway/         esc-gateway/                独立进程：认证反向代理
     panel/           esc-plugin-tunnel-panel/    子进程：axum + 前端，只认契约
                      esc-server-panel/           独立进程：主机指标 + Docker 管理
                      esc-panel-web/              两个面板共用的前端（编译期嵌入）
 ```
 
 分层原则只有两条：**依赖方向永远指向 `esc-control-api` / `esc-common`**；
-**插件独占的 crate 放进 `plugins/<插件名>/`**，跨插件复用的留在顶层。
-面板不 import 引擎，引擎不 import 面板，宿主两边都不 import 实现细节。
+**模块独占的 crate 放进 `modules/<模块名>/`**，跨模块复用的留在顶层。
+模块不 import 引擎，引擎不 import 模块，宿主两边都不 import 实现细节。
 
 ```bash
 cargo test --workspace
