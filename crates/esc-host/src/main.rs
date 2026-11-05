@@ -21,8 +21,9 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 用显式构建的 multi-thread 运行时：`HostService::call` 里的 `block_in_place`
-    // 依赖它。
+    // 显式构建 multi-thread 运行时：控制面会并发处理多个面板请求，且
+    // `HostCall` 的回执任务与隧道转发共用一个池。`block_in_place` 已随框架
+    // 的 `AsyncHostService` 一起消失（v0.12.0），不再是这里的理由。
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

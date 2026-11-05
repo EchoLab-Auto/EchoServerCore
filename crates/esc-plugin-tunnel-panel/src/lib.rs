@@ -603,16 +603,15 @@ impl PluginHandler for Panel {
                 let cfg = self.cfg.read().await.clone();
                 let bound = self.bound.read().await.clone();
                 let up = self.serving.load(Ordering::SeqCst);
-                InvokeOutcome::Ok {
-                    text: String::new(),
-                    images: Vec::new(),
-                    result: json!({
-                        "listen": bound.unwrap_or(cfg.listen),
-                        "serving": up,
-                        "auth": cfg.auth.is_some(),
-                        "title": cfg.title,
-                    }),
-                }
+                // `data` 而不是手填 `Ok { text: String::new(), images: vec![], .. }`：
+                // 这次调用的结果本来就是结构化的，`text`/`images` 是协议里的
+                // 遗留字段（agent 场景），宿主侧一个都不读。
+                InvokeOutcome::data(json!({
+                    "listen": bound.unwrap_or(cfg.listen),
+                    "serving": up,
+                    "auth": cfg.auth.is_some(),
+                    "title": cfg.title,
+                }))
             }
             other => InvokeOutcome::Error {
                 code: "unknown_contribution".into(),

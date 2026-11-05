@@ -457,8 +457,8 @@ dependencies = [
 
 [[package]]
 name = "echo-context"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "dashmap",
  "thiserror",
@@ -467,8 +467,8 @@ dependencies = [
 
 [[package]]
 name = "echo-plugin"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "echo-context",
  "serde",
@@ -480,8 +480,8 @@ dependencies = [
 
 [[package]]
 name = "echo-plugin-api"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "serde",
  "serde_json",
@@ -489,8 +489,8 @@ dependencies = [
 
 [[package]]
 name = "echo-plugin-host"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -505,8 +505,8 @@ dependencies = [
 
 [[package]]
 name = "echo-plugin-loader"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "serde",
  "serde_json",
@@ -516,8 +516,8 @@ dependencies = [
 
 [[package]]
 name = "echo-plugin-sdk"
-version = "0.1.0"
-source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.11.2#bdc5623196d02831e423c71e67a68437fd32442f"
+version = "0.12.0"
+source = "git+https://github.com/EchoLab-Auto/echo-fabric-arch.git?tag=v0.12.0#c0897155780040ded638c49d69cc3d10ae8f0ece"
 dependencies = [
  "async-trait",
  "echo-plugin-api",

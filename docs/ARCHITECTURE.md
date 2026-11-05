@@ -135,8 +135,15 @@ esc-plugin-tunnel-panel
 代价是每次 API 调用多两次 JSON 编解码（面板 → 宿主 → 引擎），在本地管道上
 是亚毫秒级；换来的是面板崩溃不会带走隧道、面板可以单独升级。
 
-> 框架的 `HostService::call` 是**同步**的，而引擎 API 是异步的。宿主里唯一
-> 一处 `block_in_place` + `block_on` 就是为此存在的（要求 multi-thread 运行时）。
+> **2026-11 更新（框架 v0.12.0）**：原先框架的 `HostService::call` 是同步的，
+> 而引擎 API 是异步的，宿主里因此有一处 `block_in_place` + `block_on` 桥接。
+> 框架补了 `AsyncHostService` 之后这段桥接已删除——顺带丢掉了"必须是
+> multi-thread 运行时"这个隐含前提。
+
+宿主服务还拿到了**调用者身份**：`CallContext::caller` 由框架的 supervisor 从
+连接归属填写（`HostCall` 帧里没有这个字段，插件伪造不了）。目前只有我们自己
+写的面板一个消费者，所以没做来源校验；将来第三方插件能调 `esc.control` 时，
+那两处 `_cx` 就是授权点。
 
 ### 4. 为什么 release 刻意不用 `panic = "abort"`
 
@@ -244,10 +251,10 @@ plugin id 用点做命名空间，像反向域名——将来生态里若有别�
 `version = "0.1.0"` 这种约束毫无意义（任何一版都满足）。本仓钉在 tag 上：
 
 ```toml
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.11.2" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.12.0" }
 ```
 
-`v0.11.2` = commit `bdc5623`。升级框架 = 改这一个 tag（五个依赖一起），
+`v0.12.0` = commit `c089715`。升级框架 = 改这一个 tag（五个依赖一起），
 然后 `cargo update` + 跑测试。因为框架在 0.x 允许 breaking，升级前值得先看
 它的 `CHANGELOG.md`。
 

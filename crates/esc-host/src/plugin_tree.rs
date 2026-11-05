@@ -5,8 +5,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use echo_plugin::{PluginDescriptor, PluginScope};
-use echo_plugin_host::host_service::HostService;
+use echo_plugin::{PluginScope, PluginTreeNode as FrameworkNode};
+use echo_plugin_host::async_trait;
+use echo_plugin_host::host_service::{AsyncHostService, CallContext};
 use echo_plugin_host::supervisor::{PluginHandle, PluginState};
 use esc_control_api::{
     PluginTreeNode, PluginTreeSnapshot, PLUGIN_TREE_METHOD, PLUGIN_TREE_SERVICE,
@@ -51,8 +52,14 @@ impl PluginTreeHostService {
     }
 }
 
-impl HostService for PluginTreeHostService {
-    fn call(&self, method: &str, _payload: Value) -> Result<Value, (String, String)> {
+#[async_trait]
+impl AsyncHostService for PluginTreeHostService {
+    async fn call(
+        &self,
+        _cx: CallContext,
+        method: &str,
+        _payload: Value,
+    ) -> Result<Value, (String, String)> {
         if method != PLUGIN_TREE_METHOD {
             return Err((
                 "not_found".into(),
@@ -64,76 +71,61 @@ impl HostService for PluginTreeHostService {
     }
 }
 
-/// 从框架对象生成快照。递归只读 `PluginScope::children_of`，不根据 id 或
-/// 配置猜父子关系；服务依赖同样原样采用 descriptor 的 Inject 声明。
+/// 从框架对象生成快照。
+///
+/// 进程内部分**直接用框架的 `PluginScope::snapshot()`**：遍历注册表、拼接
+/// 子作用域、判定 `ready/pending/failed/disabled` 都是框架的事，宿主不该重写
+/// 一遍（重写就会与框架的语义漂移）。这里只做两件框架看不见的事：
+///
+/// 1. 补上宿主自己的名字与服务清单（框架不知道有 `HostCall` 服务表）；
+/// 2. 追加**子进程**插件节点——它不在 `PluginRegistry` 里，状态在
+///    `PluginHandle` 手上。
 pub fn snapshot(
     root: &Arc<PluginScope>,
     panel: &SharedPanelObservation,
     host_services: Vec<String>,
 ) -> PluginTreeSnapshot {
-    let mut plugins = scope_nodes(root);
+    let framework = root.snapshot();
+    let mut plugins: Vec<PluginTreeNode> = framework
+        .plugins
+        .iter()
+        .map(from_framework_node)
+        .collect();
     plugins.push(panel_node(panel));
     PluginTreeSnapshot {
-        schema_version: 1,
+        schema_version: framework.schema_version,
         host: "esc-host".into(),
         framework: "echo-fabric-arch".into(),
-        context_services: root.ctx().keys(),
+        context_services: framework.context_services,
         host_services,
         plugins,
     }
 }
 
-fn scope_nodes(scope: &Arc<PluginScope>) -> Vec<PluginTreeNode> {
-    scope
-        .registry()
-        .descriptors()
-        .into_iter()
-        .map(|descriptor| {
-            let children = scope
-                .children_of(&descriptor.id)
-                .iter()
-                .flat_map(scope_nodes)
-                .collect();
-            in_process_node(scope, descriptor, children)
-        })
-        .collect()
-}
-
-fn in_process_node(
-    scope: &Arc<PluginScope>,
-    descriptor: PluginDescriptor,
-    children: Vec<PluginTreeNode>,
-) -> PluginTreeNode {
-    let mounted = scope.registry().is_mounted(&descriptor.id);
-    let state = if !descriptor.enabled {
-        "disabled"
-    } else if mounted {
-        "ready"
-    } else if !descriptor.pending_services.is_empty() {
-        "pending"
-    } else if descriptor.error.is_some() {
-        "failed"
-    } else {
-        "stopped"
-    };
+/// 框架节点 → 契约节点。
+///
+/// 只差 `restarts` / `generation` 两个字段：它们是**子进程**才有的运行态，
+/// 进程内插件没有独立进程可重启，恒为 0。框架的树投影刻意不含这两项——
+/// 它描述的是注册表事实，不是 supervisor 事实。
+fn from_framework_node(node: &FrameworkNode) -> PluginTreeNode {
     PluginTreeNode {
-        id: descriptor.id,
-        name: descriptor.name,
-        version: descriptor.version,
-        kind: descriptor.kind,
-        description: descriptor.description,
-        runtime: descriptor.runtime,
-        enabled: descriptor.enabled,
-        mounted,
-        state: state.into(),
-        error: descriptor.error,
+        id: node.id.clone(),
+        name: node.name.clone(),
+        version: node.version.clone(),
+        kind: node.kind.clone(),
+        description: node.description.clone(),
+        runtime: node.runtime.clone(),
+        enabled: node.enabled,
+        mounted: node.mounted,
+        state: node.state.clone(),
+        error: node.error.clone(),
         restarts: 0,
         generation: 0,
-        required_services: descriptor.required_services,
-        optional_services: descriptor.optional_services,
-        pending_services: descriptor.pending_services,
-        command: descriptor.command,
-        children,
+        required_services: node.required_services.clone(),
+        optional_services: node.optional_services.clone(),
+        pending_services: node.pending_services.clone(),
+        command: node.command.clone(),
+        children: node.children.iter().map(from_framework_node).collect(),
     }
 }
 

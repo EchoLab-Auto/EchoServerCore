@@ -30,7 +30,8 @@ use std::time::Duration;
 use echo_context::Ctx;
 use echo_plugin::{MountContext, Plugin, PluginScope};
 use echo_plugin_host::api::InvokeContext;
-use echo_plugin_host::host_service::HostService;
+use echo_plugin_host::async_trait;
+use echo_plugin_host::host_service::{AsyncHostService, CallContext};
 use echo_plugin_host::stdio::StdioTransport;
 use echo_plugin_host::supervisor::{PluginHandle, PluginState, PluginSupervisor};
 use echo_plugin_host::transport::PluginSpec;
@@ -169,9 +170,12 @@ fn toml_to_json(v: &toml::Value) -> Value {
 
 /// `HostCall("esc.control", <method>, <params>)` 的宿主端实现。
 ///
-/// 框架的 `HostService::call` 是**同步**的，而引擎 API 是异步的。这里是唯一
-/// 需要桥接的地方：`block_in_place` 把当前 worker 让出来，再用 `block_on` 等
-/// 引擎返回。要求 multi-thread 运行时——`#[tokio::main]` 默认就是。
+/// 用框架的 [`AsyncHostService`]（异步 trait）：引擎 API 本来就是 async 的，
+/// 直接 `.await` 即可，不需要 `block_in_place` + `block_on` 那层桥接。
+///
+/// `_cx.caller` 是发起回呼的插件 id（由框架的 supervisor 填，插件无法伪造）：
+/// 现在只有隧道面板一个消费者，所以没有做来源校验；将来第三方插件能调同一
+/// 服务时，这里就是授权点。
 pub struct EngineHostService {
     ctl: Arc<dyn TunnelControl>,
 }
@@ -182,16 +186,19 @@ impl EngineHostService {
     }
 }
 
-impl HostService for EngineHostService {
-    fn call(&self, method: &str, payload: Value) -> Result<Value, (String, String)> {
-        let ctl = Arc::clone(&self.ctl);
+#[async_trait]
+impl AsyncHostService for EngineHostService {
+    async fn call(
+        &self,
+        _cx: CallContext,
+        method: &str,
+        payload: Value,
+    ) -> Result<Value, (String, String)> {
         let req = ControlRequest {
             method: method.to_string(),
             params: payload,
         };
-        let resp: ControlResponse = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(dispatch(ctl.as_ref(), req))
-        });
+        let resp: ControlResponse = dispatch(self.ctl.as_ref(), req).await;
         if resp.ok {
             Ok(resp.data)
         } else {
@@ -206,8 +213,8 @@ impl HostService for EngineHostService {
 
 /// `HostCall("esc.edge", <method>, <params>)` 的宿主端实现。
 ///
-/// 与 [`EngineHostService`] 同一套路：同步 `HostService::call` → `block_in_place`
-/// → 异步 `dispatch_edge`。分成两个服务而不是合成一个，是因为它们背后是
+/// 与 [`EngineHostService`] 同样走 [`AsyncHostService`]，直接 await
+/// `dispatch_edge`。分成两个服务而不是合成一个，是因为它们背后是
 /// **两个不同插件**：没启用边缘路由时这个服务根本不该存在（注册了也没有
 /// 实现可转），面板据此就能判断"这台机器有没有路由能力"。
 pub struct EdgeHostService {
@@ -220,16 +227,19 @@ impl EdgeHostService {
     }
 }
 
-impl HostService for EdgeHostService {
-    fn call(&self, method: &str, payload: Value) -> Result<Value, (String, String)> {
-        let ctl = Arc::clone(&self.ctl);
+#[async_trait]
+impl AsyncHostService for EdgeHostService {
+    async fn call(
+        &self,
+        _cx: CallContext,
+        method: &str,
+        payload: Value,
+    ) -> Result<Value, (String, String)> {
         let req = ControlRequest {
             method: method.to_string(),
             params: payload,
         };
-        let resp: ControlResponse = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(dispatch_edge(ctl.as_ref(), req))
-        });
+        let resp: ControlResponse = dispatch_edge(self.ctl.as_ref(), req).await;
         if resp.ok {
             Ok(resp.data)
         } else {
@@ -309,7 +319,7 @@ impl Host {
         };
 
         let supervisor = PluginSupervisor::new();
-        supervisor.host_services().register(
+        supervisor.host_services().register_async(
             CONTROL_SERVICE,
             Arc::new(EngineHostService::new(Arc::clone(&control))),
         );
@@ -317,7 +327,7 @@ impl Host {
 
         // 边缘路由控制面：只有启用了插件才注册 —— 面板据此判断能力是否存在。
         if let Some(edge) = &edge_router {
-            supervisor.host_services().register(
+            supervisor.host_services().register_async(
                 EDGE_ROUTE_SERVICE,
                 Arc::new(EdgeHostService::new(Arc::clone(edge))),
             );
@@ -335,7 +345,7 @@ impl Host {
                 handle: None,
                 start_error: None,
             }));
-        supervisor.host_services().register(
+        supervisor.host_services().register_async(
             PLUGIN_TREE_SERVICE,
             Arc::new(PluginTreeHostService::new(
                 Arc::clone(&plugins),
@@ -485,29 +495,28 @@ fn resolve_program(command: &str) -> PathBuf {
 }
 
 /// 问面板「你在哪个地址上服务」，最多等 5 秒。
+///
+/// 为什么不能只看 `handle.state()`：`Ready` 只表示**协议握手完成**，面板那时
+/// 可能还在绑 HTTP 端口。真正的就绪判据在插件的业务含义里（`serving: true`），
+/// 所以这里轮询它——`wait_until` 把"轮询 + 超时 + 插件已死就提前放弃"这套
+/// 收进了框架，宿主只写判据。
 async fn probe_panel_url(handle: &PluginHandle) -> Option<String> {
-    for _ in 0..25 {
-        let outcome = handle
-            .invoke(
-                TUNNEL_PANEL_PLUGIN_ID,
-                InvokeContext::default(),
-                Value::Null,
-            )
-            .await;
-        if let echo_plugin_host::api::InvokeOutcome::Ok { result, .. } = outcome {
-            if result.get("serving").and_then(Value::as_bool) == Some(true) {
-                let listen = result.get("listen").and_then(Value::as_str)?.to_string();
-                let auth = result.get("auth").and_then(Value::as_bool).unwrap_or(false);
-                return Some(if auth {
-                    format!("http://{listen}/（需要口令）")
-                } else {
-                    format!("http://{listen}/")
-                });
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    None
+    let result = handle
+        .wait_until(
+            TUNNEL_PANEL_PLUGIN_ID,
+            InvokeContext::default(),
+            Value::Null,
+            Duration::from_secs(5),
+            |r| r.get("serving").and_then(Value::as_bool) == Some(true),
+        )
+        .await?;
+    let listen = result.get("listen").and_then(Value::as_str)?.to_string();
+    let auth = result.get("auth").and_then(Value::as_bool).unwrap_or(false);
+    Some(if auth {
+        format!("http://{listen}/（需要口令）")
+    } else {
+        format!("http://{listen}/")
+    })
 }
 
 async fn wait_for_signal() {
@@ -700,7 +709,29 @@ mod tests {
     //   → EdgeHostService::call → dispatch_edge → EdgeRouteControl → 插件
     //
     // 这里直接调 EdgeHostService::call（supervisor 那层是框架的，已有自己的
-    // 测试）；整个调用是同步签名，与真实 HostCall 一致。
+    // 测试）。`call` 是 async trait 方法，`cx` 取一个假的调用者 id ——
+    // supervisor 在生产路径上填的是真实的插件 id。
+
+    /// 调一次宿主服务，返回结果（失败即 panic）。
+    async fn call(svc: &EdgeHostService, method: &str, payload: Value) -> Value {
+        svc.call(test_caller(), method, payload)
+            .await
+            .unwrap_or_else(|(code, msg)| panic!("{method} 应成功，实际 {code}: {msg}"))
+    }
+
+    /// 调一次宿主服务，返回错误码与消息（成功即 panic）。
+    async fn call_err(svc: &EdgeHostService, method: &str, payload: Value) -> (String, String) {
+        match svc.call(test_caller(), method, payload).await {
+            Ok(v) => panic!("{method} 应失败，实际返回 {v}"),
+            Err(e) => e,
+        }
+    }
+
+    fn test_caller() -> CallContext {
+        CallContext {
+            caller: "test.panel".into(),
+        }
+    }
 
     /// 挂一个边缘路由插件（监听 :0），返回控制面句柄。
     ///
@@ -732,7 +763,7 @@ mod tests {
         let svc = EdgeHostService::new(ctl);
 
         // 1) status：监听地址 + 路由表 + 计数器都在
-        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        let st = call(&svc, method::EDGE_ROUTE_STATUS, Value::Null).await;
         assert_eq!(st["routes"][0]["prefix"], "cad");
         assert_eq!(st["routes"][0]["port"], 2228);
         assert!(
@@ -742,28 +773,29 @@ mod tests {
         assert_eq!(st["counters"]["requests"], 0);
 
         // 2) list：只给路由数组（面板画表格用）
-        let list = svc.call(method::EDGE_ROUTE_LIST, Value::Null).unwrap();
+        let list = call(&svc, method::EDGE_ROUTE_LIST, Value::Null).await;
         assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
 
         // 3) upsert：新增立即出现在 status 里
-        let added = svc
-            .call(
-                method::EDGE_ROUTE_UPSERT,
-                serde_json::json!({ "prefix": "panel", "port": 8080 }),
-            )
-            .unwrap();
+        let added = call(
+            &svc,
+            method::EDGE_ROUTE_UPSERT,
+            serde_json::json!({ "prefix": "panel", "port": 8080 }),
+        )
+        .await;
         assert_eq!(added["prefix"], "panel");
         assert_eq!(added["port"], 8080);
-        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        let st = call(&svc, method::EDGE_ROUTE_STATUS, Value::Null).await;
         assert_eq!(st["routes"].as_array().unwrap().len(), 2, "{st}");
 
         // 4) delete
-        svc.call(
+        call(
+            &svc,
             method::EDGE_ROUTE_DELETE,
             serde_json::json!({ "prefix": "panel" }),
         )
-        .unwrap();
-        let st = svc.call(method::EDGE_ROUTE_STATUS, Value::Null).unwrap();
+        .await;
+        let st = call(&svc, method::EDGE_ROUTE_STATUS, Value::Null).await;
         assert_eq!(st["routes"].as_array().unwrap().len(), 1, "{st}");
     }
 
@@ -774,32 +806,35 @@ mod tests {
         let svc = EdgeHostService::new(ctl);
 
         // 非法前缀 → invalid（面板按 ErrorKind::http_status 变 400）
-        let (code, msg) = svc
-            .call(
-                method::EDGE_ROUTE_UPSERT,
-                serde_json::json!({ "prefix": "a b", "port": 1 }),
-            )
-            .unwrap_err();
+        let (code, msg) = call_err(
+            &svc,
+            method::EDGE_ROUTE_UPSERT,
+            serde_json::json!({ "prefix": "a b", "port": 1 }),
+        )
+        .await;
         assert_eq!(code, "invalid", "{msg}");
 
         // 删不存在的 → not_found（→ 404）
-        let (code, msg) = svc
-            .call(
-                method::EDGE_ROUTE_DELETE,
-                serde_json::json!({ "prefix": "nope" }),
-            )
-            .unwrap_err();
+        let (code, msg) = call_err(
+            &svc,
+            method::EDGE_ROUTE_DELETE,
+            serde_json::json!({ "prefix": "nope" }),
+        )
+        .await;
         assert_eq!(code, "not_found", "{msg}");
 
         // 参数形状不对 → invalid，且错误里带方法名（便于定位是谁调错）
-        let (code, msg) = svc
-            .call(method::EDGE_ROUTE_DELETE, serde_json::json!({ "wrong": 1 }))
-            .unwrap_err();
+        let (code, msg) = call_err(
+            &svc,
+            method::EDGE_ROUTE_DELETE,
+            serde_json::json!({ "wrong": 1 }),
+        )
+        .await;
         assert_eq!(code, "invalid", "{msg}");
         assert!(msg.contains("edge.route.delete"), "错误应点名方法：{msg}");
 
         // 未知方法 → invalid（不是静默成功）
-        let (code, _) = svc.call("edge.route.explode", Value::Null).unwrap_err();
+        let (code, _) = call_err(&svc, "edge.route.explode", Value::Null).await;
         assert_eq!(code, "invalid");
     }
 
