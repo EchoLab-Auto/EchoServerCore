@@ -1,21 +1,29 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/esc-common",
-    "crates/esc-control-api",
-    "crates/esc-panel-auth",
-    "crates/esc-server-panel",
-    "crates/esc-gateway",
-    "crates/esc-engine",
-    "crates/esc-hub",
-    "crates/esc-spoke",
-    "crates/esc-cli",
-    "crates/esc-plugin-tunnel",
-    "crates/esc-plugin-tunnel-panel",
-    "crates/esc-plugin-edge-router",
-    "crates/esc-host",
-    "crates/esc-panel-web",
+    # ── 底座：跨插件复用的库与契约 ──────────────────────────────────────
+    "crates/esc-common",       # 配置 / TLS / 线协议 / yamux / PKI
+    "crates/esc-control-api",  # 控制面契约（DTO + 方法名 + trait）
+    "crates/esc-engine",       # 隧道内核（hub / spoke，可编程）
+    "crates/esc-panel-auth",   # 面板与网关共用的访问控制
 
+    # ── 宿主与独立进程 ─────────────────────────────────────────────────
+    "crates/esc-host",         # 组合根：Ctx + 插件挂载 + HostCall 服务
+    "crates/esc-gateway",      # 独立进程：认证反向代理
+
+    # ── CLI ───────────────────────────────────────────────────────────
+    "crates/esc-cli",          # 单个二进制 esc（hub / spoke / check / pki）
+    "crates/esc-hub",          # 兼容层：esc hub 的薄封装
+    "crates/esc-spoke",        # 兼容层：esc spoke 的薄封装
+
+    # ── 插件：一个插件一个目录，目录里放属于它的 crate ──────────────────
+    "crates/plugins/tunnel/esc-plugin-tunnel",
+    "crates/plugins/edge-router/esc-plugin-edge-router",
+    # 两个 Web 面板同属「panel」这一族：一个子进程插件 + 一个独立进程 +
+    # 它们共用的前端产物。面板前端只被这两个用，所以放在这里而不是顶层。
+    "crates/plugins/panel/esc-plugin-tunnel-panel",
+    "crates/plugins/panel/esc-server-panel",
+    "crates/plugins/panel/esc-panel-web",
 ]
 
 [workspace.package]
@@ -82,12 +90,13 @@ base64 = "0.22"
 esc-common = { path = "crates/esc-common" }
 esc-control-api = { path = "crates/esc-control-api" }
 esc-panel-auth = { path = "crates/esc-panel-auth" }
-esc-server-panel = { path = "crates/esc-server-panel" }
+esc-server-panel = { path = "crates/plugins/panel/esc-server-panel" }
 esc-gateway = { path = "crates/esc-gateway" }
 esc-engine = { path = "crates/esc-engine" }
-esc-plugin-tunnel = { path = "crates/esc-plugin-tunnel" }
-esc-plugin-edge-router = { path = "crates/esc-plugin-edge-router" }
-esc-panel-web = { path = "crates/esc-panel-web" }
+esc-plugin-tunnel = { path = "crates/plugins/tunnel/esc-plugin-tunnel" }
+esc-plugin-edge-router = { path = "crates/plugins/edge-router/esc-plugin-edge-router" }
+esc-panel-web = { path = "crates/plugins/panel/esc-panel-web" }
+esc-host = { path = "crates/esc-host" }
 esc-hub = { path = "crates/esc-hub" }
 esc-spoke = { path = "crates/esc-spoke" }
 

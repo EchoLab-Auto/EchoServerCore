@@ -563,7 +563,7 @@ ls -l /opt/src/esc.bundle && sha256sum /opt/src/esc.bundle
 # 远端
 python3 -c "
 import re, pathlib
-html = pathlib.Path('crates/esc-server-panel/web/index.html').read_text()
+html = pathlib.Path('crates/plugins/panel/esc-server-panel/web/index.html').read_text()
 js = re.search(r'<script>(.*?)</script>', html, re.S).group(1)
 pathlib.Path('/tmp/sp-check.js').write_text(js)
 print('JS 行数:', len(js.splitlines()))
@@ -629,7 +629,7 @@ curl -s localhost:18787/api/plugins | python3 -c 'import sys,json;print(json.loa
 - 面板：ui-frame 组件重建（这两个面板是全新的）、Docker 网络标签页、插件树
 - 框架：`plugin-framework` → `echo-fabric-arch`，v0.11.1 → **v0.14.0**
   （异步宿主服务、调用者身份、插件树快照、就绪探测、协议去领域化）
-- 前端：`panel-ui/` → `crates/esc-panel-web/`（产物从两份变一份）
+- 前端：`panel-ui/` → `crates/plugins/panel/esc-panel-web/`（产物从两份变一份）
 
 ### 步骤
 

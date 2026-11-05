@@ -269,24 +269,32 @@ DEBUG connection finished service=grafana peer=203.0.113.5:60011 up=78 down=168
 
 ```
 crates/
+  ── 底座（跨插件复用）──────────────────────────────────────────
   esc-common/        配置、TLS、线协议、yamux 驱动、PKI
   esc-engine/        可编程内核：动态端口绑定 / 注册表 / 映射表 / 计数管道
   esc-control-api/   控制面契约（DTO + 方法名 + 信封 + TunnelControl trait）
-  esc-plugin-tunnel/ 进程内插件：把引擎注册进宿主的 Ctx
-  esc-plugin-edge-router/  进程内插件：按域名前缀把请求分到本机不同端口
-  esc-plugin-tunnel-panel/  子进程插件：axum + 前端，只认契约
-  esc-server-panel/  独立进程：主机指标 + Docker 管理面板
-  esc-gateway/       独立进程：认证反向代理（面板前面）
-  esc-panel-auth/    两个面板共用的访问控制（Basic + 白名单 + 限速）
-  esc-panel-web/     两个面板共用的静态前端（Vue 3 产物，编译期嵌入）
+  esc-panel-auth/    面板与网关共用的访问控制（Basic + 白名单 + 限速）
+
+  ── 宿主与独立进程 ──────────────────────────────────────────────
   esc-host/          宿主：Ctx + 插件挂载 + HostCall 服务 + 面板管理
+  esc-gateway/       独立进程：认证反向代理（面板前面）
+
+  ── CLI ────────────────────────────────────────────────────────
+  esc-cli/           单个二进制 esc，子命令 hub / spoke / check / pki
   esc-hub/           公网侧 CLI 薄封装（行为与改造前一致）
   esc-spoke/         内网侧 CLI 薄封装（行为与改造前一致）
-  esc-cli/           单个二进制 esc，子命令 hub / spoke / check / pki
-  esc-host(二进制)   esc-host，宿主入口
+
+  ── 插件（一个插件一个目录，目录里放属于它的 crate）──────────────
+  plugins/
+    tunnel/          esc-plugin-tunnel/          进程内：把引擎注册进 Ctx
+    edge-router/     esc-plugin-edge-router/     进程内：按域名前缀分流到本机端口
+    panel/           esc-plugin-tunnel-panel/    子进程：axum + 前端，只认契约
+                     esc-server-panel/           独立进程：主机指标 + Docker 管理
+                     esc-panel-web/              两个面板共用的前端（编译期嵌入）
 ```
 
-分层原则只有一个：**依赖方向永远指向 `esc-control-api` / `esc-common`**。
+分层原则只有两条：**依赖方向永远指向 `esc-control-api` / `esc-common`**；
+**插件独占的 crate 放进 `plugins/<插件名>/`**，跨插件复用的留在顶层。
 面板不 import 引擎，引擎不 import 面板，宿主两边都不 import 实现细节。
 
 ```bash

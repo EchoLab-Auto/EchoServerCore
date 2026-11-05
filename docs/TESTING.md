@@ -206,11 +206,11 @@ SAN: IP Address:127.0.0.1, DNS:localhost
 |---|---|---|
 | 引擎单测 | `crates/esc-engine/src/{store,config}.rs` | 映射表 CRUD / 冲突校验 / 原子落盘；旧 hub.toml、spoke.toml 仍能解析；内联 `[[mapping]]` 优先于 `[[service]]` |
 | 引擎集成 | `crates/esc-engine/tests/runtime_mapping.rs` | **spoke 已连接时加映射 → 现有连接被立即授权**（不需要重连）→ 数据穿过隧道 → 停用后端口释放 → 删除后记录消失 |
-| 插件 | `crates/esc-plugin-tunnel/src/lib.rs` | mount 后 `Ctx` 里出现 `esc.tunnel.control`；配置非法时挂载 fail-closed；引擎启动失败时调用方拿到明确错误而不是挂住 |
-| 面板 HTTP | `crates/esc-plugin-tunnel-panel/tests/http_api.rs` | 每个 REST 端点对应正确的契约方法；URL 里的 `id` 覆盖 body；Basic 认证缺失即 401 且**不会**触达后端；非回环 + 无口令被配置校验拒绝 |
-| 端到端 | `crates/esc-plugin-tunnel-panel/tests/e2e_host.rs` | 真子进程面板 + 真宿主 + 真引擎 + 真 spoke：HTTP 建映射 → 端口绑定 → 字节往返；宿主退出后面板进程消失 |
+| 插件 | `crates/plugins/tunnel/esc-plugin-tunnel/src/lib.rs` | mount 后 `Ctx` 里出现 `esc.tunnel.control`；配置非法时挂载 fail-closed；引擎启动失败时调用方拿到明确错误而不是挂住 |
+| 面板 HTTP | `crates/plugins/panel/esc-plugin-tunnel-panel/tests/http_api.rs` | 每个 REST 端点对应正确的契约方法；URL 里的 `id` 覆盖 body；Basic 认证缺失即 401 且**不会**触达后端；非回环 + 无口令被配置校验拒绝 |
+| 端到端 | `crates/plugins/panel/esc-plugin-tunnel-panel/tests/e2e_host.rs` | 真子进程面板 + 真宿主 + 真引擎 + 真 spoke：HTTP 建映射 → 端口绑定 → 字节往返；宿主退出后面板进程消失 |
 | 隔离性 | `crates/esc-host/tests/isolation.rs` | 面板二进制指向不存在的路径时，宿主**不退出**、隧道引擎仍就绪、进程持续运行（「面板挂了不影响隧道」这条承诺的回归测试） |
-| 契约稳定性 | `crates/esc-plugin-tunnel-panel/tests/http_api.rs::error_code_table_lives_in_the_contract` | `ErrorKind::as_code` ↔ `from_code` 往返、未知码归 `Other`（向前兼容）、`http_status` 不退化 |
+| 契约稳定性 | `crates/plugins/panel/esc-plugin-tunnel-panel/tests/http_api.rs::error_code_table_lives_in_the_contract` | `ErrorKind::as_code` ↔ `from_code` 往返、未知码归 `Other`（向前兼容）、`http_status` 不退化 |
 
 手工冒烟（release 二进制）：
 

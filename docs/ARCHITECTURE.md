@@ -42,29 +42,53 @@
 
 ## crate 地图
 
+目录按**归属**分组：跨插件复用的放顶层，**插件独占的放进 `plugins/<插件名>/`**。
+这条规则让「哪些代码属于哪个插件」从名字看不出来变成目录结构能看出来 ——
+改一个插件时不用在 14 个平铺目录里找。
+
 ```
 crates/
-  esc-common/        配置、TLS、线协议、yamux 驱动、PKI         （未改动）
-  esc-engine/        ★ 新增：可编程内核
+  ── 底座：跨插件复用 ───────────────────────────────────────────────
+  esc-common/        配置、TLS、线协议、yamux 驱动、PKI
+  esc-control-api/   控制面契约（DTO + 方法名 + 信封 + trait）
+  esc-engine/        可编程内核
       hub/           动态公网监听：运行时 add/remove、每映射计数器
       spoke.rs       可变服务表 + 变配置自动重新握手
       store.rs       映射表（TOML 持久化，原子写）
       config.rs      兼容旧 hub.toml/spoke.toml 的引擎配置
       pipe.rs        带计数的双向搬运（替代 copy_bidirectional）
-  esc-control-api/   ★ 新增：控制面契约（DTO + 方法名 + 信封 + trait）
-  esc-plugin-tunnel/ ★ 新增：进程内插件，把引擎注册进 Ctx
-  esc-plugin-edge-router/
-                     ★ 新增：进程内插件，按域名前缀把请求分到本机不同端口
-  esc-panel-auth/    ★ 新增：两个面板共用的访问控制（Basic + 白名单 + 限速）
-  esc-plugin-tunnel-panel/
-                     ★ 新增：子进程插件，端口映射面板（HTTP + 单页前端，:2223）
-  esc-server-panel/  ★ 新增：独立进程，主机指标 + Docker 管理面板（:2224）
-  esc-gateway/       ★ 新增：独立进程，认证反向代理（面板前面，:2223/:2224）
-  esc-host/          ★ 新增：组合根（宿主二进制 + 可复用 lib）
-  esc-hub/           保留：`esc hub` 的薄封装（行为不变）
-  esc-spoke/         保留：`esc spoke` 的薄封装（行为不变）
-  esc-cli/           保留：`esc` 二进制（hub / spoke / check / pki）
+  esc-panel-auth/    面板与网关共用的访问控制（Basic + 白名单 + 限速）
+
+  ── 宿主与独立进程 ─────────────────────────────────────────────────
+  esc-host/          组合根（宿主二进制 + 可复用 lib）
+  esc-gateway/       独立进程：认证反向代理（面板前面，:2223/:2224）
+
+  ── CLI ───────────────────────────────────────────────────────────
+  esc-cli/           `esc` 二进制（hub / spoke / check / pki）
+  esc-hub/           `esc hub` 的薄封装（行为不变）
+  esc-spoke/         `esc spoke` 的薄封装（行为不变）
+
+  ── 插件：一个插件一个目录，目录里放属于它的 crate ──────────────────
+  plugins/
+    tunnel/
+      esc-plugin-tunnel/          进程内插件：把引擎注册进 Ctx
+    edge-router/
+      esc-plugin-edge-router/     进程内插件：按域名前缀把请求分到本机不同端口
+    panel/
+      esc-plugin-tunnel-panel/    子进程插件：端口映射面板（:2223）
+      esc-server-panel/           独立进程：主机指标 + Docker 管理面板（:2224）
+      esc-panel-web/              两个面板共用的静态前端（Vue 3 产物）
 ```
+
+`plugins/panel/` 里放三个 crate 而不是一个，因为它们是**同一族**：一个子进程
+插件（隧道面板）、一个同族独立进程（服务器面板）、以及只被这两个用的前端。
+
+`esc-panel-auth` 没有放进 `plugins/panel/`：它同时被 `esc-gateway` 用，
+归属不唯一，所以留在顶层。
+
+**一个插件 ≠ 一个 crate 的充要关系**：`esc-plugin-edge-router` 这个 crate 里
+只定义了一个 `EdgeRouterPlugin`，但框架不要求 1:1 —— 同一个 crate 定义多个
+插件、或者插件实现在别的 crate 里，都合法。
 
 依赖方向（只能向下）：
 
@@ -72,16 +96,21 @@ crates/
 esc-cli ──▶ esc-hub / esc-spoke ──▶ esc-engine ──▶ esc-common
                                               └──▶ esc-control-api
 
-esc-host ──▶ esc-plugin-tunnel ──▶ esc-engine
-        ├──▶ esc-plugin-edge-router ──▶ esc-control-api   ← 不认识隧道
+esc-host ──▶ plugins/tunnel/esc-plugin-tunnel ──▶ esc-engine
+        ├──▶ plugins/edge-router/esc-plugin-edge-router ──▶ esc-control-api
         └──▶ esc-control-api
 
-esc-plugin-tunnel-panel ──▶ esc-control-api      ← 没有 esc-engine（物理隔离）
-                        └──▶ esc-panel-auth
+plugins/panel/esc-plugin-tunnel-panel ──▶ esc-control-api   ← 不认识隧道实现
+                                      ├──▶ esc-panel-auth
+                                      └──▶ plugins/panel/esc-panel-web
 
-esc-server-panel ──▶ esc-panel-auth              ← 只依赖这一个
-esc-gateway      ──▶ esc-panel-auth              ← 同样只依赖这一个
+plugins/panel/esc-server-panel ──▶ esc-panel-auth
+                              └──▶ plugins/panel/esc-panel-web
+esc-gateway ──▶ esc-panel-auth
 ```
+
+`esc-gateway` 与服务器面板都只依赖 `esc-panel-auth`：它们物理上无法调用引擎
+内部函数，只能走 HTTP。
 
 最后两行是架构约束，不是「暂时没用到」：面板物理上无法调用引擎内部函数，
 只能走 `HostCall("esc.control", …)`；服务器面板与隧道生态完全无关。
@@ -304,7 +333,7 @@ ErrorKind::http_status() -> u16           // 400 / 404 / 409 / 409 / 503 / 502
 | 想做的事 | 改哪里 |
 |---|---|
 | 加一个控制方法 | `esc-control-api`：加方法名 + `TunnelControl` 方法 + `dispatch` 分支 → 引擎实现 → 面板加 HTTP 路由 |
-| 换前端 | 只改 `esc-plugin-tunnel-panel/web/index.html`（单文件，无构建步骤） |
+| 换前端 | 只改 `crates/plugins/panel/esc-plugin-tunnel-panel/web/index.html`（单文件，无构建步骤） |
 | 换个面板实现（别的语言） | 讲同一套 `HostCall("esc.control", method, params)` 即可，宿主不用改 |
 | 加一个新插件（比如证书签发 UI） | 写一个 `PluginHandler` 子进程插件 + 在宿主里 `supervisor.start(...)`；它通过 `HostCall` 拿数据 |
 | 换隧道实现 | 在 Ctx 里注册同一个 `ServiceKey<Arc<dyn TunnelControl>>`，面板完全不用知道 |

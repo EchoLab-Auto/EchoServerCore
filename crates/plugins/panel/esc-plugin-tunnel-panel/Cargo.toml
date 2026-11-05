@@ -34,5 +34,5 @@ tokio = { workspace = true }
 esc-common = { workspace = true }
 esc-engine = { workspace = true }
 esc-control-api = { workspace = true }
-esc-host = { path = "../esc-host" }
+esc-host = { workspace = true }
 echo-plugin-host = { workspace = true }
