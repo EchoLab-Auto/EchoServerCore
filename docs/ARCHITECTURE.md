@@ -141,9 +141,22 @@ esc-plugin-tunnel-panel
 > multi-thread 运行时"这个隐含前提。
 
 宿主服务还拿到了**调用者身份**：`CallContext::caller` 由框架的 supervisor 从
-连接归属填写（`HostCall` 帧里没有这个字段，插件伪造不了）。目前只有我们自己
-写的面板一个消费者，所以没做来源校验；将来第三方插件能调 `esc.control` 时，
-那两处 `_cx` 就是授权点。
+连接归属填写（`HostCall` 帧里没有这个字段，插件伪造不了）。
+
+三个宿主服务都在入口处校验它（`esc-host/src/caller.rs`）：
+
+```text
+esc.control  ← 能增删所有端口映射
+esc.edge     ← 能增删边缘路由（含绑 :80 的那张表）
+esc.plugins  ← 只读插件树
+```
+
+规则是**允许清单 + 默认拒绝**，清单里目前只有隧道面板一个 id。默认拒绝的理由
+是后果不对称：将来新增一个插件时，忘了配权限的代价是"它调不通、日志一条
+warn"，而默认允许的代价是"它一上来就能删掉所有映射"。
+
+权限表刻意不写成配置：一旦可配置就有了"配置写错导致权限开太大"这种失效模式，
+而在引入第三方插件之前它没有收益。写死成常量 + 测试，改它必须过一次代码评审。
 
 ### 4. 为什么 release 刻意不用 `panic = "abort"`
 
@@ -251,10 +264,10 @@ plugin id 用点做命名空间，像反向域名——将来生态里若有别�
 `version = "0.1.0"` 这种约束毫无意义（任何一版都满足）。本仓钉在 tag 上：
 
 ```toml
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.13.0" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.14.0" }
 ```
 
-`v0.13.0` = commit `bc981ee`。升级框架 = 改这一个 tag（五个依赖一起），
+`v0.14.0` = commit `0da765b`。升级框架 = 改这一个 tag（五个依赖一起），
 然后 `cargo update` + 跑测试。因为框架在 0.x 允许 breaking，升级前值得先看
 它的 `CHANGELOG.md`。
 

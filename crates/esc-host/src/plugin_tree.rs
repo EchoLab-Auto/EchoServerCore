@@ -14,6 +14,7 @@ use esc_control_api::{
 };
 use serde_json::Value;
 
+use crate::caller::CallerPolicy;
 use crate::TUNNEL_PANEL_PLUGIN_ID;
 
 /// 子进程面板没有住在 `PluginRegistry` 里，因此单独保存它的框架句柄。
@@ -32,6 +33,7 @@ pub struct PluginTreeHostService {
     root: Arc<PluginScope>,
     panel: SharedPanelObservation,
     host_services: Vec<String>,
+    policy: Arc<CallerPolicy>,
 }
 
 impl PluginTreeHostService {
@@ -39,11 +41,13 @@ impl PluginTreeHostService {
         root: Arc<PluginScope>,
         panel: SharedPanelObservation,
         host_services: Vec<String>,
+        policy: Arc<CallerPolicy>,
     ) -> Self {
         Self {
             root,
             panel,
             host_services,
+            policy,
         }
     }
 
@@ -56,10 +60,11 @@ impl PluginTreeHostService {
 impl AsyncHostService for PluginTreeHostService {
     async fn call(
         &self,
-        _cx: CallContext,
+        cx: CallContext,
         method: &str,
         _payload: Value,
     ) -> Result<Value, (String, String)> {
+        self.policy.check(&cx, PLUGIN_TREE_SERVICE)?;
         if method != PLUGIN_TREE_METHOD {
             return Err((
                 "not_found".into(),

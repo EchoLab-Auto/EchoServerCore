@@ -32,6 +32,8 @@ use echo_plugin::{MountContext, Plugin, PluginScope};
 use echo_plugin_host::api::InvokeContext;
 use echo_plugin_host::async_trait;
 use echo_plugin_host::host_service::{AsyncHostService, CallContext};
+
+use crate::caller::CallerPolicy;
 use echo_plugin_host::stdio::StdioTransport;
 use echo_plugin_host::supervisor::{PluginHandle, PluginState, PluginSupervisor};
 use echo_plugin_host::transport::PluginSpec;
@@ -46,7 +48,8 @@ use esc_control_api::{
 use esc_plugin_edge_router::EdgeRouterPlugin;
 use esc_plugin_tunnel::TunnelPlugin;
 
-pub mod plugin_tree;
+pub mod caller;
+mod plugin_tree;
 use plugin_tree::{PanelObservation, PluginTreeHostService, SharedPanelObservation};
 
 /// 隧道插件在注册表里的 id。
@@ -178,11 +181,12 @@ fn toml_to_json(v: &toml::Value) -> Value {
 /// 服务时，这里就是授权点。
 pub struct EngineHostService {
     ctl: Arc<dyn TunnelControl>,
+    policy: Arc<CallerPolicy>,
 }
 
 impl EngineHostService {
-    pub fn new(ctl: Arc<dyn TunnelControl>) -> Self {
-        Self { ctl }
+    pub fn new(ctl: Arc<dyn TunnelControl>, policy: Arc<CallerPolicy>) -> Self {
+        Self { ctl, policy }
     }
 }
 
@@ -190,10 +194,11 @@ impl EngineHostService {
 impl AsyncHostService for EngineHostService {
     async fn call(
         &self,
-        _cx: CallContext,
+        cx: CallContext,
         method: &str,
         payload: Value,
     ) -> Result<Value, (String, String)> {
+        self.policy.check(&cx, CONTROL_SERVICE)?;
         let req = ControlRequest {
             method: method.to_string(),
             params: payload,
@@ -219,11 +224,12 @@ impl AsyncHostService for EngineHostService {
 /// 实现可转），面板据此就能判断"这台机器有没有路由能力"。
 pub struct EdgeHostService {
     ctl: Arc<dyn EdgeRouteControl>,
+    policy: Arc<CallerPolicy>,
 }
 
 impl EdgeHostService {
-    pub fn new(ctl: Arc<dyn EdgeRouteControl>) -> Self {
-        Self { ctl }
+    pub fn new(ctl: Arc<dyn EdgeRouteControl>, policy: Arc<CallerPolicy>) -> Self {
+        Self { ctl, policy }
     }
 }
 
@@ -231,10 +237,11 @@ impl EdgeHostService {
 impl AsyncHostService for EdgeHostService {
     async fn call(
         &self,
-        _cx: CallContext,
+        cx: CallContext,
         method: &str,
         payload: Value,
     ) -> Result<Value, (String, String)> {
+        self.policy.check(&cx, EDGE_ROUTE_SERVICE)?;
         let req = ControlRequest {
             method: method.to_string(),
             params: payload,
@@ -318,10 +325,20 @@ impl Host {
             None
         };
 
+        // 调用者策略：宿主服务只对允许清单里的插件开放。
+        //
+        // 目前唯一的消费者是隧道面板（映射 / 边缘路由 / 插件树都由它驱动）。
+        // 默认拒绝而不是默认允许——"新插件忘了配权限"的后果不对称：默认允许
+        // 意味着它一上来就能删掉所有映射。
+        let callers = Arc::new(CallerPolicy::new([TUNNEL_PANEL_PLUGIN_ID]));
+
         let supervisor = PluginSupervisor::new();
         supervisor.host_services().register_async(
             CONTROL_SERVICE,
-            Arc::new(EngineHostService::new(Arc::clone(&control))),
+            Arc::new(EngineHostService::new(
+                Arc::clone(&control),
+                Arc::clone(&callers),
+            )),
         );
         let mut host_services = vec![CONTROL_SERVICE.to_string(), PLUGIN_TREE_SERVICE.to_string()];
 
@@ -329,7 +346,7 @@ impl Host {
         if let Some(edge) = &edge_router {
             supervisor.host_services().register_async(
                 EDGE_ROUTE_SERVICE,
-                Arc::new(EdgeHostService::new(Arc::clone(edge))),
+                Arc::new(EdgeHostService::new(Arc::clone(edge), Arc::clone(&callers))),
             );
             host_services.push(EDGE_ROUTE_SERVICE.to_string());
             info!(
@@ -351,6 +368,7 @@ impl Host {
                 Arc::clone(&plugins),
                 Arc::clone(&panel_observation),
                 host_services,
+                Arc::clone(&callers),
             )),
         );
 
@@ -727,10 +745,17 @@ mod tests {
         }
     }
 
+    const TEST_CALLER: &str = "test.panel";
+
     fn test_caller() -> CallContext {
         CallContext {
-            caller: "test.panel".into(),
+            caller: TEST_CALLER.into(),
         }
+    }
+
+    /// 测试用的调用者策略：只放行 `TEST_CALLER`。
+    fn test_policy() -> Arc<CallerPolicy> {
+        Arc::new(CallerPolicy::new([TEST_CALLER]))
     }
 
     /// 挂一个边缘路由插件（监听 :0），返回控制面句柄。
@@ -760,7 +785,7 @@ mod tests {
     async fn edge_control_service_exposes_status_and_mutations() {
         use esc_control_api::method;
         let (ctl, _ctx, _registry) = mount_edge_router().await;
-        let svc = EdgeHostService::new(ctl);
+        let svc = EdgeHostService::new(ctl, test_policy());
 
         // 1) status：监听地址 + 路由表 + 计数器都在
         let st = call(&svc, method::EDGE_ROUTE_STATUS, Value::Null).await;
@@ -803,7 +828,7 @@ mod tests {
     async fn edge_control_service_maps_errors_to_contract_codes() {
         use esc_control_api::method;
         let (ctl, _ctx, _registry) = mount_edge_router().await;
-        let svc = EdgeHostService::new(ctl);
+        let svc = EdgeHostService::new(ctl, test_policy());
 
         // 非法前缀 → invalid（面板按 ErrorKind::http_status 变 400）
         let (code, msg) = call_err(
@@ -836,6 +861,40 @@ mod tests {
         // 未知方法 → invalid（不是静默成功）
         let (code, _) = call_err(&svc, "edge.route.explode", Value::Null).await;
         assert_eq!(code, "invalid");
+    }
+
+    /// 陌生插件调宿主服务 → `forbidden`，且**真正的逻辑一次都没执行**。
+    ///
+    /// 后者才是这条测试的重点：只断言错误码的话，一个"先执行再检查"的实现也
+    /// 能通过。所以这里用一个只读方法（`status`），并断言它没有返回数据。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stranger_caller_is_rejected_before_the_call_runs() {
+        use esc_control_api::method;
+        let (ctl, _ctx, _registry) = mount_edge_router().await;
+        let svc = EdgeHostService::new(ctl, test_policy());
+
+        let stranger = CallContext {
+            caller: "some.third_party".into(),
+        };
+        let err = svc
+            .call(stranger, method::EDGE_ROUTE_STATUS, Value::Null)
+            .await
+            .expect_err("陌生调用者必须被拒绝");
+        assert_eq!(err.0, "forbidden", "面板按 ErrorKind::http_status 映射成 403");
+        assert!(
+            err.1.contains("some.third_party"),
+            "消息要点名调用者：{}",
+            err.1
+        );
+        assert!(
+            !err.1.contains(TEST_CALLER),
+            "拒绝消息不该回显允许清单（等于泄露内部拓扑）：{}",
+            err.1
+        );
+
+        // 同一个服务，白名单内的调用者照常成功——证明拒绝的是"人"，不是"功能"。
+        let ok = call(&svc, method::EDGE_ROUTE_STATUS, Value::Null).await;
+        assert_eq!(ok["routes"][0]["prefix"], "cad");
     }
 
     #[test]
