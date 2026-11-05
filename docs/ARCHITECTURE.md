@@ -251,10 +251,10 @@ plugin id 用点做命名空间，像反向域名——将来生态里若有别�
 `version = "0.1.0"` 这种约束毫无意义（任何一版都满足）。本仓钉在 tag 上：
 
 ```toml
-echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.12.0" }
+echo-plugin-sdk = { git = "https://github.com/EchoLab-Auto/echo-fabric-arch.git", tag = "v0.13.0" }
 ```
 
-`v0.12.0` = commit `c089715`。升级框架 = 改这一个 tag（五个依赖一起），
+`v0.13.0` = commit `bc981ee`。升级框架 = 改这一个 tag（五个依赖一起），
 然后 `cargo update` + 跑测试。因为框架在 0.x 允许 breaking，升级前值得先看
 它的 `CHANGELOG.md`。
 
