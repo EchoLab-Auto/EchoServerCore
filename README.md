@@ -277,15 +277,15 @@ crates/
 
   ── 模块（一个模块一个目录，目录里放属于它的 crate）──────────────
   modules/
-    core/            module-server-core（底座：跨模块复用）
+    module-core/     module-server-core（底座：跨模块复用）
                      esc-common/          配置、TLS、线协议、yamux 驱动、PKI
                      esc-control-api/     控制面契约（DTO + 方法名 + 信封 + trait）
                      esc-engine/          可编程内核（hub / spoke）
                      esc-panel-auth/      面板与网关共用的访问控制
-    tunnel/          esc-plugin-tunnel/          进程内：把引擎注册进 Ctx
-    edge-router/     esc-plugin-edge-router/     进程内：按域名前缀分流到本机端口
-    gateway/         esc-gateway/                独立进程：认证反向代理
-    panel/           esc-plugin-tunnel-panel/    子进程：axum + 前端，只认契约
+    module-tunnel/   esc-plugin-tunnel/          进程内：把引擎注册进 Ctx
+    module-edge-router/ esc-plugin-edge-router/  进程内：按域名前缀分流到本机端口
+    module-gateway/  esc-gateway/                独立进程：认证反向代理
+    module-panel/    esc-plugin-tunnel-panel/    子进程：axum + 前端，只认契约
                      esc-server-panel/           独立进程：主机指标 + Docker 管理
                      esc-panel-web/              两个面板共用的前端（编译期嵌入）
 ```

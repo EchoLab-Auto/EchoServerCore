@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
     # ── 底座：跨模块复用的库与契约（module-server-core）─────────────────
-    "crates/modules/core/esc-common",       # 配置 / TLS / 线协议 / yamux / PKI
-    "crates/modules/core/esc-control-api",  # 控制面契约（DTO + 方法名 + trait）
-    "crates/modules/core/esc-engine",       # 隧道内核（hub / spoke，可编程）
-    "crates/modules/core/esc-panel-auth",   # 面板与网关共用的访问控制
+    "crates/modules/module-core/esc-common",       # 配置 / TLS / 线协议 / yamux / PKI
+    "crates/modules/module-core/esc-control-api",  # 控制面契约（DTO + 方法名 + trait）
+    "crates/modules/module-core/esc-engine",       # 隧道内核（hub / spoke，可编程）
+    "crates/modules/module-core/esc-panel-auth",   # 面板与网关共用的访问控制
 
     # ── 宿主 ───────────────────────────────────────────────────────────
     "crates/esc-host",         # 组合根：Ctx + 插件挂载 + HostCall 服务
@@ -16,14 +16,14 @@ members = [
     "crates/esc-spoke",        # 兼容层：esc spoke 的薄封装
 
     # ── 模块：一个模块一个目录，目录里放属于它的 crate ──────────────────
-    "crates/modules/tunnel/esc-plugin-tunnel",
-    "crates/modules/edge-router/esc-plugin-edge-router",
-    "crates/modules/gateway/esc-gateway",
+    "crates/modules/module-tunnel/esc-plugin-tunnel",
+    "crates/modules/module-edge-router/esc-plugin-edge-router",
+    "crates/modules/module-gateway/esc-gateway",
     # 两个 Web 面板同属「panel」这一族：一个子进程插件 + 一个独立进程 +
     # 它们共用的前端产物。面板前端只被这两个用，所以放在这里而不是顶层。
-    "crates/modules/panel/esc-plugin-tunnel-panel",
-    "crates/modules/panel/esc-server-panel",
-    "crates/modules/panel/esc-panel-web",
+    "crates/modules/module-panel/esc-plugin-tunnel-panel",
+    "crates/modules/module-panel/esc-server-panel",
+    "crates/modules/module-panel/esc-panel-web",
 ]
 
 [workspace.package]
@@ -87,15 +87,15 @@ async-trait = "0.1"
 base64 = "0.22"
 
 # ── 内部 crate ───────────────────────────────────────────────────────
-esc-common = { path = "crates/modules/core/esc-common" }
-esc-control-api = { path = "crates/modules/core/esc-control-api" }
-esc-panel-auth = { path = "crates/modules/core/esc-panel-auth" }
-esc-server-panel = { path = "crates/modules/panel/esc-server-panel" }
-esc-gateway = { path = "crates/modules/gateway/esc-gateway" }
-esc-engine = { path = "crates/modules/core/esc-engine" }
-esc-plugin-tunnel = { path = "crates/modules/tunnel/esc-plugin-tunnel" }
-esc-plugin-edge-router = { path = "crates/modules/edge-router/esc-plugin-edge-router" }
-esc-panel-web = { path = "crates/modules/panel/esc-panel-web" }
+esc-common = { path = "crates/modules/module-core/esc-common" }
+esc-control-api = { path = "crates/modules/module-core/esc-control-api" }
+esc-panel-auth = { path = "crates/modules/module-core/esc-panel-auth" }
+esc-server-panel = { path = "crates/modules/module-panel/esc-server-panel" }
+esc-gateway = { path = "crates/modules/module-gateway/esc-gateway" }
+esc-engine = { path = "crates/modules/module-core/esc-engine" }
+esc-plugin-tunnel = { path = "crates/modules/module-tunnel/esc-plugin-tunnel" }
+esc-plugin-edge-router = { path = "crates/modules/module-edge-router/esc-plugin-edge-router" }
+esc-panel-web = { path = "crates/modules/module-panel/esc-panel-web" }
 esc-host = { path = "crates/esc-host" }
 esc-hub = { path = "crates/esc-hub" }
 esc-spoke = { path = "crates/esc-spoke" }

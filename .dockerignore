@@ -13,4 +13,4 @@ docker-compose.yml
 # 前端工程：`cargo build` 只需要 crates/modules/panel/esc-panel-web/web/ 的**产物**，
 # 不需要源码、node_modules（86 MB）或 ui-frame 子模块（348 MB）。
 # 少了这行，`COPY crates ./crates` 会把它们全搬进构建上下文。
-crates/modules/panel/esc-panel-web/ui/
+crates/modules/module-panel/esc-panel-web/ui/

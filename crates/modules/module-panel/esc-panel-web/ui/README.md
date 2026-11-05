@@ -8,7 +8,7 @@ Vue 3 + TypeScript 工程。真实组件来自
 ## 这个 crate 是什么
 
 ```
-crates/modules/panel/esc-panel-web/
+crates/modules/module-panel/esc-panel-web/
 ├── src/lib.rs          ← Rust 侧：路径 → 资源、HTML 外壳（零依赖）
 ├── build.rs            ← 无（不跑 npm，见下）
 ├── ui/                 ← 前端工程（源码、submodule、npm 工程）
@@ -46,8 +46,8 @@ crates/modules/panel/esc-panel-web/
 需要 Node.js 20+。先取回组件库，再安装并构建：
 
 ```bash
-git submodule update --init --recursive crates/modules/panel/esc-panel-web/ui/vendor/ui-frame
-cd crates/modules/panel/esc-panel-web/ui
+git submodule update --init --recursive crates/modules/module-panel/esc-panel-web/ui/vendor/ui-frame
+cd crates/modules/module-panel/esc-panel-web/ui
 npm install --install-links=true --no-audit --no-fund
 npm run typecheck
 npm run build
@@ -57,7 +57,7 @@ npm run build
 `build` 随后执行 Vite 并把四个文件与戳记写进 `../web/`：
 
 ```text
-crates/modules/panel/esc-panel-web/web/{panel.css,panel.js,tunnel.js,server.js,.build-stamp}
+crates/modules/module-panel/esc-panel-web/web/{panel.css,panel.js,tunnel.js,server.js,.build-stamp}
 ```
 
 `panel.js` / `panel.css` 是 Vue、ui-frame 和共享插件树的 chunk；`tunnel.js` /

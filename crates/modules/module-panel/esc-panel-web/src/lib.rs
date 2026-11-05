@@ -220,7 +220,7 @@ mod tests {
         let recorded = match std::fs::read_to_string(&stamp_path) {
             Ok(text) => text.trim().to_string(),
             Err(e) => panic!(
-                "读不到 {}：{e}\n请按 crates/modules/panel/esc-panel-web/ui/README.md 重建前端",
+                "读不到 {}：{e}\n请按 crates/modules/module-panel/esc-panel-web/ui/README.md 重建前端",
                 stamp_path.display()
             ),
         };
@@ -229,7 +229,7 @@ mod tests {
             actual,
             recorded,
             "前端源码与 web/ 产物不一致——改了 ui/src 却没重建。\n\
-             修复：cd crates/modules/panel/esc-panel-web/ui && npm run build\n\
+             修复：cd crates/modules/module-panel/esc-panel-web/ui && npm run build\n\
              （它会重写 web/ 与 web/.build-stamp）"
         );
     }

@@ -297,11 +297,11 @@ curl -s -u admin:<口令> -o /dev/null -w "%{http_code}\n" \
 
 ## ui-frame 组件化前端
 
-隧道面板与服务器面板共用 `crates/modules/panel/esc-panel-web/` 的 Vue 3 + TypeScript 工程，
+隧道面板与服务器面板共用 `crates/modules/module-panel/esc-panel-web/` 的 Vue 3 + TypeScript 工程，
 按钮、卡片、页签、弹窗、输入控件、进度条与插件树均使用 `@echolab-auto/ui-frame`。
 组件库以固定 commit 的 Git submodule 引入；构建产物嵌入 Rust 二进制，运行时
 无需 Node 或 CDN。
 
 产物在仓库里只有**一份**（此前复制进两个 crate，公共 chunk 存了两份），由
 `esc-panel-web` 的 `artifacts_are_fresh` 测试盯着"改了源码没重建"。前端源码修改、
-类型检查、重建和浏览器烟测见 `crates/modules/panel/esc-panel-web/ui/README.md`。
+类型检查、重建和浏览器烟测见 `crates/modules/module-panel/esc-panel-web/ui/README.md`。

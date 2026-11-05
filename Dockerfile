@@ -45,10 +45,10 @@ RUN mkdir -p /root/.cargo \
 # 先只拷依赖清单，利用层缓存：改业务代码时不必重新拉依赖。
 COPY Cargo.toml Cargo.lock ./
 # 底座（module-server-core）
-COPY crates/modules/core/esc-common/Cargo.toml      crates/modules/core/esc-common/
-COPY crates/modules/core/esc-control-api/Cargo.toml crates/modules/core/esc-control-api/
-COPY crates/modules/core/esc-engine/Cargo.toml      crates/modules/core/esc-engine/
-COPY crates/modules/core/esc-panel-auth/Cargo.toml  crates/modules/core/esc-panel-auth/
+COPY crates/modules/module-core/esc-common/Cargo.toml      crates/modules/module-core/esc-common/
+COPY crates/modules/module-core/esc-control-api/Cargo.toml crates/modules/module-core/esc-control-api/
+COPY crates/modules/module-core/esc-engine/Cargo.toml      crates/modules/module-core/esc-engine/
+COPY crates/modules/module-core/esc-panel-auth/Cargo.toml  crates/modules/module-core/esc-panel-auth/
 # 宿主
 COPY crates/esc-host/Cargo.toml         crates/esc-host/
 # CLI
@@ -56,12 +56,12 @@ COPY crates/esc-cli/Cargo.toml          crates/esc-cli/
 COPY crates/esc-hub/Cargo.toml          crates/esc-hub/
 COPY crates/esc-spoke/Cargo.toml        crates/esc-spoke/
 # 模块（一个模块一个目录）
-COPY crates/modules/tunnel/esc-plugin-tunnel/Cargo.toml            crates/modules/tunnel/esc-plugin-tunnel/
-COPY crates/modules/edge-router/esc-plugin-edge-router/Cargo.toml  crates/modules/edge-router/esc-plugin-edge-router/
-COPY crates/modules/gateway/esc-gateway/Cargo.toml                 crates/modules/gateway/esc-gateway/
-COPY crates/modules/panel/esc-plugin-tunnel-panel/Cargo.toml       crates/modules/panel/esc-plugin-tunnel-panel/
-COPY crates/modules/panel/esc-server-panel/Cargo.toml              crates/modules/panel/esc-server-panel/
-COPY crates/modules/panel/esc-panel-web/Cargo.toml                 crates/modules/panel/esc-panel-web/
+COPY crates/modules/module-tunnel/esc-plugin-tunnel/Cargo.toml            crates/modules/module-tunnel/esc-plugin-tunnel/
+COPY crates/modules/module-edge-router/esc-plugin-edge-router/Cargo.toml  crates/modules/module-edge-router/esc-plugin-edge-router/
+COPY crates/modules/module-gateway/esc-gateway/Cargo.toml                 crates/modules/module-gateway/esc-gateway/
+COPY crates/modules/module-panel/esc-plugin-tunnel-panel/Cargo.toml       crates/modules/module-panel/esc-plugin-tunnel-panel/
+COPY crates/modules/module-panel/esc-server-panel/Cargo.toml              crates/modules/module-panel/esc-server-panel/
+COPY crates/modules/module-panel/esc-panel-web/Cargo.toml                 crates/modules/module-panel/esc-panel-web/
 
 # 给每个 crate 造一个空的 lib/main，让 `cargo fetch` 能解析出完整依赖图。
 # 这一步只为把「拉依赖」缓存成独立层——它不产出可用的二进制。
@@ -72,9 +72,9 @@ RUN for d in crates/*/ crates/modules/*/*/; do \
       mkdir -p "$d/src"; \
       [ -f "$d/src/lib.rs" ] || echo "" > "$d/src/lib.rs"; \
     done \
- && for b in crates/esc-cli crates/esc-host crates/modules/gateway/esc-gateway \
-             crates/modules/panel/esc-server-panel \
-             crates/modules/panel/esc-plugin-tunnel-panel; do \
+ && for b in crates/esc-cli crates/esc-host crates/modules/module-gateway/esc-gateway \
+             crates/modules/module-panel/esc-server-panel \
+             crates/modules/module-panel/esc-plugin-tunnel-panel; do \
       mkdir -p "$b/src"; \
       [ -f "$b/src/main.rs" ] || echo "fn main(){}" > "$b/src/main.rs"; \
     done \
