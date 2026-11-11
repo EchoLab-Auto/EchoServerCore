@@ -38,6 +38,10 @@ pub struct AppState {
     pub jobs: Arc<Jobs>,
     /// `None` = 未配置服务器核心上游；插件树标签页会明确显示配置方法。
     pub plugin_tree: Option<PluginTreeClient>,
+    /// 导航页条目（来自 `[[nav]]`）。空 = 不显示导航页。
+    pub nav: Arc<Vec<crate::nav::NavEntry>>,
+    /// 是否把 Docker 已发布端口自动列进导航页。
+    pub nav_auto_docker: bool,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -45,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/ui/{*path}", get(ui_asset))
+        .route("/api/nav", get(api_nav))
         .route("/api/overview", get(api_overview))
         .route("/api/host", get(api_host))
         .route("/api/plugins", get(api_plugins))
@@ -163,6 +168,74 @@ async fn api_plugins(State(st): State<AppState>) -> Response {
 }
 
 /// 一次拿到「主机 + Docker 摘要」，前端每 3 秒轮询这一个端点就够了。
+/// 导航页条目 + 每个条目的存活探测。
+///
+/// 探测在后端做而不是浏览器做：浏览器侧的 `fetch` 会被 CORS 拦（那些服务不会
+/// 为这个面板加 `Access-Control-Allow-Origin`），也会被混合内容拦（面板是
+/// HTTPS 而目标是 HTTP）。后端探测没有这两个问题，代价是「探测结果代表服务器
+/// 的视角」——对「这台机器上的服务活着吗」这个问题来说，这恰好是**更对**的视角。
+async fn api_nav(State(st): State<AppState>) -> Response {
+    let mut entries: Vec<crate::nav::NavEntry> = (*st.nav).clone();
+
+    // 自动发现：把 Docker 已发布到宿主机的端口补进「自动发现」组。
+    if st.nav_auto_docker {
+        if let Ok(containers) = st.docker.containers().await {
+            for container in containers.iter().filter(|c| c.state == "running") {
+                for port in &container.ports {
+                    let Some(public) = port.public else { continue };
+                    // 只收 `0.0.0.0` / `::` 这种真正对外发布的；绑在回环上的
+                    // 是内部端口，摆到导航页上没有意义（也点不通）。
+                    if !matches!(port.ip.as_str(), "0.0.0.0" | "::" | "") {
+                        continue;
+                    }
+                    entries.push(crate::nav::NavEntry {
+                        name: format!("{} · {}", container.name, port.private),
+                        url: format!("http://127.0.0.1:{public}/"),
+                        desc: Some(format!("Docker 容器 {}（自动发现）", container.image)),
+                        group: Some("自动发现".into()),
+                        check: None,
+                        tags: vec![port.kind.clone()],
+                    });
+                }
+            }
+        }
+    }
+
+    let groups = group_items(crate::nav::probe_all(&entries).await);
+    Json(json!({ "groups": groups })).into_response()
+}
+
+/// 按 `group` 收敛成 `[{ name, items }]`，**保持配置里的出现顺序**。
+///
+/// 不用 `BTreeMap`：用户是按自己心里的顺序写的分组，字典序会把它打乱
+/// （「设计工具 / 面板 / 开源项目」会变成「开源项目 / 面板 / 设计工具」）。
+/// 分组数量是个位数，线性查找的代价不必优化。
+fn group_items(items: Vec<crate::nav::NavItem>) -> Vec<Value> {
+    let mut buckets: Vec<(String, Vec<Value>)> = Vec::new();
+    for item in items {
+        let index = match buckets.iter().position(|(name, _)| name == &item.group) {
+            Some(index) => index,
+            None => {
+                buckets.push((item.group.clone(), Vec::new()));
+                buckets.len() - 1
+            }
+        };
+        buckets[index].1.push(json!({
+            "name": item.name,
+            "url": item.url,
+            "desc": item.desc,
+            "tags": item.tags,
+            "status": item.status,
+            "ms": item.ms,
+            "detail": item.detail,
+        }));
+    }
+    buckets
+        .into_iter()
+        .map(|(name, items)| json!({ "name": name, "items": items }))
+        .collect()
+}
+
 async fn api_overview(State(st): State<AppState>) -> Json<Value> {
     let sampler = st.sampler.clone();
     let (snap, sampling_error) = match tokio::task::spawn_blocking(move || sampler.sample()).await {
@@ -750,6 +823,8 @@ mod tests {
             allow_delete: !readonly,
             jobs: Arc::new(Jobs::new()),
             plugin_tree: None,
+            nav: Arc::new(Vec::new()),
+            nav_auto_docker: false,
         }
     }
 

@@ -11,6 +11,22 @@ for (const [name, url, tab] of [
   page.on('pageerror', error => errors.push(String(error)))
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   await page.goto(url, { waitUntil: 'networkidle' })
+  let navCards
+  if (name === 'server') {
+    // 服务器面板配了 [[nav]] 时默认落在「导航」，没配时直接是主机概览。
+    // 两种形态都要能跑，所以先探测一下再决定要不要点。
+    const navTab = page.getByRole('tab', { name: '导航', exact: true })
+    if (await navTab.count()) {
+      await page.locator('.esc-nav-card').first().waitFor()
+      navCards = await page.locator('.esc-nav-card').count()
+      await page.screenshot({ path: '/tmp/esc-server-nav.png', fullPage: true })
+      // 导航页上每张卡片都必须有状态点：数量对不上说明探测结果没渲染出来
+      if (await page.locator('.esc-nav-dot').count() !== navCards) {
+        throw new Error('server: 导航卡片的存活状态点数量对不上')
+      }
+      await page.getByRole('tab', { name: '主机概览', exact: true }).click()
+    }
+  }
   await page.locator('.nm-card:visible').first().waitFor()
   await page.screenshot({ path: `/tmp/esc-${name}-ui.png`, fullPage: true })
   await page.getByRole('tab', { name: tab, exact: true }).click()
@@ -18,7 +34,7 @@ for (const [name, url, tab] of [
   const plugins = await page.locator('.nm-tree-node').count()
   if (plugins < 3) throw new Error(`${name}: 插件节点只有 ${plugins}`)
   await page.screenshot({ path: `/tmp/esc-${name}-plugins.png`, fullPage: true })
-  results.push({ name, cards: await page.locator('.nm-card').count(), plugins, errors })
+  results.push({ name, cards: await page.locator('.nm-card').count(), plugins, navCards, errors })
   if (name === 'server') {
     await page.getByRole('tab', { name: '容器', exact: true }).click()
     await page.getByText('echo-cad-toolbox', { exact: true }).first().waitFor()

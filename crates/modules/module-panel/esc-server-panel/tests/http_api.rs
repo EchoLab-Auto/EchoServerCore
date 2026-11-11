@@ -123,6 +123,8 @@ async fn launch(
         allow_delete,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
         plugin_tree: None,
+        nav: Arc::new(Vec::new()),
+        nav_auto_docker: false,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -391,6 +393,8 @@ async fn configured_plugin_tree_is_proxied_from_the_core_panel() {
         allow_delete: false,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
         plugin_tree: Some(client),
+        nav: Arc::new(Vec::new()),
+        nav_auto_docker: false,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -545,4 +549,113 @@ async fn network_link_without_a_container_is_a_400() {
     .await;
     assert_eq!(code, 400, "空容器标识应被拒，实际 {code}: {body}");
     r.token.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 导航页
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 只配导航条目的最小启动器（其余全部沿用 `launch` 的默认值）。
+///
+/// 单独开一个而不是给 `launch` 加参数：`launch` 已经被二十来个测试调用，
+/// 加一个「只有这两个测试关心」的参数会让那些调用点充满噪声。
+async fn launch_with_nav(nav: Vec<esc_server_panel::nav::NavEntry>) -> Running {
+    let state = AppState {
+        sampler: Arc::new(Sampler::new()),
+        docker: Arc::new(Docker::new("/nonexistent/docker.sock")),
+        title: "服务器面板测试".into(),
+        access: Arc::new(AccessControl::new(&AuthConfig::default())),
+        allow_actions: false,
+        allow_create: false,
+        allow_delete: false,
+        jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
+        plugin_tree: None,
+        nav: Arc::new(nav),
+        nav_auto_docker: false,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let shutdown = token.clone();
+    let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Running {
+        addr: addr.to_string(),
+        token,
+    }
+}
+
+fn nav_entry(name: &str, url: &str, group: Option<&str>) -> esc_server_panel::nav::NavEntry {
+    esc_server_panel::nav::NavEntry {
+        name: name.into(),
+        url: url.into(),
+        desc: None,
+        group: group.map(str::to_string),
+        check: None,
+        tags: vec![],
+    }
+}
+
+/// 没有配置导航时，接口返回空 `groups`（前端据此隐藏整个标签页）。
+#[tokio::test]
+async fn nav_is_empty_when_not_configured() {
+    let r = start(|_, _| {}).await;
+    let (code, body) = http(&r.addr, "GET", "/api/nav", None).await;
+    assert_eq!(code, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["groups"].as_array().unwrap().len(), 0, "{body}");
+    r.token.cancel();
+}
+
+/// 分组顺序跟配置顺序一致，不是字典序。
+#[tokio::test]
+async fn nav_keeps_configuration_group_order() {
+    let r = launch_with_nav(vec![
+        nav_entry("A", "http://127.0.0.1:1/", Some("设计工具")),
+        nav_entry("B", "http://127.0.0.1:1/", Some("面板")),
+        nav_entry("C", "http://127.0.0.1:1/", Some("设计工具")),
+    ])
+    .await;
+    let (code, body) = http(&r.addr, "GET", "/api/nav", None).await;
+    assert_eq!(code, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<&str> = json["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    // 字典序会是 ["面板", "设计工具"] 之外的另一回事；这里断言「配置里先出现的在前」
+    assert_eq!(names, vec!["设计工具", "面板"], "{body}");
+    // 同一分组的两条要收进同一个 group
+    assert_eq!(json["groups"][0]["items"].as_array().unwrap().len(), 2);
+    r.token.cancel();
+}
+
+/// 探测结果如实反映在接口里：必然连不上的端口 → `down`。
+#[tokio::test]
+async fn nav_reports_probe_status() {
+    let mut dead = nav_entry("死端口", "http://127.0.0.1:1/", None);
+    dead.desc = Some("用来验证探测".into());
+    let r = launch_with_nav(vec![dead]).await;
+    let (code, body) = http(&r.addr, "GET", "/api/nav", None).await;
+    assert_eq!(code, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let item = &json["groups"][0]["items"][0];
+    assert_eq!(item["status"], "down", "{body}");
+    assert_eq!(item["name"], "死端口");
+    assert!(item["detail"].is_string(), "down 必须带原因：{body}");
+    r.token.cancel();
+}
+
+/// 非法 URL 在启动前就被挡下来，而不是运行期显示成一张点不动的卡片。
+#[tokio::test]
+async fn nav_rejects_non_http_urls_at_validation() {
+    let entry = nav_entry("坏地址", "file:///etc/shadow", None);
+    assert!(entry.validate().is_err());
 }

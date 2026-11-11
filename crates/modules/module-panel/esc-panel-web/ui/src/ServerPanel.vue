@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import NavGrid from './NavGrid.vue'
 import Networks from './Networks.vue'
 import PluginTree from './PluginTree.vue'
 import { api, bytes, duration, flash, flashKind, flashText, json, stateVariant, tabItems } from './ui'
 
-const tab = ref('overview')
+// 默认落在「导航」。没配 [[nav]] 时这个标签页根本不出现（见 navTabs），
+// 于是默认值对没有导航的部署没有任何影响——仍是原来的主机概览。
+const tab = ref('nav')
+const navGroups = ref<any[]>([])
+const navStale = ref(false)
 const overview = ref<any>(null)
 const containers = ref<any[]>([])
 const images = ref<any[]>([])
@@ -28,6 +33,7 @@ const details = ref<any>(null)
 const createForm = ref<any>({})
 let timer: ReturnType<typeof setInterval> | undefined
 let jobTimer: ReturnType<typeof setInterval> | undefined
+let navTimer: ReturnType<typeof setInterval> | undefined
 
 const filteredContainers = computed(() => {
   const q = filter.value.trim().toLowerCase()
@@ -41,10 +47,19 @@ const groupedContainers = computed(() => {
   }
   return [...groups.entries()]
 })
+const navTabs = computed<[string, string][]>(() =>
+  navGroups.value.length ? [['nav', '导航']] : [],
+)
 const allowActions = computed(() => !!overview.value?.allow_actions)
 const allowCreate = computed(() => !!overview.value?.allow_create)
 const allowDelete = computed(() => !!overview.value?.allow_delete)
 
+async function loadNav() {
+  // 失败时**保留上一次的结果**并挂个标记：导航页突然全空，看起来像服务没了；
+  // 而实际上多半只是一次请求抖了。标 stale 比清空诚实。
+  try { navGroups.value = (await api('/api/nav')).groups || []; navStale.value = false }
+  catch { navStale.value = navGroups.value.length > 0 }
+}
 async function loadOverview() { try { overview.value = await api('/api/overview'); error.value = '' } catch (e) { error.value = (e as Error).message } }
 async function loadContainers() { try { containers.value = (await api('/api/docker/containers')).containers || [] } catch (e) { flash((e as Error).message, 'error') } }
 async function loadImages() { try { images.value = (await api('/api/docker/images')).images || [] } catch (e) { flash((e as Error).message, 'error') } }
@@ -110,21 +125,26 @@ async function removeImage(name: string) {
 watch(tab, value => {
   if (value === 'containers') loadContainers()
   if (value === 'images') { loadImages(); loadJobs() }
+  if (value === 'nav') loadNav()
   if (value === 'networks') networksPanel.value?.load()
   if (value === 'plugins') plugins.value?.load()
 })
 onMounted(() => {
+  // 导航先拉：它决定要不要显示「导航」标签页（也是默认落点）。
+  loadNav()
+  // 探测有真实网络开销，60 秒一次够了（比指标轮询慢一档）。
+  navTimer = setInterval(() => { if (tab.value === 'nav') loadNav() }, 60000)
   loadOverview()
   timer = setInterval(() => { if (tab.value === 'overview') loadOverview() }, 5000)
   jobTimer = setInterval(() => { if (tab.value === 'images' && jobs.value.some(j => j.state === 'running')) loadJobs() }, 2000)
 })
-onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer) })
+onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer); clearInterval(navTimer) })
 </script>
 
 <template>
   <div class="esc-app">
     <header class="esc-header"><h1>服务器面板</h1><NeumorphismTag v-if="overview" :variant="overview.docker?.state === 'ok' ? 'success' : 'warning'">Docker {{ overview.docker?.state }}</NeumorphismTag><NeumorphismTag v-if="overview && !allowActions && !allowCreate && !allowDelete">只读</NeumorphismTag><span class="esc-spacer" /><NeumorphismButton size="small" @click="loadOverview">刷新</NeumorphismButton><span class="subtitle">主机指标与 Docker 管理 · ui-frame</span></header>
-    <NeumorphismTabs v-model="tab" class="esc-tabs" :tabs="tabItems([['overview','主机概览'],['containers','容器'],['images','镜像'],['networks','网络'],['plugins','插件树']])" />
+    <NeumorphismTabs v-model="tab" class="esc-tabs" :tabs="tabItems([...navTabs, ['overview','主机概览'],['containers','容器'],['images','镜像'],['networks','网络'],['plugins','插件树']])" />
     <NeumorphismAlert v-if="error" type="error" title="面板连接失败" :message="error" />
     <Networks
       v-show="tab === 'networks'"
@@ -134,6 +154,10 @@ onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer) })
       :allow-delete="allowDelete"
     />
     <PluginTree v-show="tab === 'plugins'" ref="plugins" />
+
+    <main v-if="navGroups.length" v-show="tab === 'nav'">
+      <NavGrid :groups="navGroups" :stale="navStale" />
+    </main>
 
     <main v-if="overview" v-show="tab === 'overview'">
       <div class="esc-grid">

@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod docker;
+pub mod nav;
 pub mod plugins;
 pub mod sys;
 pub mod web;

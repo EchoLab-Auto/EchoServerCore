@@ -14,6 +14,8 @@ esc-panel-auth = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# 导航页并发探测用；`join_all` 是这里唯一需要的原语。
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

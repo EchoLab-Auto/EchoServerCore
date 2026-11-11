@@ -53,6 +53,21 @@ struct Config {
     plugin_tree_url: Option<String>,
     /// 隧道面板自己的 Basic 凭据（不是服务器面板的 auth）。
     plugin_tree_auth: Option<String>,
+
+    /// 导航页条目：主页第一屏，点一下就进对应服务。
+    ///
+    /// 空数组 = 不显示导航页（主页仍是主机概览）。这是默认值——不配就不该多出
+    /// 一个空页面。
+    #[serde(default)]
+    nav: Vec<esc_server_panel::nav::NavEntry>,
+
+    /// 是否把 Docker 已发布的端口自动列进导航页。
+    ///
+    /// 默认关。自动发现很像"贴心"，但一台机器上跑着数据库、Redis、内部探针时，
+    /// 它会把这些**不该给人点**的东西也摆到页面上——而导航页可能正对着公网。
+    /// 想让导航页完整，就把它们显式写进 `[[nav]]`；想图省事再打开这个开关。
+    #[serde(default)]
+    nav_auto_docker: bool,
 }
 
 fn default_listen() -> String {
@@ -100,6 +115,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        for entry in &self.nav {
+            entry.validate()?;
+        }
         if self.listen.rsplit_once(':').is_none() {
             return Err(format!("listen 需要 host:port，收到 {:?}", self.listen));
         }
@@ -275,6 +293,8 @@ async fn main() -> anyhow::Result<()> {
         allow_delete: cfg.allow_delete,
         jobs: Arc::new(esc_server_panel::docker::Jobs::new()),
         plugin_tree,
+        nav: Arc::new(cfg.nav.clone()),
+        nav_auto_docker: cfg.nav_auto_docker,
     };
 
     if !cfg.is_loopback_only() {

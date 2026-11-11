@@ -750,6 +750,7 @@ dependencies = [
  "base64 0.22.1",
  "esc-panel-auth",
  "esc-panel-web",
+ "futures 0.3.34",
  "libc",
  "reqwest",
  "serde",
