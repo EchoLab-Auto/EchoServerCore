@@ -378,6 +378,86 @@ trust_forwarded_for = true
 替换时，客户端伪造的值进不来。不开这个开关的后果是：所有请求的来源都变成
 `127.0.0.1`，按来源限速把所有人算成同一个人，`allowed_cidrs` 也会失效。
 
+### 有了域名：真证书（无需点「继续访问」）
+
+自签方案能用，但每个浏览器都会拦一次。有域名就换真证书。
+
+**这里踩过一个坑，值得记下来：Let's Encrypt 签发不了。** 报的是
+
+```
+SERVFAIL looking up A for cloud.tx.evencewu.asia
+During secondary validation: SERVFAIL while processing CAA for ...
+```
+
+但本地 `dig @dns25.hichina.com` 连续 20 次全是 NOERROR —— 权威服务器是好的。
+原因是 LE 的 Boulder **从全球多个验证点**查询，而阿里云（hichina）的免费 DNS
+对部分境外解析源返回 SERVFAIL。LE 的多点校验只要有一个点失败就整体失败，
+所以重试也没用。换 **ZeroSSL** 一次就过了（单一验证点 + 走 webroot）：
+
+```bash
+# ① 先取 EAB 凭证（ZeroSSL 的 ACME 注册需要外部账户绑定）
+curl -s -X POST https://api.zerossl.com/acme/eab-credentials-email \
+     --data-urlencode "email=you@example.com"
+# → {"success":true,"eab_kid":"...","eab_hmac_key":"..."}
+
+# ② 签发
+docker run --rm --network host \
+  -v /etc/letsencrypt:/etc/letsencrypt -v /var/lib/letsencrypt:/var/lib/letsencrypt \
+  -v /var/www/certbot:/var/www/certbot \
+  certbot/certbot certonly --webroot -w /var/www/certbot \
+  -d cloud.tx.evencewu.asia \
+  --server https://acme.zerossl.com/v2/DV90 \
+  --eab-kid <kid> --eab-hmac-key <hmac> \
+  --register-unsafely-without-email --agree-tos --non-interactive
+```
+
+> 换句话说：**如果这个域名哪天迁到 Cloudflare DNS，LE 就能用了**。不迁也行，
+> ZeroSSL 的证书浏览器同样信任，只是 90 天要续一次。
+
+**HTTP-01 的 80 端口从哪来？** 生产上 80 被 esc-host 的 edge_router 占着，
+所以加了一条完整的域名路由指向一个只服务 ACME 的 nginx：
+
+```toml
+# /var/lib/esc/edge-routes.toml
+"cloud.tx.evencewu.asia" = 18789   # ACME webroot
+```
+
+那个 nginx（`esc-certweb` 容器）除 `/.well-known/acme-challenge/` 外一律 404：
+它不是网站，别让扫描器以为它是。webroot 在 `/var/www/certbot`。
+
+### 续期
+
+ZeroSSL 证书 90 天。`esc-certbot-renew.timer` 每天 04:17（±30 分钟）跑一次，
+`certbot renew` 只在到期前 30 天真正申请，平时空跑。
+
+**关键在 `ExecStartPost`：**
+
+```ini
+ExecStartPost=/usr/bin/docker exec esc-tls nginx -s reload
+```
+
+nginx 启动时就把证书读进内存了，文件换了不 reload 不生效 —— 少了这一行，
+续期会"成功"，但线上继续用旧证书直到下次重启，然后突然过期。
+
+### 两套证书按 SNI 并存
+
+IP 访问走自签，域名走真证书。nginx 按 `server_name` 的 SNI 匹配挑证书，
+所以同一个端口上可以：
+
+```nginx
+server { listen 2224 ssl; server_name _;                        # 自签
+         ssl_certificate /etc/ssl/esc/esc.crt; }
+server { listen 443 ssl; listen 2224 ssl;
+         server_name cloud.tx.evencewu.asia;                    # ZeroSSL
+         ssl_certificate /etc/letsencrypt/live/.../fullchain.pem; }
+```
+
+域名那一段**同时挂 443 和 2224**：443 要等云安全组放行，2224 是已经开着的，
+安全组没放行时 `https://<域名>:2224/` 立刻能用。
+
+HSTS 只加在真证书那一段（`max-age=2592000`，30 天，留回退余地）。自签段不加 ——
+浏览器本来就不信，加了反而在换真证书后留一段无法回退的时间。
+
 ### 明文端口会怎样
 
 nginx 在 2223/2224/2226 上只监听 TLS，所以 `http://…:2226` 会得到
@@ -717,6 +797,8 @@ docker inspect esc-gateway --format '{{.State.Health.Status}}'
 | 加了 nginx 后所有请求来源都是 127.0.0.1 | 忘了开 `trust_forwarded_for`，或 nginx 那边没设 `X-Forwarded-For $remote_addr` |
 | `http://…` 访问得到 400 Bad Request | 正常：那个端口只监听 TLS（nginx: "plain HTTP request was sent to HTTPS port"） |
 | 首页的端口链接少了端口号 | nginx 用了 `Host $host`，要改成 `$http_host` |
+| Let's Encrypt 报 SERVFAIL，但 `dig @权威NS` 正常 | 权威 DNS 对 LE 的境外验证点返回 SERVFAIL（阿里云免费 DNS 常见）。换 ZeroSSL，或把 DNS 迁到 Cloudflare |
+| 证书续期"成功"了但浏览器还是旧证书 | 忘了 `nginx -s reload`——nginx 启动时就把证书读进内存了 |
 | `/__admin/` 一直 403 | 账号没有 `admin = true`；或来源不在 `admin_allowed_cidrs` 里（页面会写明是哪一个） |
 | 面板是灰的、按钮点不动 | 账号库不可写。页面顶部有原因，`esc-gateway check` 也会列 |
 | 改了 `gateway.toml` 里的口令但不生效 | 该账号在账号库里也有同名条目，后者优先。看启动日志的 WARN 或面板里的「覆盖」标记 |
