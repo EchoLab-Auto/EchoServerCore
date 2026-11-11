@@ -687,3 +687,90 @@ systemctl restart esc-host.service esc-server-panel.service
 
 配置与路由状态没有改动，回滚不需要动它们。
 
+## 把隧道暴露的服务收紧成「TLS + 认证」（2026-11-11，cloud2 的 2222）
+
+`[[mapping]]` 是**裸 TCP 转发**：引擎把公网端口上的字节原样送进隧道，不解释
+HTTP、不加认证。所以当映射的对端是「能驱动 agent 执行命令」的控制面板时，这条
+路上就是**明文 + 无认证**——拿到 URL 的人可以读全部会话、让 agent 干活。
+
+实测确认过这个洞：映射对端是 EchoAgent Panel，`http://<IP>:2222/api/sessions`
+直接 200，返回全部会话内容。
+
+### 三层，缺一层也不至于裸奔
+
+| 层 | 做什么 | 在哪 |
+|---|---|---|
+| ① TLS 终结 | 公网只开 TLS，明文请求直接 400 | nginx `listen 2222 ssl` |
+| ② 只听回环 | 隧道映射绑 `127.0.0.1`，明文物理上出不了本机 | 映射表 `listen = "127.0.0.1:18790"` |
+| ③ 应用认证 | 面板自己校验 `access_token` | 面板 `[server].access_token` |
+
+第②层是关键的一步，而且**不用重启**：隧道面板的 `POST /api/mappings/{id}`
+保存即现绑、失败整体回滚。
+
+```bash
+curl -s -X POST http://127.0.0.1:18787/api/mappings/<id> \
+  -H 'content-type: application/json' \
+  -d '{"name":"4090-8080","listen":"127.0.0.1:18790","spoke":"evence-4090","enabled":true}'
+```
+
+第③层用对端面板自己的令牌（EchoAgent Panel 的 `[server].access_token`）：非空时
+`/ws`、HTTP API、`/media` 全要 `Authorization: Bearer` 或 `?token=`，**静态资源
+豁免**——所以浏览器能先加载页面，再由前端把 `?token=` 播种进 `localStorage`
+并把 URL 里的令牌擦掉。
+
+### nginx 侧三件必须做的事
+
+**① 透传 WebSocket。** 这类面板的协议是 WS，少了两行，页面能打开但永远停在
+「正在连接」——看起来像后端挂了，其实是反代没转发 Upgrade：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;          # 不能留空串，那会退回 HTTP/1.0 的 Connection 语义
+}
+...
+proxy_http_version 1.1;
+proxy_set_header Upgrade    $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_read_timeout 3600s;   # agent 事件可能长时间静默，短了会被拦腰截断
+proxy_buffering off;
+```
+
+**② 访问日志要擦掉查询串。** 令牌走 `?token=`，而默认的 `$request` 带着查询串：
+
+```nginx
+log_format scrubbed '$remote_addr - [$time_local] "$request_method $uri $server_protocol" ...';
+access_log /var/log/nginx/access.log scrubbed;
+```
+
+实测 `grep -c 'token=' access.log` = 0。
+
+**③ 改完必须 reload，而且文件是 bind mount。** `nginx.conf` 以单文件 bind mount
+进容器，**换 inode 的重写（`mv`/`install`）容器里看不到**——要原地写
+（`open(p,'w')`）。改完先 `docker exec <容器> md5sum /etc/nginx/nginx.conf` 和宿主
+对比，再 `nginx -s reload`。
+
+### 验证清单
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' http://<域名>:2222/          # 400（只收 TLS）
+curl -o /dev/null -w '%{http_code}\n' https://<域名>:2222/         # 200（静态外壳）
+curl -o /dev/null -w '%{http_code}\n' https://<域名>:2222/ws       # 401（无令牌）
+curl -o /dev/null -w '%{http_code}\n' "https://<域名>:2222/ws?token=$T"   # 400 → 认证过了
+                                                                  # （400 是 WS 握手缺头的正常回应）
+```
+
+WS 真正升级要用带 `Upgrade` 头的请求验，`curl` 不带：
+
+```python
+# 带令牌 → HTTP/1.1 101 Switching Protocols；不带 → 401
+```
+
+浏览器侧最好也走一遍（Playwright）：令牌落进 `localStorage`、URL 里的 `?token=`
+被擦掉、`wss://…/ws?token=…` 确实连上、页面能读到真实数据。
+
+### 第一次访问的那一次 401
+
+启用令牌后，首次访问（`localStorage` 还空着）可能有**一个** `/api/upstreams`
+先于令牌播种发出而拿到 401；刷新一次即消失。属于对端面板前端的启动时序问题，
+不影响使用（下一次轮询会成功）。
