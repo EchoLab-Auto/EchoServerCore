@@ -38,8 +38,11 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 
 use crate::auth::{self, Denied};
 use crate::config::valid_user_name;
-use crate::proxy::{html, json_error, redirect, text, urlencode, Account, Gateway, ProxyBody};
+use crate::proxy::{json_body, json_error, redirect, text, urlencode, Account, Gateway, ProxyBody};
 use crate::store::MIN_PASSWORD_LEN;
+use serde::Serialize;
+use serde_json::json;
+
 use crate::web::{
     self, Banner, MeView, SessionRow, SessionsView, UserFormView, UserRow, UsersView,
 };
@@ -62,13 +65,9 @@ pub async fn handle(
     // ① 来源白名单。放在最前面：不在名单里就连「需要登录」都不告诉他。
     if !gw.cfg.admin_source_allowed(source) {
         tracing::warn!(source = ?source, "admin panel source not allowed");
-        return page(
+        return json_err(
             StatusCode::FORBIDDEN,
-            web::error_page(
-                gw.title(),
-                "管理面板不可达",
-                "当前来源地址不在 <code>admin_allowed_cidrs</code> 允许范围内。",
-            ),
+            "当前来源地址不在 admin_allowed_cidrs 允许范围内",
         );
     }
 
@@ -100,19 +99,20 @@ pub async fn handle(
 
     // ③ 普通用户只有「我的账号」这一亩地。其余在分发前就拒掉，
     //    这样即使将来加了新端点，也不会忘记加权限判断。
-    let is_self_only = matches!(segs.as_slice(), [] | ["me"]);
+    //
+    //    `api` 是这些端点的**公共前缀**（见下），不是端点名：判权限要看它后面
+    //    那几段。拿带 `api` 的段去比 `[] | ["me"]` 永远不匹配，结果就是普通
+    //    用户连自己的改口令页面都进不去。
+    let tail: &[&str] = match segs.as_slice() {
+        ["api", rest @ ..] => rest,
+        other => other,
+    };
+    let is_self_only = matches!(tail, [] | ["me"] | ["me", "password"]);
     if !session.admin && !is_self_only {
         tracing::warn!(user = %session.user, path = %path, "non-admin tried to open the admin panel");
-        return page(
+        return json_err(
             StatusCode::FORBIDDEN,
-            web::error_page(
-                gw.title(),
-                "需要管理员权限",
-                &format!(
-                    "账号 <code>{}</code> 不是管理员。可以访问的只有 <a href=\"{PREFIX}/me\">我的账号</a>。",
-                    crate::proxy::html_escape(&session.user)
-                ),
-            ),
+            &format!("账号 {} 不是管理员", session.user),
         );
     }
 
@@ -121,14 +121,10 @@ pub async fn handle(
     // ④ 所有变更都是 POST，且必须过 Origin 校验（纵深防御，主防线是 SameSite）
     if is_post && !auth::same_origin(req.headers()) {
         tracing::warn!(user = %session.user, source = ?source, path = %path, "cross-origin admin write rejected");
-        return page(
-            StatusCode::FORBIDDEN,
-            web::error_page(
-                gw.title(),
-                "跨站请求被拒绝",
-                "这个表单不是从本网关的页面提交的。",
-            ),
-        );
+        return json_err(
+              StatusCode::FORBIDDEN,
+              "跨站请求被拒绝：这个请求不是从本网关的页面发出的",
+          );
     }
     if !is_post && req.method() != Method::GET && req.method() != Method::HEAD {
         return text(StatusCode::METHOD_NOT_ALLOWED, "只支持 GET 与 POST");
@@ -148,10 +144,32 @@ pub async fn handle(
         flash,
     };
 
-    match (is_post, segs.as_slice()) {
+    // 全部管理端点都在 `/__admin/api/` 下：这个前缀以外的请求一律 404，
+    // 免得有人把 `/__admin/users` 当成"另一个入口"来试。
+    //
+    // 为什么用 `/__admin/api/`（而不是裸 `/__admin/users`）：
+    // 上游面板未来若长出同名路径，前缀能保证两边永不撞车；而且一眼能看出
+    // 这是给前端调的、不是给人点的。
+    let Some(rest) = segs.split_first() else {
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "管理接口都在 /__admin/api/ 下",
+        );
+    };
+    if rest.0 != &"api" {
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "管理接口都在 /__admin/api/ 下",
+        );
+    }
+    let segs = rest.1;
+
+    match (is_post, segs) {
+        // 我是谁 + 我能去哪些端口（前端壳子启动时拉一次）
+        (false, ["overview"]) => ctx.overview(),
+
         // 账号
-        (false, []) => ctx.users_page(),
-        (false, ["users", "new"]) => ctx.user_form_new(),
+        (false, ["users"]) => ctx.users_page(),
         (true, ["users"]) => ctx.user_create(req).await,
         (false, ["users", name]) => ctx.user_form_edit(name),
         (true, ["users", name]) => ctx.user_update(name, req).await,
@@ -161,8 +179,8 @@ pub async fn handle(
 
         // 代理（端口 → 上游）
         (false, ["routes"]) => ctx.routes_page(),
-        (false, ["routes", "new"]) => ctx.route_form_new(),
         (true, ["routes"]) => ctx.route_create(req).await,
+        (false, ["routes", "new"]) => ctx.route_form_new(),
         (false, ["routes", name]) => ctx.route_form_edit(name),
         (true, ["routes", name]) => ctx.route_update(name, req).await,
         (true, ["routes", name, "delete"]) => ctx.route_delete(name).await,
@@ -175,9 +193,9 @@ pub async fn handle(
 
         // 我的账号
         (false, ["me"]) => ctx.me_page(None),
-        (true, ["me"]) => ctx.me_change_password(req).await,
+        (true, ["me", "password"]) => ctx.me_change_password(req).await,
 
-        _ => text(StatusCode::NOT_FOUND, "没有这个管理端点"),
+        _ => json_err(StatusCode::NOT_FOUND, "没有这个管理端点"),
     }
 }
 
@@ -218,6 +236,54 @@ impl Flash {
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl Ctx<'_> {
+    /// 壳子启动时拉一次：我是谁、我有权去哪些端口、当前从哪个端口进来。
+    ///
+    /// 单独一个端点而不是塞进 `/users`：普通用户（非管理员）也要能拿到它，
+    /// 而 `/users` 对他们是 403。
+    fn overview(&self) -> HyperResponse<ProxyBody> {
+        let routes = self
+            .gw
+            .effective_routes()
+            .into_iter()
+            .filter(|r| self.admin || self.can_reach(&r.spec.name))
+            .map(|r| {
+                json!({
+                    "name": r.spec.name,
+                    "listen": r.spec.listen,
+                    "disabled": r.disabled,
+                    "listening": r.disabled == false,
+                })
+            })
+            .collect::<Vec<_>>();
+        json_with(
+            StatusCode::OK,
+            json!({
+                "title": self.gw.title(),
+                "user": self.actor,
+                "admin": self.admin,
+                "routes": routes,
+                "//": "当前请求从哪个监听端口进来——删端口时要靠它认出「我自己」",
+                "current_addr": self.local.to_string(),
+                "admin_port": self.gw.cfg.admin_listen.map(|a| a.to_string()),
+                "store_writable": self.gw.store.writable(),
+                "routes_writable": self.gw.rt_store.writable(),
+            }),
+        )
+    }
+
+    /// 这个账号能不能去某个端口。
+    ///
+    /// 管理员不看 ACL（和网关转发时的判断保持一致：`Session::can_access`）。
+    fn can_reach(&self, route: &str) -> bool {
+        self.gw
+            .auth
+            .list()
+            .into_iter()
+            .find(|(sid, _)| sid == &self.sid)
+            .map(|(_, s)| s.can_access(route))
+            .unwrap_or(false)
+    }
+
     fn users_page(&self) -> HyperResponse<ProxyBody> {
         // 非管理员走到这里是 `/__admin/`，直接带他去看自己的账号
         if !self.admin {
@@ -276,8 +342,7 @@ impl Ctx<'_> {
                 .collect(),
             admin_count: gw.admin_count(),
         };
-        let body = web::users_page(&view);
-        page(StatusCode::OK, body)
+        json_ok(&view)
     }
 
     /// 账号库自身的状态说明：可写 / 只读原因 / 坏条目。
@@ -295,6 +360,9 @@ impl Ctx<'_> {
 
     // ── 新建 ──
 
+    /// 新建表单的空白初值（`GET /__admin/api/users/new` 用不到——前端自己就能
+    /// 画一个空表单；留着是因为创建失败时要回填同一份结构，走 `render_form`）。
+    #[allow(dead_code)]
     fn user_form_new(&self) -> HyperResponse<ProxyBody> {
         self.render_form(FormState {
             name: String::new(),
@@ -601,7 +669,7 @@ impl Ctx<'_> {
             current_port: self.local.port(),
             dedicated_admin: gw.cfg.admin_listen.is_some(),
         };
-        page(StatusCode::OK, web::routes_page(&view))
+        json_ok(&view)
     }
 
     fn route_store_banners(&self) -> Vec<Banner> {
@@ -999,7 +1067,7 @@ impl Ctx<'_> {
             rows,
             banners: self.flash.banners(),
         };
-        page(StatusCode::OK, web::sessions_page(&view))
+        json_ok(&view)
     }
 
     fn session_revoke(&self, short_id: &str) -> HyperResponse<ProxyBody> {
@@ -1050,13 +1118,9 @@ impl Ctx<'_> {
     fn me_page(&self, error: Option<Banner>) -> HyperResponse<ProxyBody> {
         let Some(acct) = self.account(&self.actor) else {
             // 会话还在但账号已经被删掉了：诚实地说出来并让他退出
-            return page(
+            return json_err(
                 StatusCode::FORBIDDEN,
-                web::error_page(
-                    self.gw.title(),
-                    "账号已不存在",
-                    "你的账号已经被删除，会话会在过期后失效。<a href=\"/__auth/logout\">退出</a>",
-                ),
+                "你的账号已经被删除，会话会在过期后失效，请退出重新登录",
             );
         };
         let mut banners = self.flash.banners();
@@ -1080,7 +1144,7 @@ impl Ctx<'_> {
             writable: self.gw.store.writable(),
             banners,
         };
-        page(StatusCode::OK, web::me_page(&view))
+        json_ok(&view)
     }
 
     async fn me_change_password(&self, req: HyperRequest<Incoming>) -> HyperResponse<ProxyBody> {
@@ -1178,6 +1242,12 @@ impl Ctx<'_> {
     }
 
     fn render_route_form(&self, st: RouteFormState) -> HyperResponse<ProxyBody> {
+        let error = st
+            .banners
+            .iter()
+            .find(|b| b.kind == "err")
+            .map(|b| b.text.clone())
+            .unwrap_or_else(|| "提交的内容没有通过校验".into());
         let view = web::RouteFormView {
             title: self.gw.title().to_string(),
             actor: self.actor.clone(),
@@ -1193,7 +1263,10 @@ impl Ctx<'_> {
             writable: self.gw.rt_store.writable(),
             banners: st.banners,
         };
-        page(StatusCode::OK, web::route_form_page(&view))
+        json_with(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": error, "form": view }),
+        )
     }
 
     fn account(&self, name: &str) -> Option<Account> {
@@ -1204,16 +1277,32 @@ impl Ctx<'_> {
         self.done(false, &format!("{PREFIX}/"), &format!("账号 {name} 不存在"))
     }
 
-    /// 302 回某页，把提示挂到会话上（下个 GET 取走一次）。
+    /// 一次操作的结果。
+    ///
+    /// 从前这里是 `302 → 目标页 + flash 塞进会话`，因为表单提交必须让浏览器
+    /// 跳转一次（否则刷新会重复提交）。JSON 客户端不存在这个问题：它自己决定
+    /// 要不要重新拉列表，所以直接回结果，让前端就地显示。
     ///
     /// `ok` 显式给，不靠文案猜。「已保存」和「不能保存」都能被一条
     /// `contains("已")` 判错，而错误提示显示成绿色勾是最糟的反馈。
-    fn done(&self, ok: bool, to: &str, msg: &str) -> HyperResponse<ProxyBody> {
-        self.gw.auth.set_flash(&self.sid, ok, msg);
-        redirect(StatusCode::FOUND, to)
+    ///
+    /// `_to` 保留着：前端的"该刷新哪个列表"本来就由它自己按当前标签页决定，
+    /// 不需要服务端指路。
+    fn done(&self, ok: bool, _to: &str, msg: &str) -> HyperResponse<ProxyBody> {
+        json_msg(ok, msg)
     }
 
+    /// 表单校验失败：回**结构体本身**（前端要拿它回填），外加一条错误。
+    ///
+    /// 状态码 400 而不是 200：这不是"成功返回了一个表单"，是"你提交的东西
+    /// 没被接受"。前端的 `api()` 据此抛错，错误信息照样能取到。
     fn render_form(&self, st: FormState) -> HyperResponse<ProxyBody> {
+        let error = st
+            .banners
+            .iter()
+            .find(|b| b.kind == "err")
+            .map(|b| b.text.clone())
+            .unwrap_or_else(|| "提交的内容没有通过校验".into());
         let view = UserFormView {
             title: self.gw.title().to_string(),
             actor: self.actor.clone(),
@@ -1227,7 +1316,7 @@ impl Ctx<'_> {
             writable: self.gw.store.writable(),
             banners: st.banners,
         };
-        page(StatusCode::OK, web::user_form_page(&view))
+        json_with(StatusCode::BAD_REQUEST, json!({ "error": error, "form": view }))
     }
 }
 
@@ -1582,18 +1671,46 @@ fn segments(path: &str) -> Vec<&str> {
         .collect()
 }
 
-/// 面板页面的统一出口：`no-store`（别让浏览器缓存账号列表）+ 禁止被 iframe 套。
-fn page(status: StatusCode, body: String) -> HyperResponse<ProxyBody> {
-    let mut resp = html(status, body);
+/// 管理 API 的统一出口。
+///
+/// `no-store` 是必须的：这里返回的是账号列表和在线会话，任何一层缓存把它留下
+/// 都是事故。`nosniff` 防止有人把 JSON 当脚本加载。
+fn json_out(status: StatusCode, body: String) -> HyperResponse<ProxyBody> {
+    let mut resp = json_body(status, body);
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp.headers_mut()
-        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     resp.headers_mut().insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
     resp
+}
+
+fn json_ok<T: Serialize>(v: &T) -> HyperResponse<ProxyBody> {
+    match serde_json::to_string(v) {
+        Ok(body) => json_out(StatusCode::OK, body),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("序列化失败：{e}"),
+        ),
+    }
+}
+
+fn json_with(status: StatusCode, v: serde_json::Value) -> HyperResponse<ProxyBody> {
+    json_out(status, v.to_string())
+}
+
+/// `{ "ok": bool, "message": "..." }`——写操作的结果。
+fn json_msg(ok: bool, msg: &str) -> HyperResponse<ProxyBody> {
+    json_with(StatusCode::OK, json!({ "ok": ok, "message": msg }))
+}
+
+/// `{ "error": "..." }`。
+///
+/// 前端把 `error` 当作唯一可信的错误通道（它不看状态码判断成败），所以这里的
+/// 文案要**能直接给人看**——不要写 "invalid input" 这种。
+fn json_err(status: StatusCode, msg: &str) -> HyperResponse<ProxyBody> {
+    json_with(status, json!({ "error": msg }))
 }
 
 fn query_suffix(req: &HyperRequest<Incoming>) -> String {

@@ -399,14 +399,6 @@ impl Gateway {
 /// 主机名取请求的 `Host`（去端口）而不是配置里的 IP：配置里通常写
 /// `127.0.0.1` 或 `0.0.0.0`，前者对远程浏览器没意义、后者不能访问。
 ///
-/// 用协议相对的 `//host:port`，这样前面挂 TLS 也不用改。
-fn admin_base(admin: SocketAddr, host: &str) -> String {
-    if host.is_empty() {
-        format!(":{}", admin.port())
-    } else {
-        format!("//{host}:{}", admin.port())
-    }
-}
 
 /// 管理端口的 accept loop。
 ///
@@ -579,16 +571,17 @@ async fn handle(
         return gateway_endpoint(&gw, Some(&route), source, req).await;
     }
 
-    // ②b 管理面板。它要自己判登录态（普通用户也能进「我的账号」），
-    //     所以不能走下面的通用认证流程。
+    // ②b 管理接口。它自己判登录态（普通用户也能读「我的账号」），所以不能
+    //     走下面的通用认证流程。
     //
-    //     配了 `admin_listen` 之后这个路径**不再由网关占用**：它就是一个普通
-    //     路径，照常认证后转发给上游（上游没有它，于是 404）。
+    //     **在任何端口上都由网关接手**，不再受 `admin_listen` 影响。
+    //     原因：合并之后管理页是壳子（面板那边）的一个标签页，而壳子是从业务
+    //     端口加载的——它必须能**同源**调用 `/__admin/api/*`。若这个前缀被让给
+    //     上游，壳子就永远调不到管理接口（跨端口 = 跨源 = 要 CORS）。
     //
-    //     为什么不再给一页「管理面板在别处」+ 链接：那等于在每个公网端口上
-    //     公开管理入口的位置。用户本来就是从业务端口敲过来的，指路的价值远
-    //     不如"别告诉任何人管理面在哪"。
-    if gw.cfg.admin_listen.is_none() && (path == "/__admin" || path.starts_with("/__admin/")) {
+    //     代价：业务端口上的 `/__admin/*` 不能再被上游占用。这个前缀本来就是
+    //     网关的保留字（`__` 开头），撞车概率可以忽略。
+    if path == "/__admin" || path.starts_with("/__admin/") {
         return crate::admin::handle(&gw, source, local, req).await;
     }
 
@@ -688,33 +681,36 @@ fn home(
         .unwrap_or("")
         .to_string();
 
-    let routes: Vec<web::HomeLink> = links
+    // `/__auth/` 从前是「网关首页」：我是谁、我能去哪些端口、管理入口在哪。
+    //
+    // 合并之后它没有 HTML 了 —— 壳子在面板那边，这里只留一份**机器可读**的
+    // 清单。仍然只列这个会话有权访问的端口：没权限的东西连名字都不该出现，
+    // 否则「这台机器开了哪些面板」就成了公开信息。
+    let routes: Vec<serde_json::Value> = links
         .into_iter()
-        .map(|(name, port)| web::HomeLink {
-            name,
-            href: if host.is_empty() {
-                format!(":{}", port)
-            } else {
-                format!("//{host}:{port}/")
-            },
+        .map(|(name, port)| {
+            serde_json::json!({
+                "name": name,
+                "port": port,
+                "url": if host.is_empty() {
+                    format!(":{port}/")
+                } else {
+                    format!("//{host}:{port}/")
+                },
+            })
         })
         .collect();
-
-    let view = web::HomeView {
-        title: gw.title().to_string(),
-        user: session.user.clone(),
-        admin: session.admin,
-        routes,
-        current_route: route.map(|r| r.name.clone()).unwrap_or_default(),
-        // 配了独立管理端口时，首页上的管理链接要指到那个端口去；
-        // 否则在业务端口点「管理账号」会被当普通路径转发 → 上游 404。
-        admin_base: gw
-            .cfg
-            .admin_listen
-            .map(|a| admin_base(a, &host))
-            .unwrap_or_default(),
-    };
-    html(StatusCode::OK, web::home_page(&view))
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({
+            "user": session.user,
+            "admin": session.admin,
+            "routes": routes,
+            "current_route": route.map(|r| r.name.clone()).unwrap_or_default(),
+            "admin_api": "/__admin/api/",
+        })
+        .to_string(),
+    )
 }
 
 /// 解析请求来源。
@@ -1279,6 +1275,20 @@ pub fn html(status: StatusCode, body: String) -> HyperResponse<ProxyBody> {
     );
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// `application/json` 的裸响应（缓存头由 `admin::json_out` 补）。
+///
+/// 不在这里设 `no-store`：`json_out` 统一管，两个地方都设只会让人以后疑惑
+/// 「到底哪个在生效」。
+pub fn json_body(status: StatusCode, body: String) -> HyperResponse<ProxyBody> {
+    let mut resp = HyperResponse::new(full(body));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
     resp
 }
 

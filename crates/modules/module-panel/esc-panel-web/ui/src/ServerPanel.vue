@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import GatewaySection from './GatewaySection.vue'
 import NavGrid from './NavGrid.vue'
+import TunnelSection from './TunnelSection.vue'
 import Networks from './Networks.vue'
 import PluginTree from './PluginTree.vue'
 import { api, bytes, duration, flash, flashKind, flashText, json, stateVariant, tabItems } from './ui'
@@ -47,9 +49,18 @@ const groupedContainers = computed(() => {
   }
   return [...groups.entries()]
 })
-const navTabs = computed<[string, string][]>(() =>
-  navGroups.value.length ? [['nav', '导航']] : [],
-)
+// 三个 section 的可用性各自独立判断：没配隧道就没有「隧道」页，网关不可达
+// 就没有「网关」页。**不显示比显示一个必然报错的入口好**——后者每次点进去
+// 都要读一遍错误信息才能确认"这台机器没有这个功能"。
+const tunnelReady = ref(false)
+const gatewayReady = ref(false)
+const navTabs = computed<[string, string][]>(() => {
+  const tabs: [string, string][] = []
+  if (navGroups.value.length) tabs.push(['nav', '导航'])
+  if (tunnelReady.value) tabs.push(['tunnel', '隧道'])
+  if (gatewayReady.value) tabs.push(['gateway', '网关'])
+  return tabs
+})
 const allowActions = computed(() => !!overview.value?.allow_actions)
 const allowCreate = computed(() => !!overview.value?.allow_create)
 const allowDelete = computed(() => !!overview.value?.allow_delete)
@@ -59,6 +70,20 @@ async function loadNav() {
   // 而实际上多半只是一次请求抖了。标 stale 比清空诚实。
   try { navGroups.value = (await api('/api/nav')).groups || []; navStale.value = false }
   catch { navStale.value = navGroups.value.length > 0 }
+}
+/** 探一下隧道面板的转发是否可用（未配置时后端回 503）。 */
+async function probeTunnel() {
+  try { await api('/api/tunnel/mappings'); tunnelReady.value = true }
+  catch { tunnelReady.value = false }
+}
+/** 探一下网关管理接口。未登录时回 401——那也说明**它存在**，要显示出来。 */
+async function probeGateway() {
+  try { await api('/__admin/api/overview'); gatewayReady.value = true }
+  catch (e) {
+    const msg = (e as Error).message || ''
+    // 404/「都在 /__admin/api/ 下」= 根本没有网关；401/403 = 有，只是进不去
+    gatewayReady.value = !/404|Not Found|不在|没有这个/.test(msg)
+  }
 }
 async function loadOverview() { try { overview.value = await api('/api/overview'); error.value = '' } catch (e) { error.value = (e as Error).message } }
 async function loadContainers() { try { containers.value = (await api('/api/docker/containers')).containers || [] } catch (e) { flash((e as Error).message, 'error') } }
@@ -126,12 +151,16 @@ watch(tab, value => {
   if (value === 'containers') loadContainers()
   if (value === 'images') { loadImages(); loadJobs() }
   if (value === 'nav') loadNav()
+  // 隧道/网关两个 section 自己管自己的轮询与加载，切过去不需要额外动作
+  // （它们在 v-show 里一直挂着，数据已经是最新的）
   if (value === 'networks') networksPanel.value?.load()
   if (value === 'plugins') plugins.value?.load()
 })
 onMounted(() => {
   // 导航先拉：它决定要不要显示「导航」标签页（也是默认落点）。
   loadNav()
+  probeTunnel()
+  probeGateway()
   // 探测有真实网络开销，60 秒一次够了（比指标轮询慢一档）。
   navTimer = setInterval(() => { if (tab.value === 'nav') loadNav() }, 60000)
   loadOverview()
@@ -154,6 +183,9 @@ onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer); clearInte
       :allow-delete="allowDelete"
     />
     <PluginTree v-show="tab === 'plugins'" ref="plugins" />
+
+    <TunnelSection v-if="tunnelReady" v-show="tab === 'tunnel'" />
+    <GatewaySection v-if="gatewayReady" v-show="tab === 'gateway'" />
 
     <main v-if="navGroups.length" v-show="tab === 'nav'">
       <NavGrid :groups="navGroups" :stale="navStale" />

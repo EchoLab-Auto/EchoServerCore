@@ -125,6 +125,7 @@ async fn launch(
         plugin_tree: None,
         nav: Arc::new(Vec::new()),
         nav_auto_docker: false,
+        tunnel: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -395,6 +396,7 @@ async fn configured_plugin_tree_is_proxied_from_the_core_panel() {
         plugin_tree: Some(client),
         nav: Arc::new(Vec::new()),
         nav_auto_docker: false,
+        tunnel: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -572,6 +574,7 @@ async fn launch_with_nav(nav: Vec<esc_server_panel::nav::NavEntry>) -> Running {
         plugin_tree: None,
         nav: Arc::new(nav),
         nav_auto_docker: false,
+        tunnel: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

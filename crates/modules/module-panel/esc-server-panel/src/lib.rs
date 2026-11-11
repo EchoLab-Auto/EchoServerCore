@@ -7,5 +7,6 @@ pub mod api;
 pub mod docker;
 pub mod nav;
 pub mod plugins;
+pub mod tunnel_proxy;
 pub mod sys;
 pub mod web;

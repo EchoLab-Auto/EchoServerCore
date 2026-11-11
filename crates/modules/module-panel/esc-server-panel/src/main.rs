@@ -54,6 +54,16 @@ struct Config {
     /// 隧道面板自己的 Basic 凭据（不是服务器面板的 auth）。
     plugin_tree_auth: Option<String>,
 
+    /// 隧道面板的上游根地址，例如 `http://127.0.0.1:18787`。
+    ///
+    /// 配了之后「隧道」标签页才出现——它把隧道面板的 JSON 接口转发进来，
+    /// 于是端口映射、Spoke、边缘路由都在同一个页面里管。
+    ///
+    /// `None` 不是错误状态：不用隧道面板的部署（比如纯 Docker 宿主）本来就
+    /// 没有它，少一个标签页而已。
+    #[serde(default)]
+    tunnel_url: Option<String>,
+
     /// 导航页条目：主页第一屏，点一下就进对应服务。
     ///
     /// 空数组 = 不显示导航页（主页仍是主机概览）。这是默认值——不配就不该多出
@@ -275,6 +285,13 @@ async fn main() -> anyhow::Result<()> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("插件树上游配置无效：{e}"))?;
 
+    let tunnel = cfg
+        .tunnel_url
+        .as_deref()
+        .map(esc_server_panel::tunnel_proxy::TunnelClient::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("隧道面板上游配置无效：{e}"))?;
+
     let docker = Docker::new(&cfg.docker_socket);
     if !docker.socket_exists() {
         tracing::info!(
@@ -295,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
         plugin_tree,
         nav: Arc::new(cfg.nav.clone()),
         nav_auto_docker: cfg.nav_auto_docker,
+        tunnel,
     };
 
     if !cfg.is_loopback_only() {

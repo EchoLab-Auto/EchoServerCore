@@ -42,6 +42,9 @@ pub struct AppState {
     pub nav: Arc<Vec<crate::nav::NavEntry>>,
     /// 是否把 Docker 已发布端口自动列进导航页。
     pub nav_auto_docker: bool,
+    /// 隧道面板的上游（`/api/tunnel/*` 转发到它）。`None` = 未配置，
+    /// 「隧道」标签页会明确说明怎么配。
+    pub tunnel: Option<crate::tunnel_proxy::TunnelClient>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -50,6 +53,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/ui/{*path}", get(ui_asset))
         .route("/api/nav", get(api_nav))
+        // 隧道面板的全部 JSON 接口都从这里过（方法白名单见 tunnel_proxy）
+        .route("/api/tunnel", axum::routing::any(api_tunnel_root))
+        .route("/api/tunnel/{*path}", axum::routing::any(api_tunnel))
         .route("/api/overview", get(api_overview))
         .route("/api/host", get(api_host))
         .route("/api/plugins", get(api_plugins))
@@ -168,6 +174,51 @@ async fn api_plugins(State(st): State<AppState>) -> Response {
 }
 
 /// 一次拿到「主机 + Docker 摘要」，前端每 3 秒轮询这一个端点就够了。
+/// 隧道面板的 JSON 接口转发。
+///
+/// 为什么是 `{*path}` 通配而不是逐个端点列举：隧道面板的 API 是它自己的事，
+/// 这里多列一遍就等于多一份要同步的清单——上游加个端点，这边忘了加，症状是
+/// 一个只在特定操作下出现的 404。**方法**才是需要卡的地方（在白名单里），
+/// 路径不必。
+async fn api_tunnel(
+    State(st): State<AppState>,
+    Path(path): Path<String>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    forward_tunnel(st, &method, &format!("/{path}"), uri.query(), body.to_vec()).await
+}
+
+async fn api_tunnel_root(
+    State(st): State<AppState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    forward_tunnel(st, &method, "/", uri.query(), body.to_vec()).await
+}
+
+async fn forward_tunnel(
+    st: AppState,
+    method: &axum::http::Method,
+    path: &str,
+    query: Option<&str>,
+    body: Vec<u8>,
+) -> Response {
+    let Some(client) = st.tunnel else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "未配置隧道面板上游。请在 server-panel.toml 里设置 \
+                          tunnel_url = \"http://127.0.0.1:18787\"（esc-host 的隧道面板端口）。"
+            })),
+        )
+            .into_response();
+    };
+    client.forward(method, path, query, body).await
+}
+
 /// 导航页条目 + 每个条目的存活探测。
 ///
 /// 探测在后端做而不是浏览器做：浏览器侧的 `fetch` 会被 CORS 拦（那些服务不会
@@ -825,6 +876,7 @@ mod tests {
             plugin_tree: None,
             nav: Arc::new(Vec::new()),
             nav_auto_docker: false,
+            tunnel: None,
         }
     }
 

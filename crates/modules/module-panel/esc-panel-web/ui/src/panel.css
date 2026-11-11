@@ -83,3 +83,9 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .esc-nav-down { color: #dc2626; }
 .esc-nav-ok { color: #16a34a; }
 .esc-nav-stale { color: var(--nm-color-warning, #d97706); }
+
+/* 危险操作按钮：组件库的 variant 里没有"红"，但我们确实需要一眼看出
+   哪个按钮会删东西。用边框和文字色表达，而不是整块红底——一排按钮里
+   三块红底会让人不敢点任何一个。 */
+.esc-danger { color: #dc2626; }
+.esc-danger:hover { border-color: #dc2626; }

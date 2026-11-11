@@ -953,6 +953,9 @@ fn form_escape(s: &str) -> String {
 }
 
 /// 带 cookie 的 POST（表单）。
+///
+/// 管理面板现在回 JSON，但**收**的还是 `application/x-www-form-urlencoded`：
+/// 前端那个 `api()` 也是这么发的（`new URLSearchParams(...)`），所以不用改成 JSON 体。
 async fn post_form(addr: SocketAddr, path: &str, cookie: &str, body: &str) -> Resp {
     http(
         addr,
@@ -967,6 +970,85 @@ async fn post_form(addr: SocketAddr, path: &str, cookie: &str, body: &str) -> Re
     .await
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON 断言小工具
+//
+// 管理面板从「服务端渲染的 HTML + flash」改成了 JSON API，所以断言从
+// 「页面里找字符串」变成「结构里找字段」。这几个函数把重复的部分收起来，
+// 顺带把「JSON 解析失败」「缺少字段」变成能看懂的报错。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 把响应体解析成 JSON。
+fn json(r: &Resp) -> serde_json::Value {
+    serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("响应体不是 JSON（{e}）：{}", r.body))
+}
+
+/// 读接口：`200` + JSON 结构。
+fn view(r: &Resp) -> serde_json::Value {
+    assert_eq!(r.status, 200, "读接口应回 200 + JSON：{}", r.body);
+    json(r)
+}
+
+/// 写接口的结果：`200` + `{"ok": bool, "message": "..."}`。
+///
+/// 从前是 `302` + 把提示塞进会话，让浏览器跳一次再显示；JSON 客户端自己决定
+/// 要不要重新拉列表，所以结果就地返回。
+fn done(r: &Resp) -> (bool, String) {
+    assert_eq!(r.status, 200, "写操作应回 200 + JSON：{}", r.body);
+    let v = json(r);
+    let ok = v["ok"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("缺少 ok 字段：{}", r.body));
+    let msg = v["message"].as_str().unwrap_or_default().to_string();
+    (ok, msg)
+}
+
+/// 写操作成功：返回提示文案。
+fn done_ok(r: &Resp) -> String {
+    let (ok, msg) = done(r);
+    assert!(ok, "应成功，实际被拒：{msg}");
+    msg
+}
+
+/// 写操作被拒（业务规则不允许，但请求本身合法）：返回提示文案。
+fn done_err(r: &Resp) -> String {
+    let (ok, msg) = done(r);
+    assert!(!ok, "应被拒绝，实际成功：{msg}");
+    msg
+}
+
+/// 校验失败：`400` + `{"error": "...", "form": {...}}`。
+///
+/// 400 而不是 200：这不是「成功返回了一个表单」，是「你提交的东西没被接受」。
+/// 同时把 `form` 回给前端，刚填的内容不用重填。
+fn form_error(r: &Resp) -> (String, serde_json::Value) {
+    assert_eq!(r.status, 400, "校验失败应回 400 + 表单：{}", r.body);
+    let v = json(r);
+    let err = v["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("缺少 error 字段：{}", r.body))
+        .to_string();
+    (err, v["form"].clone())
+}
+
+/// 从 `rows` 里按 `name` 取一行。
+fn row<'a>(v: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("缺少 rows 数组：{v}"))
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or_else(|| panic!("rows 里没有 {name}：{}", v["rows"]))
+}
+
+/// `rows` 里有没有这一行。
+fn has_row(v: &serde_json::Value, name: &str) -> bool {
+    v["rows"]
+        .as_array()
+        .map(|a| a.iter().any(|r| r["name"] == name))
+        .unwrap_or(false)
+}
+
 #[tokio::test]
 async fn admin_panel_needs_login_like_everything_else() {
     let (up, _u) = start_upstream().await;
@@ -976,7 +1058,7 @@ async fn admin_panel_needs_login_like_everything_else() {
     let r = http(
         gw.addr(),
         "GET",
-        "/__admin/users",
+        "/__admin/api/users",
         &[("sec-fetch-mode", "navigate")],
         None,
     )
@@ -1001,12 +1083,24 @@ async fn panel_pages_are_not_cacheable_and_not_framable() {
     let (gw, _dir) = start_admin_gateway(up).await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200);
     // 账号列表被中间层缓存下来会是什么后果，不用细想
     assert_eq!(r.header("cache-control"), Some("no-store"));
-    assert_eq!(r.header("x-frame-options"), Some("DENY"));
     assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+    // 现在回的是 JSON 文档，不是能被塞进 iframe 的页面——「不可被框架」这件事
+    // 由「它根本不是 HTML」保证，所以钉住 content-type 而不是 X-Frame-Options。
+    assert_eq!(
+        r.header("content-type"),
+        Some("application/json; charset=utf-8")
+    );
 
     gw.token.cancel();
     _u.cancel();
@@ -1018,25 +1112,40 @@ async fn plain_user_can_only_reach_my_account() {
     let (gw, _dir) = start_admin_gateway(up).await;
     let c = login(&gw, "viewer", "pw-123").await.unwrap();
 
-    // `/__admin/` 带他去看自己的账号，而不是一个冷冰冰的 403
+    // 裸前缀 `/__admin/` 已经不是页面了：管理接口全在 `/__admin/api/` 下
     let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 302);
-    assert_eq!(r.header("location"), Some("/__admin/me"));
+    assert_eq!(r.status, 404);
+    assert!(
+        json(&r)["error"]
+            .as_str()
+            .unwrap()
+            .contains("/__admin/api/"),
+        "要说清入口在哪：{}",
+        r.body
+    );
 
-    let r = http(gw.addr(), "GET", "/__admin/me", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("我的账号"));
+    // 但「我的账号」对他开着，而不是一个冷冰冰的 403——否则他连自己口令都改不了
+    let r = http(gw.addr(), "GET", "/__admin/api/me", &[("cookie", &c)], None).await;
+    let me = view(&r);
+    assert_eq!(me["name"], "viewer", "应是查看者自己的账号：{me}");
+    assert_eq!(me["actor"], "viewer");
+    assert_eq!(me["is_admin"], false);
 
     // 但改账号一律 403——包括猜出来的端点
     for path in [
-        "/__admin/users",
-        "/__admin/users/admin",
-        "/__admin/sessions",
+        "/__admin/api/users",
+        "/__admin/api/users/admin",
+        "/__admin/api/sessions",
     ] {
         let r = http(gw.addr(), "GET", path, &[("cookie", &c)], None).await;
         assert_eq!(r.status, 403, "{path} 应对普通用户关闭");
+        assert!(
+            json(&r)["error"].as_str().unwrap().contains("不是管理员"),
+            "{}",
+            r.body
+        );
     }
-    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
+    let r = post_form(gw.addr(), "/__admin/api/users/admin/delete", &c, "").await;
     assert_eq!(r.status, 403, "普通用户不能删账号");
     assert!(gw.gw.user("admin").is_some(), "账号不该被删掉");
 
@@ -1050,30 +1159,53 @@ async fn admin_creates_an_account_that_can_then_log_in() {
     let (gw, path) = start_admin_gateway(up).await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    // 列表里能看到两个配置文件账号
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("viewer"));
-    assert!(r.body.contains("配置文件"), "要标出账号来源");
+    // 列表里能看到两个配置文件账号，并且标了来源
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&r);
+    assert_eq!(row(&list, "viewer")["name"], "viewer");
+    assert_eq!(
+        row(&list, "viewer")["source_label"],
+        "配置文件（只读）",
+        "要标出账号来源：{list}"
+    );
+    assert_eq!(row(&list, "admin")["admin"], true);
 
     let r = post_form(
         gw.addr(),
-        "/__admin/users",
+        "/__admin/api/users",
         &c,
         "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
     )
     .await;
-    assert_eq!(r.status, 302, "成功后重定向: {}", r.body);
-    assert_eq!(
-        r.header("location"),
-        Some("/__admin/"),
-        "提示走会话，不进 URL"
+    // 成功就地返回结果：`{"ok": true, "message": "账号 bob 已创建"}`
+    assert!(
+        done_ok(&r).contains("已创建"),
+        "提示应跟着这次响应回来：{}",
+        r.body
     );
-    // 提示条只在紧接着的那次 GET 出现一次
-    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert!(page.body.contains("已创建"), "{}", page.body);
-    let again = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert!(!again.body.contains("已创建"), "刷新不该重复出现提示");
+    // 提示不再依赖会话里的 flash：紧跟其后的列表**不该**重复出现这条提示
+    let listed = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let page = view(&listed);
+    assert_eq!(row(&page, "bob")["source_label"], "账号库");
+    assert!(
+        !page["banners"].to_string().contains("已创建"),
+        "刷新不该重复出现提示：{}",
+        page["banners"]
+    );
 
     // 落盘了，而且没有明文口令
     let raw = std::fs::read_to_string(&path).unwrap();
@@ -1105,12 +1237,12 @@ async fn granted_routes_are_enforced_at_login_and_afterwards() {
 
     let r = post_form(
         gw.addr(),
-        "/__admin/users",
+        "/__admin/api/users",
         &c,
         "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
     )
     .await;
-    assert_eq!(r.status, 302);
+    assert!(done_ok(&r).contains("已创建"));
 
     // 只能在授权过的端口登录
     assert!(login(&gw, "bob", "bob-pass-123").await.is_some());
@@ -1128,47 +1260,56 @@ async fn the_last_admin_can_be_neither_deleted_nor_demoted() {
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
     // 配置文件里的账号面板动不了，先接管进账号库
-    let r = post_form(gw.addr(), "/__admin/users/admin/adopt", &c, "").await;
-    assert_eq!(r.status, 302);
+    let r = post_form(gw.addr(), "/__admin/api/users/admin/adopt", &c, "").await;
+    assert!(done_ok(&r).contains("已接管"));
     assert!(gw.gw.store.get("admin").is_some());
 
-    // 删：拒绝
-    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
-    assert_eq!(r.status, 302);
-    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert!(page.body.contains("最后一个管理员"), "{}", page.body);
+    // 删：拒绝。理由就在这次的响应里，不用回列表页找 flash
+    let r = post_form(gw.addr(), "/__admin/api/users/admin/delete", &c, "").await;
+    assert!(
+        done_err(&r).contains("最后一个管理员"),
+        "要说清为什么删不掉：{}",
+        r.body
+    );
     assert!(gw.gw.user("admin").is_some(), "最后一个管理员不能被删");
 
-    // 降级：拒绝。这里是表单提交，所以错误要回到表单上（200 + 内联提示），
-    // 而不是重定向——否则用户填的东西全丢了。
-    let r = post_form(gw.addr(), "/__admin/users/admin", &c, "route=panel").await;
-    assert_eq!(r.status, 200, "表单错误应原地显示: {}", r.body);
-    assert!(r.body.contains("最后一个管理员"), "{}", r.body);
-    assert!(r.body.contains("type=\"checkbox\""), "表单要重新渲染出来");
+    // 降级：拒绝。校验失败回 400 + 表单，用户填的东西不丢。
+    let r = post_form(gw.addr(), "/__admin/api/users/admin", &c, "route=panel").await;
+    let (err, form) = form_error(&r);
+    assert!(err.contains("最后一个管理员"), "{err}");
+    // 表单要能被回填：账号名、授权、可选端口都在
+    assert_eq!(form["name"], "admin");
+    assert_eq!(form["admin"], false);
+    assert!(
+        form["available"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "panel"),
+        "可选端口要回给前端：{form}"
+    );
     assert!(gw.gw.user("admin").unwrap().admin, "管理权限不该被取消");
 
     // 有第二个管理员之后，一切恢复正常
     let r = post_form(
         gw.addr(),
-        "/__admin/users",
+        "/__admin/api/users",
         &c,
         "name=boss&pass=boss-pass-123&pass2=boss-pass-123&route=panel&admin=1",
     )
     .await;
-    assert_eq!(r.status, 302);
+    assert!(done_ok(&r).contains("已创建"));
     // 但不能用它自己的会话删自己：那会把当前会话一起打掉，
     // 用户看到的是一个莫名其妙的登录页
-    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &c, "").await;
-    assert_eq!(r.status, 302);
-    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert!(page.body.contains("正在使用的账号"), "{}", page.body);
+    let r = post_form(gw.addr(), "/__admin/api/users/admin/delete", &c, "").await;
+    assert!(done_err(&r).contains("正在使用的账号"), "{}", r.body);
 
     // 换成 boss 的会话删，就成了
     let boss = login(&gw, "boss", "boss-pass-123")
         .await
         .expect("boss 应能登录");
-    let r = post_form(gw.addr(), "/__admin/users/admin/delete", &boss, "").await;
-    assert_eq!(r.status, 302);
+    let r = post_form(gw.addr(), "/__admin/api/users/admin/delete", &boss, "").await;
+    assert!(done_ok(&r).contains("已删除"));
     assert!(
         gw.gw.store.get("admin").is_none(),
         "有了第二个管理员就该允许删除"
@@ -1178,8 +1319,20 @@ async fn the_last_admin_can_be_neither_deleted_nor_demoted() {
     // 又生效了。这不是 bug，是刻意留的救援通道——管理面板永远无法把配置
     // 文件里的账号删掉，所以「把自己锁在门外」这件事有硬下限。
     assert!(gw.gw.user("admin").is_some(), "配置文件里的账号应重新生效");
-    let page = http(gw.addr(), "GET", "/__admin/", &[("cookie", &boss)], None).await;
-    assert!(page.body.contains("配置文件（只读）"), "{}", page.body);
+    let listed = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &boss)],
+        None,
+    )
+    .await;
+    let list = view(&listed);
+    assert_eq!(
+        row(&list, "admin")["source_label"],
+        "配置文件（只读）",
+        "配置文件里的账号应重新出现在列表里：{list}"
+    );
 
     gw.token.cancel();
     _u.cancel();
@@ -1195,20 +1348,36 @@ async fn changing_a_password_kills_other_sessions_and_adopts_the_config_account(
     let stolen = login(&gw, "admin", "pw-123").await.unwrap();
     assert_eq!(gw.gw.auth.session_count(), 2);
 
+    // 自助改口令是 `POST /__admin/api/me/password`（`/me` 本身是 GET 读视图）
     let r = post_form(
         gw.addr(),
-        "/__admin/me",
+        "/__admin/api/me/password",
         &mine,
         "old=pw-123&pass=new-pass-456&pass2=new-pass-456",
     )
     .await;
-    assert_eq!(r.status, 302);
-    assert_eq!(r.header("location"), Some("/__admin/me"));
+    // 结果就地返回；前端自己重新拉一次 `/__admin/api/me`
+    let msg = done_ok(&r);
+    assert!(msg.contains("口令已修改"), "{msg}");
 
     // 旧 cookie 立刻失效，自己的这个保留
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &stolen)], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/me",
+        &[("cookie", &stolen)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 401, "被盗的会话必须马上踢掉");
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &mine)], None).await;
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/me",
+        &[("cookie", &mine)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 200, "自己的会话不该被自己踢掉");
 
     // 口令真的换了
@@ -1238,13 +1407,20 @@ async fn self_service_password_change_requires_the_current_password() {
     // 光有 cookie 不够：不验证当前口令的话，一次会话劫持就变成永久占有
     let r = post_form(
         gw.addr(),
-        "/__admin/me",
+        "/__admin/api/me/password",
         &c,
         "old=wrong-pw&pass=new-pass-456&pass2=new-pass-456",
     )
     .await;
-    assert_eq!(r.status, 200, "口令不对应该回到表单");
-    assert!(r.body.contains("当前口令不正确"), "{}", r.body);
+    // 口令不对不算「端点错误」，而是带着原因重新给出「我的账号」：200 + banners
+    assert_eq!(r.status, 200, "口令不对应该回到我的账号：{}", r.body);
+    let v = json(&r);
+    assert_eq!(v["name"], "admin");
+    assert!(
+        v["banners"].to_string().contains("当前口令不正确"),
+        "{}",
+        v["banners"]
+    );
     assert!(
         login(&gw, "admin", "pw-123").await.is_some(),
         "口令不该被改掉"
@@ -1253,12 +1429,17 @@ async fn self_service_password_change_requires_the_current_password() {
     // 两次新口令不一致
     let r = post_form(
         gw.addr(),
-        "/__admin/me",
+        "/__admin/api/me/password",
         &c,
         "old=pw-123&pass=new-pass-456&pass2=new-pass-457",
     )
     .await;
-    assert!(r.body.contains("不一致"), "{}", r.body);
+    let v = json(&r);
+    assert!(
+        v["banners"].to_string().contains("不一致"),
+        "{}",
+        v["banners"]
+    );
 
     gw.token.cancel();
     _u.cancel();
@@ -1274,7 +1455,7 @@ async fn cross_origin_admin_post_is_rejected() {
     let r = http(
         gw.addr(),
         "POST",
-        "/__admin/users",
+        "/__admin/api/users",
         &[
             ("cookie", &c),
             ("content-type", "application/x-www-form-urlencoded"),
@@ -1301,22 +1482,32 @@ async fn sessions_can_be_kicked_out_by_prefix_and_by_account() {
     let r = http(
         gw.addr(),
         "GET",
-        "/__admin/sessions",
+        "/__admin/api/sessions",
         &[("cookie", &admin)],
         None,
     )
     .await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("viewer"));
-    // 完整 session id 不进 HTML：一次 XSS 就等于把所有在线会话交出去
+    let v = view(&r);
+    let rows = v["rows"].as_array().expect("应有 rows");
+    assert!(
+        rows.iter().any(|s| s["user"] == "viewer"),
+        "会话列表应列出 viewer：{v}"
+    );
+    // 完整 session id 不进响应：一次 XSS 就等于把所有在线会话交出去
     assert!(
         !r.body.contains(&sid_of(&viewer)),
-        "页面不该包含完整会话 id"
+        "接口不该包含完整会话 id"
+    );
+    // 只给前 12 个字符
+    assert!(
+        rows.iter()
+            .all(|s| s["short"].as_str().is_some_and(|x| x.len() <= 12)),
+        "只该给短 id：{v}"
     );
 
     // 按账号全踢
-    let r = post_form(gw.addr(), "/__admin/users/viewer/revoke", &admin, "").await;
-    assert_eq!(r.status, 302);
+    let r = post_form(gw.addr(), "/__admin/api/users/viewer/revoke", &admin, "").await;
+    assert!(done_ok(&r).contains("已踢下线"), "{}", r.body);
     let r = http(
         gw.addr(),
         "GET",
@@ -1341,13 +1532,12 @@ async fn sessions_can_be_kicked_out_by_prefix_and_by_account() {
         .expect("应找到刚建的那个会话");
     let r = post_form(
         gw.addr(),
-        &format!("/__admin/sessions/{prefix}/revoke"),
+        &format!("/__admin/api/sessions/{prefix}/revoke"),
         &admin,
         "",
     )
     .await;
-    assert_eq!(r.status, 302);
-    assert_eq!(r.header("location"), Some("/__admin/sessions"));
+    assert!(done_ok(&r).contains("已踢下线"), "{}", r.body);
     let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &other)], None).await;
     assert_eq!(r.status, 401);
 
@@ -1377,20 +1567,35 @@ async fn a_gateway_without_users_file_is_a_read_only_panel() {
     .await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("只读"), "页面要说明为什么改不了");
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let v = view(&r);
+    let line = v["store_line"].as_str().expect("应有 store_line");
+    assert!(line.contains("只读"), "接口要说明为什么改不了：{v}");
+    assert!(line.contains("未配置"), "要说清是没配 users_file：{v}");
+    assert!(
+        v["banners"].to_string().contains("只读"),
+        "只读原因要能一眼看到：{}",
+        v["banners"]
+    );
 
-    // 提交了也不会生效，而且要说清楚原因
+    // 提交了也不会生效，而且要说清楚原因（400 + 表单，不是 302）
     let r = post_form(
         gw.addr(),
-        "/__admin/users",
+        "/__admin/api/users",
         &c,
         "name=bob&pass=bob-pass-123&pass2=bob-pass-123&route=panel",
     )
     .await;
-    assert_eq!(r.status, 200, "错误应回到表单而不是重定向");
-    assert!(r.body.contains("只读"), "{}", r.body);
+    let (err, form) = form_error(&r);
+    assert!(err.contains("只读"), "{err}");
+    assert_eq!(form["name"], "bob", "填的内容要回填");
     assert!(gw.gw.user("bob").is_none());
 
     gw.token.cancel();
@@ -1411,10 +1616,24 @@ async fn admin_allowed_cidrs_is_fail_closed() {
     .await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    // 测试从 127.0.0.1 发起，不在 10/8 里 → 连登录页都不该给
-    let r = http(gw.addr(), "GET", "/__admin/", &[("cookie", &c)], None).await;
+    // 测试从 127.0.0.1 发起，不在 10/8 里 → 连管理接口都不该给
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
     assert_eq!(r.status, 403);
-    assert!(r.body.contains("admin_allowed_cidrs"), "{}", r.body);
+    assert!(
+        json(&r)["error"]
+            .as_str()
+            .unwrap()
+            .contains("admin_allowed_cidrs"),
+        "{}",
+        r.body
+    );
 
     // 普通页面不受影响
     let r = http(
@@ -1452,40 +1671,71 @@ async fn gateway_home_lists_only_the_routes_you_may_use() {
     assert_eq!(r.status, 302);
     assert_eq!(r.header("location"), Some("/__auth/login?next=/__auth/"));
 
-    // admin 看得到两个端口，并且有管理入口
+    // admin 看得到两个端口，并且有管理接口入口
     let c = login(&gw, "admin", "pw-123").await.unwrap();
     let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("panel") && r.body.contains("admin-only"));
-    assert!(r.body.contains("/__admin/"), "管理员应有管理入口");
-    assert!(r.body.contains("你好，admin"));
+    let home = view(&r);
+    assert_eq!(home["user"], "admin");
+    assert_eq!(home["admin"], true);
+    assert_eq!(home["current_route"], "panel", "要说明当前是哪个端口");
+    let names: Vec<&str> = home["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"panel") && names.contains(&"admin-only"),
+        "管理员该看到全部端口：{home}"
+    );
+    assert_eq!(
+        home["admin_api"], "/__admin/api/",
+        "管理员应有管理入口：{home}"
+    );
 
     // viewer 只能看到 panel：没权限的端口**连名字都不该出现**
     let v = login(&gw, "viewer", "pw-123").await.unwrap();
     let r = http(gw.addr(), "GET", "/__auth", &[("cookie", &v)], None).await;
     assert_eq!(r.status, 200, "/__auth 不带斜杠也认");
-    assert!(r.body.contains("panel"));
+    let home = view(&r);
+    assert_eq!(home["user"], "viewer");
+    assert_eq!(home["admin"], false);
+    let names: Vec<&str> = home["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["panel"], "只该列出自己有权访问的端口：{home}");
     assert!(
         !r.body.contains("admin-only"),
         "不该泄露自己无权访问的端口名：{}",
         r.body
     );
-    // 用链接而不是文案判断：页面上有一句「管理账号…需要管理员权限」的说明，
-    // 按文案断言会把提示语误判成入口。
-    assert!(
-        !r.body.contains("href=\"/__admin/\""),
-        "普通用户不该看到账号列表入口：{}",
-        r.body
-    );
-    assert!(
-        !r.body.contains(">/__admin/sessions<") && !r.body.contains("href=\"/__admin/sessions\""),
-        "也不该看到会话列表入口"
-    );
-    assert!(
-        r.body.contains("href=\"/__admin/me\""),
-        "但改自己口令要能给：{}",
-        r.body
-    );
+    // 管理入口现在对所有人都是同一个路径（管理接口在任何端口上都由网关接手），
+    // 权限不在页面上藏，而在服务端判：普通用户点进去只会拿到 403。
+    assert_eq!(home["admin_api"], "/__admin/api/");
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &v)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 403, "普通用户拿不到账号列表");
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/sessions",
+        &[("cookie", &v)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 403, "也拿不到会话列表");
+    // 但改自己口令要能给
+    let r = http(gw.addr(), "GET", "/__admin/api/me", &[("cookie", &v)], None).await;
+    assert_eq!(r.status, 200, "改自己的口令要对普通用户开放");
 
     gw.token.cancel();
     _u.cancel();
@@ -1498,17 +1748,27 @@ async fn gateway_home_links_carry_the_port_and_keep_the_scheme() {
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
     let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
+    let home = view(&r);
+    let routes = home["routes"].as_array().expect("应有 routes");
+    assert!(!routes.is_empty(), "{home}");
     // 端口取自**配置**（用户实际要连的那个），不是当前监听 socket。
-    // 测试配置里写的是占位端口，所以这里只验证形状：协议相对 + 带主机名 + 带端口。
-    assert!(
-        r.body.contains("href=\"//127.0.0.1:"),
-        "入口链接应是协议相对的 //host:port/：{}",
-        r.body
-    );
-    assert!(
-        !r.body.contains("href=\"http://"),
-        "不该写死 scheme——前面挂 TLS 后就会跳回明文"
-    );
+    // 链接保持协议相对（`//host:port/`），前面挂 TLS 后也不会跳回明文。
+    for route in routes {
+        let url = route["url"].as_str().expect("每个入口都该有 url");
+        let port = route["port"].as_u64().expect("每个入口都该有 port");
+        assert!(
+            url.starts_with("//127.0.0.1:"),
+            "入口链接应是协议相对的 //host:port/：{url}"
+        );
+        assert!(
+            url.ends_with(&format!(":{port}/")),
+            "链接里的端口应来自配置：{url} vs {port}"
+        );
+        assert!(
+            !url.starts_with("http://"),
+            "不该写死 scheme——前面挂 TLS 后就会跳回明文：{url}"
+        );
+    }
 
     gw.token.cancel();
     _u.cancel();
@@ -1525,10 +1785,22 @@ async fn a_port_added_from_the_panel_starts_listening_immediately() {
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
     // 列表页能看到现有的两个端口
-    let r = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("panel") && r.body.contains("admin-only"));
-    assert!(r.body.contains("配置文件"), "要标出端口来源");
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&r);
+    assert_eq!(row(&list, "panel")["disabled"], false);
+    assert_eq!(row(&list, "admin-only")["disabled"], false);
+    assert_eq!(
+        row(&list, "panel")["source_label"],
+        "配置文件（只读）",
+        "要标出端口来源：{list}"
+    );
 
     let port = free_port().await;
     let body = format!(
@@ -1536,8 +1808,12 @@ async fn a_port_added_from_the_panel_starts_listening_immediately() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
-    assert_eq!(r.status, 302, "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(
+        done_ok(&r).contains("新建端口 fresh"),
+        "保存即生效：{}",
+        r.body
+    );
 
     // 真的开始听了：新端口上未登录访问会被要求登录（= 网关在服务）
     let new_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -1573,8 +1849,8 @@ async fn a_port_added_from_the_panel_is_written_to_disk() {
         form_escape(&up.to_string()),
         form_escape("10.0.0.0/8\n192.168.0.0/16"),
     );
-    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
-    assert_eq!(r.status, 302);
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
 
     let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
     let raw = std::fs::read_to_string(&routes_file).unwrap();
@@ -1604,12 +1880,8 @@ async fn changing_the_upstream_takes_effect_on_the_next_request() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
     // 先确认通
     let r = http(
         new_addr,
@@ -1627,8 +1899,8 @@ async fn changing_the_upstream_takes_effect_on_the_next_request() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape("127.0.0.1:1"),
     );
-    let r = post_form(gw.addr(), "/__admin/routes/fresh", &c, &body).await;
-    assert_eq!(r.status, 302, "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh", &c, &body).await;
+    assert!(done_ok(&r).contains("修改端口 fresh"), "{}", r.body);
 
     // 同一个地址、下一个请求，就该 502 了 —— 证明每个请求都重读了路由定义
     let r = http(
@@ -1660,12 +1932,13 @@ async fn a_port_that_cannot_be_bound_changes_nothing() {
         form_escape(&busy.to_string()),
         form_escape(&up.to_string())
     );
-    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
-    // 错误回填到表单（200），而不是重定向
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert!(r.body.contains("无法监听"), "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    // 校验失败：400 + 表单，而不是重定向
+    let (err, form) = form_error(&r);
+    assert!(err.contains("无法监听"), "{err}");
     // 表单里的值要还在，不然重填一遍很烦
-    assert!(r.body.contains(&busy.to_string()), "{}", r.body);
+    assert_eq!(form["listen"], busy.to_string(), "{form}");
+    assert_eq!(form["upstream"], up.to_string(), "{form}");
 
     // 什么都没写进库
     let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
@@ -1704,23 +1977,17 @@ async fn deleting_a_port_stops_the_listener_and_refuses_to_break_the_current_one
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
 
     // 「删自己脚下的端口」这道闸对配置文件来的端口同样生效——不需要先接管
     // 什么东西，面板已经把每一行都当成可操作的了。
     // 删掉「自己正在用的那个端口」要被拒绝
-    let r = post_form(gw.addr(), "/__admin/routes/panel/delete", &c, "").await;
-    assert_eq!(r.status, 302);
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    let r = post_form(gw.addr(), "/__admin/api/routes/panel/delete", &c, "").await;
     assert!(
-        page.body.contains("就是你现在访问管理面板用的这个"),
+        done_err(&r).contains("就是你现在访问管理面板用的这个"),
         "{}",
-        page.body
+        r.body
     );
     // 它还在、还在听
     assert!(gw.gw.routes.get("panel").is_some());
@@ -1738,8 +2005,8 @@ async fn deleting_a_port_stops_the_listener_and_refuses_to_break_the_current_one
     );
 
     // 删掉刚建的那个：监听要停
-    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
-    assert_eq!(r.status, 302);
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/delete", &c, "").await;
+    assert!(done_ok(&r).contains("已删除"), "{}", r.body);
     // 监听真的停了：连都连不上（不是 401、不是 502，是 connection refused）
     assert!(
         tokio::net::TcpStream::connect(new_addr).await.is_err(),
@@ -1787,12 +2054,12 @@ async fn start_gateway_with_admin(upstream: SocketAddr) -> (Gw, std::path::PathB
 }
 
 #[tokio::test]
-async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
+async fn the_admin_port_serves_the_panel_and_the_api_works_on_every_port() {
     let (up, _u) = start_upstream().await;
     let (gw, _dir) = start_gateway_with_admin(up).await;
     let admin = gw.admin_addr();
 
-    // ① 管理端口上：登录页 + 管理面板都正常
+    // ① 管理端口上：登录页 + 管理接口都正常
     let r = http(
         admin,
         "GET",
@@ -1807,23 +2074,25 @@ async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
     let c = login_at(&gw, admin, "admin", "pw-123")
         .await
         .expect("管理端口应能登录");
-    let r = http(admin, "GET", "/__admin/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("账号"));
+    let r = http(admin, "GET", "/__admin/api/users", &[("cookie", &c)], None).await;
+    let list = view(&r);
+    assert_eq!(row(&list, "admin")["admin"], true, "账号列表应可用：{list}");
 
     // ② 管理端口不转发任何东西：`/` 是网关首页，不是上游内容
     let r = http(admin, "GET", "/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
+    let home = view(&r);
     assert!(
         !r.body.contains("\"uri\":\"/\""),
         "管理端口不该转发到上游：{}",
         r.body
     );
-    assert!(r.body.contains("你可以访问"), "应是网关首页：{}", r.body);
+    assert_eq!(home["user"], "admin", "应是网关首页：{home}");
+    assert_eq!(home["current_route"], "", "管理端口不属于任何 route");
+    assert!(home["routes"].is_array(), "{home}");
 
-    // ③ 转发端口上的 /__admin/ **不再被网关占用**：它就是普通路径，
-    //    认证后照常转发给上游（上游没有它，于是 404）。不再给「管理面板在
-    //    别处」的指路页——那等于在每个公网端口上公开管理入口的位置。
+    // ③ 业务端口上的 `/__admin/*` **同样由网关接手**（管理接口在任何端口上都在
+    //    网关里），所以既不会 404 到上游，也不再需要「管理面板在别处」的指路页。
+    //    壳子就是从业务端口加载的，必须能同源调用。
     let r = http(
         gw.addr(),
         "GET",
@@ -1832,20 +2101,33 @@ async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
         None,
     )
     .await;
-    assert_eq!(r.status, 200, "应转发给上游：{}", r.body);
+    assert_eq!(r.status, 404, "裸前缀不是入口：{}", r.body);
     assert!(
-        r.body.contains("\"uri\":\"/__admin/\""),
-        "应是上游收到的请求，而不是网关自己的页面：{}",
+        json(&r)["error"]
+            .as_str()
+            .unwrap()
+            .contains("/__admin/api/"),
+        "应说清入口在哪：{}",
         r.body
     );
     assert!(
-        !r.body.contains("管理面板"),
-        "不该再暴露管理入口：{}",
+        !r.body.contains("\"uri\":"),
+        "不该被当成普通路径转发给上游：{}",
         r.body
     );
+    // 真正的管理接口在业务端口上也能调（同源）
+    let r = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    let list = view(&r);
+    assert_eq!(row(&list, "admin")["name"], "admin");
 
-    // 未登录时它和任何路径一样：脚本拿 401，浏览器跳登录页。
-    // 都不透露"管理面板在哪"。
+    // 未登录时它和任何路径一样：脚本拿 401。都不透露"管理面板在哪"。
     let r = http(gw.addr(), "GET", "/__admin/", &[("accept", "*/*")], None).await;
     assert_eq!(r.status, 401);
     assert!(
@@ -1854,14 +2136,23 @@ async fn the_admin_port_serves_the_panel_and_replaces_the_per_port_path() {
         r.body
     );
 
-    // ③b 但网关首页上的「管理账号」要指到管理端口去，否则在业务端口点它
-    //     会被当普通路径转发 → 上游 404。
+    // ③b 网关首页给出的管理入口是**同源路径**：跟着它走就能到，不必知道管理端口
+    //     在哪（也就不用把管理端口写进每个公网端口的页面里）。
     let r = http(gw.addr(), "GET", "/__auth/", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(
-        r.body
-            .contains(&format!("//127.0.0.1:{}/__admin/", admin.port())),
-        "首页的管理链接应指向管理端口：{}",
+    let home = view(&r);
+    let api = home["admin_api"].as_str().expect("首页要给出管理接口前缀");
+    assert_eq!(api, "/__admin/api/");
+    let r = http(
+        gw.addr(),
+        "GET",
+        &format!("{api}users"),
+        &[("cookie", &c), ("accept", "*/*")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        r.status, 200,
+        "业务端口上跟着 admin_api 走要能到：{}",
         r.body
     );
 
@@ -1915,12 +2206,13 @@ async fn the_admin_port_accepts_non_route_users_for_self_service() {
     let c = login_at(&gw, admin, "viewer", "pw-123")
         .await
         .expect("非管理员也应能在管理端口登录");
-    let r = http(admin, "GET", "/__admin/me", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    assert!(r.body.contains("我的账号"));
+    let r = http(admin, "GET", "/__admin/api/me", &[("cookie", &c)], None).await;
+    let me = view(&r);
+    assert_eq!(me["name"], "viewer", "应是他自己的账号：{me}");
+    assert_eq!(me["is_admin"], false);
 
     // 但管理功能一如既往地关着
-    let r = http(admin, "GET", "/__admin/users", &[("cookie", &c)], None).await;
+    let r = http(admin, "GET", "/__admin/api/users", &[("cookie", &c)], None).await;
     assert_eq!(r.status, 403);
 
     gw.token.cancel();
@@ -1964,16 +2256,21 @@ async fn the_routes_page_explains_the_dedicated_admin_port() {
     let admin = gw.admin_addr();
     let c = login_at(&gw, admin, "admin", "pw-123").await.unwrap();
 
-    let r = http(admin, "GET", "/__admin/routes", &[("cookie", &c)], None).await;
-    assert_eq!(r.status, 200);
-    // 独立端口下不该再说"删掉这个端口会把当前连接断掉"——那是挂在业务端口上
-    // 才成立的警告，说错了会让人以为删业务端口有风险。
+    let r = http(admin, "GET", "/__admin/api/routes", &[("cookie", &c)], None).await;
+    let list = view(&r);
+    // 独立端口下没有任何一行是「你正踩着的这个」：删谁都不会断掉当前连接
+    // （那句「删它会把当前连接一起断掉」的警告只在面板挂在业务端口上时才成立）。
+    assert_eq!(list["dedicated_admin"], true, "{list}");
+    assert_eq!(list["current_port"].as_u64(), Some(admin.port() as u64));
     assert!(
-        r.body.contains("独立的管理端口"),
-        "该页要说明自己是独立端口：{}",
-        r.body
+        list["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["here"] == false),
+        "独立管理端口不属于任何业务端口：{list}"
     );
-    assert!(!r.body.contains("删掉它会把当前连接一起断掉"));
+    assert!(!r.body.contains("删它会把当前连接一起断掉"));
 
     // 没配 admin_listen 的网关则相反
     let (gw2, _d2) = start_admin_gateway(up).await;
@@ -1981,13 +2278,27 @@ async fn the_routes_page_explains_the_dedicated_admin_port() {
     let r = http(
         gw2.addr(),
         "GET",
-        "/__admin/routes",
+        "/__admin/api/routes",
         &[("cookie", &c2)],
         None,
     )
     .await;
+    let list = view(&r);
+    assert_eq!(list["dedicated_admin"], false, "{list}");
+    // 正好有一行是「我现在用的这个」——就是 panel
+    let here: Vec<&serde_json::Value> = list["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["here"] == true)
+        .collect();
+    assert_eq!(here.len(), 1, "挂在业务端口上时应认得出自己：{list}");
+    assert_eq!(here[0]["name"], "panel");
+    assert_eq!(here[0]["port"], gw2.addr().port().to_string());
+    // 删它会被拒，并且要说清后果
+    let r = post_form(gw2.addr(), "/__admin/api/routes/panel/delete", &c2, "").await;
     assert!(
-        r.body.contains("删掉它会把当前连接一起断掉"),
+        done_err(&r).contains("删它会把当前连接一起断掉"),
         "挂在业务端口上时要给出这条警告：{}",
         r.body
     );
@@ -2010,8 +2321,8 @@ async fn editing_a_config_route_works_without_adopting_first() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    let r = post_form(gw.addr(), "/__admin/routes/panel", &c, &body).await;
-    assert_eq!(r.status, 302, "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes/panel", &c, &body).await;
+    assert!(done_ok(&r).contains("修改端口 panel"), "{}", r.body);
 
     // 落在了路由库里 —— 这就是隐式接管
     let routes_file = gw.gw.cfg.routes_file.clone().unwrap();
@@ -2019,12 +2330,29 @@ async fn editing_a_config_route_works_without_adopting_first() {
     assert!(raw.contains("name = \"panel\""), "{raw}");
 
     // 列表页把它标成"覆盖了配置文件"，并且仍然可以继续编辑/下架
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
-    assert!(page.body.contains("覆盖了配置文件"), "{}", page.body);
+    let page = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&page);
+    let panel = row(&list, "panel");
+    assert_eq!(
+        panel["source_label"], "路由库（覆盖了配置文件）",
+        "要标出它现在由谁说了算：{panel}"
+    );
+    assert_eq!(panel["disabled"], false, "仍然可以下架：{panel}");
+    assert_eq!(
+        panel["deletable"], false,
+        "配置文件里也有同名条目，所以删不得：{panel}"
+    );
     assert!(
-        page.body.contains("/__admin/routes/panel"),
-        "应有编辑入口：{}",
-        page.body
+        list["banners"].to_string().contains("gateway.toml"),
+        "要提醒配置文件里还有一条：{}",
+        list["banners"]
     );
 
     gw.token.cancel();
@@ -2045,12 +2373,8 @@ async fn a_config_route_can_be_disabled_and_restored_without_touching_the_config
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
     assert_eq!(
         http(addr, "GET", "/", &[("cookie", &c), ("accept", "*/*")], None)
             .await
@@ -2059,32 +2383,34 @@ async fn a_config_route_can_be_disabled_and_restored_without_touching_the_config
     );
 
     // 下架：监听停，但条目还在列表里
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/disable", &c, "").await;
+    assert!(done_ok(&r).contains("已下架"), "{}", r.body);
     assert!(
         tokio::net::TcpStream::connect(addr).await.is_err(),
         "下架后不该再接受连接"
     );
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
-    assert!(page.body.contains("已下架"), "{}", page.body);
+    let page = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&page);
+    let fresh = row(&list, "fresh");
+    // `disabled` 是「下架」，`live` 是「真的在听」——两者分开，才不会把下架
+    // 误报成「这个端口出问题了」。
+    assert_eq!(fresh["disabled"], true, "下架的端口要标出来：{fresh}");
+    assert_eq!(fresh["live"], false, "下架后当然不在听：{fresh}");
     assert!(
-        page.body.contains("/__admin/routes/fresh/enable"),
-        "要给出恢复入口：{}",
-        page.body
+        fresh["source_label"].as_str().unwrap().contains("已下架"),
+        "{fresh}"
     );
-    assert!(!page.body.contains("未监听"), "下架的端口不该标成未监听");
 
     // 恢复：又能听了
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/enable", &c, "")
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/enable", &c, "").await;
+    assert!(done_ok(&r).contains("已恢复"), "{}", r.body);
     assert_eq!(
         http(addr, "GET", "/", &[("cookie", &c), ("accept", "*/*")], None)
             .await
@@ -2092,6 +2418,18 @@ async fn a_config_route_can_be_disabled_and_restored_without_touching_the_config
         200,
         "恢复后应立刻可用"
     );
+    let page = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&page);
+    let fresh = row(&list, "fresh");
+    assert_eq!(fresh["disabled"], false, "{fresh}");
+    assert_eq!(fresh["live"], true, "{fresh}");
 
     gw.token.cancel();
     _u.cancel();
@@ -2109,18 +2447,10 @@ async fn a_disabled_port_stays_down_after_a_restart() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/disable", &c, "").await;
+    assert!(done_ok(&r).contains("已下架"), "{}", r.body);
 
     // 重载路由库：墓碑必须在文件里，否则重启后端口会"自己回来"，
     // 而下架本该是一个持久决定。
@@ -2150,9 +2480,10 @@ async fn an_upstream_pointing_back_at_the_gateway_is_rejected() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&format!("127.0.0.1:{other}")),
     );
-    let r = post_form(gw.addr(), "/__admin/routes", &c, &body).await;
-    assert_eq!(r.status, 200, "应回表单并报错：{}", r.body);
-    assert!(r.body.contains("自环"), "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    let (err, form) = form_error(&r);
+    assert!(err.contains("自环"), "{err}");
+    assert_eq!(form["upstream"], format!("127.0.0.1:{other}"), "{form}");
     assert!(gw.gw.rt_store.get("fresh").is_none(), "不该落盘");
 
     gw.token.cancel();
@@ -2173,9 +2504,9 @@ async fn an_upstream_pointing_at_the_admin_port_is_rejected_too() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&format!("127.0.0.1:{}", admin.port())),
     );
-    let r = post_form(admin, "/__admin/routes", &c, &body).await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert!(r.body.contains("自环"), "{}", r.body);
+    let r = post_form(admin, "/__admin/api/routes", &c, &body).await;
+    let (err, _form) = form_error(&r);
+    assert!(err.contains("自环"), "{err}");
     assert!(gw.gw.rt_store.get("fresh").is_none());
 
     gw.token.cancel();
@@ -2199,16 +2530,12 @@ async fn a_store_route_can_be_deleted_for_real() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
 
     // 删除（不是下架）：连定义一起没了
-    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
-    assert_eq!(r.status, 302, "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/delete", &c, "").await;
+    assert!(done_ok(&r).contains("已删除"), "{}", r.body);
     assert!(
         tokio::net::TcpStream::connect(addr).await.is_err(),
         "删除后不该再接受连接"
@@ -2217,17 +2544,24 @@ async fn a_store_route_can_be_deleted_for_real() {
     assert!(gw.gw.rt_store.get("fresh").is_none());
     assert_eq!(gw.gw.rt_store.disabled_count(), 0, "真删除不该留墓碑");
     // 列表里彻底消失（不像下架那样留在「已下架」段里）。
-    // 注意别用裸 "fresh" 判断：成功横幅里就有端口名。看的是「有没有这一行」。
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    // 看的是「有没有这一行」，而不是裸字符串：提示文案里也可能出现端口名。
+    let page = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&page);
+    assert!(!has_row(&list, "fresh"), "不该再有它的行：{list}");
     assert!(
-        !page.body.contains("/__admin/routes/fresh"),
-        "不该再有它的行：{}",
-        page.body
-    );
-    assert!(
-        !page.body.contains("已下架"),
-        "也该没有墓碑段：{}",
-        page.body
+        list["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["disabled"] == false),
+        "也该没有墓碑段：{list}"
     );
 
     gw.token.cancel();
@@ -2240,47 +2574,42 @@ async fn a_route_that_also_lives_in_the_config_cannot_be_deleted() {
     let (gw, _dir) = start_admin_gateway(up).await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    // 先编辑 panel（走隐式接管），让它在库里也有一条
-    let port = gw.addr_of("panel").port();
-    let other = gw.addr_of("admin-only").port();
-    let up_s = up.to_string();
+    // 先编辑 admin-only（走隐式接管），让它在库里也有一条。
+    // 用 admin-only 而不是 panel：panel 就是当前访问管理面板的端口，删它会被
+    // 「删自己脚下的端口」那道闸先拦下，测不到「配置文件里也有一条」这一条。
+    let other = gw.addr_of("admin-only");
     let body = format!(
         "listen={}&upstream={}",
-        form_escape(&format!("127.0.0.1:{port}")),
-        form_escape(&up_s)
+        form_escape(&other.to_string()),
+        form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/panel", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes/admin-only", &c, &body).await;
+    assert!(done_ok(&r).contains("修改端口 admin-only"), "{}", r.body);
+    assert!(gw.gw.rt_store.get("admin-only").is_some());
 
     // 现在「删除」必须被拒：删掉库里那条会让 gateway.toml 里那条复活，
     // 端口照样在听 —— 那是和用户意图相反的结果。
-    let r = post_form(gw.addr(), "/__admin/routes/panel/delete", &c, "").await;
-    assert_eq!(r.status, 302);
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
+    let r = post_form(gw.addr(), "/__admin/api/routes/admin-only/delete", &c, "").await;
     assert!(
-        page.body.contains("在 gateway.toml 里也有一条"),
+        done_err(&r).contains("在 gateway.toml 里也有一条"),
         "要说清为什么删不掉：{}",
-        page.body
+        r.body
     );
-    assert!(gw.gw.rt_store.get("panel").is_some(), "不该被删");
+    assert!(gw.gw.rt_store.get("admin-only").is_some(), "不该被删");
     // 端口还在服务
     assert_eq!(
         http(
-            gw.addr(),
+            other,
             "GET",
             "/",
             &[("cookie", &c), ("accept", "*/*")],
-            None
+            None,
         )
         .await
         .status,
-        200
+        200,
+        "端口照旧在转发"
     );
-    let _ = other;
 
     gw.token.cancel();
     _u.cancel();
@@ -2292,20 +2621,24 @@ async fn a_config_only_route_offers_disable_but_not_delete() {
     let (gw, _dir) = start_admin_gateway(up).await;
     let c = login(&gw, "admin", "pw-123").await.unwrap();
 
-    let page = http(gw.addr(), "GET", "/__admin/routes", &[("cookie", &c)], None).await;
-    // panel 只在 gateway.toml 里：有「下架」，没有「删除」
-    assert!(
-        page.body.contains("/__admin/routes/panel/disable"),
-        "{}",
-        page.body
+    let page = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let list = view(&page);
+    // panel 只在 gateway.toml 里：有「下架」（disabled=false 时可下架），没有「删除」
+    let panel = row(&list, "panel");
+    assert_eq!(panel["disabled"], false, "{panel}");
+    assert_eq!(
+        panel["deletable"], false,
+        "只定义在配置文件里的端口不该给删除：{panel}"
     );
-    assert!(
-        !page.body.contains("/__admin/routes/panel/delete"),
-        "只定义在配置文件里的端口不该给删除按钮：{}",
-        page.body
-    );
-    // 并且标成「外部定义」，让人知道为什么
-    assert!(page.body.contains("外部定义"), "{}", page.body);
+    // 并且标成「外部定义」（配置文件来的），让人知道为什么
+    assert_eq!(panel["source_label"], "配置文件（只读）", "{panel}");
 
     gw.token.cancel();
     _u.cancel();
@@ -2323,24 +2656,16 @@ async fn a_store_route_deleted_from_the_disabled_section_is_gone_for_good() {
         form_escape(&format!("127.0.0.1:{port}")),
         form_escape(&up.to_string())
     );
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes", &c, &body)
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes", &c, &body).await;
+    assert!(done_ok(&r).contains("新建端口 fresh"), "{}", r.body);
     // 下架 → 墓碑
-    assert_eq!(
-        post_form(gw.addr(), "/__admin/routes/fresh/disable", &c, "")
-            .await
-            .status,
-        302
-    );
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/disable", &c, "").await;
+    assert!(done_ok(&r).contains("已下架"), "{}", r.body);
     assert_eq!(gw.gw.rt_store.disabled_count(), 1);
 
     // 在「已下架」段里也能删除，连墓碑一起清掉
-    let r = post_form(gw.addr(), "/__admin/routes/fresh/delete", &c, "").await;
-    assert_eq!(r.status, 302, "{}", r.body);
+    let r = post_form(gw.addr(), "/__admin/api/routes/fresh/delete", &c, "").await;
+    assert!(done_ok(&r).contains("已删除"), "{}", r.body);
     assert_eq!(gw.gw.rt_store.disabled_count(), 0);
     assert!(gw.gw.rt_store.get("fresh").is_none());
 
