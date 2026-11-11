@@ -455,8 +455,41 @@ server { listen 443 ssl; listen 2224 ssl;
 域名那一段**同时挂 443 和 2224**：443 要等云安全组放行，2224 是已经开着的，
 安全组没放行时 `https://<域名>:2224/` 立刻能用。
 
-HSTS 只加在真证书那一段（`max-age=2592000`，30 天，留回退余地）。自签段不加 ——
-浏览器本来就不信，加了反而在换真证书后留一段无法回退的时间。
+### ⚠ HSTS 的陷阱：它是按**主机名**记的，不看端口
+
+这里踩过一个坑，代价是「页面完全打不开」。
+
+当时域名段落同时监听 443 和 2224，并在 2224 上发了：
+
+```nginx
+add_header Strict-Transport-Security "max-age=2592000" always;
+```
+
+**结果用户访问 `cloud.tx.evencewu.asia` 直接超时。** 因为 HSTS 记录的是
+`cloud.tx.evencewu.asia` **这个主机名**，跟端口无关。浏览器收到后就把整个主机名
+标成 HTTPS-only，于是下次输入域名（等价于 `http://…/`，端口 80）会被浏览器
+**在本地改写成 `https://…/`，也就是标准端口 443** —— 而 443 当时还没在云安全组
+放行，于是超时。80 端口上那条 301 跳转根本没机会执行（浏览器压根没发这个请求）。
+
+**规则：HSTS 只能在「它指向的那个端口真的通」时才发。** 具体到这里的顺序：
+
+1. 先放行 443，确认 `https://<域名>/` 能开
+2. 再打开 HSTS
+
+自签段永远不加 —— 浏览器本来就不信那个证书，加了反而在换真证书后留一段无法
+回退的时间。
+
+已经发出去过 HSTS 的话，光改配置不够，**浏览器那边的记录得手动清**（默认按
+`max-age` 记 30 天）：
+
+- **Chrome / Edge**：`chrome://net-internals/#hsts` → *Delete domain security
+  policies* → 输入域名 → Delete
+- **Firefox**：关闭该站所有标签 → 关闭浏览器 → 在 profile 目录删掉
+  `SiteSecurityServiceState.txt`
+- **Safari**：删 `~/Library/Cookies/HSTS.plist` 后重启
+
+清之前，显式写端口（`https://<域名>:2224/`）是可以照常访问的 —— HSTS 只改写
+默认端口的请求，不阻止你直接指定端口。
 
 ### 明文端口会怎样
 
@@ -799,6 +832,7 @@ docker inspect esc-gateway --format '{{.State.Health.Status}}'
 | 首页的端口链接少了端口号 | nginx 用了 `Host $host`，要改成 `$http_host` |
 | Let's Encrypt 报 SERVFAIL，但 `dig @权威NS` 正常 | 权威 DNS 对 LE 的境外验证点返回 SERVFAIL（阿里云免费 DNS 常见）。换 ZeroSSL，或把 DNS 迁到 Cloudflare |
 | 证书续期"成功"了但浏览器还是旧证书 | 忘了 `nginx -s reload`——nginx 启动时就把证书读进内存了 |
+| 加了域名后页面**完全打不开**（超时），但带端口能开 | 在非 443 端口发过 HSTS。浏览器把主机名锁到 443 了，而 443 没放行。清浏览器 HSTS 记录，或先放行 443 |
 | `/__admin/` 一直 403 | 账号没有 `admin = true`；或来源不在 `admin_allowed_cidrs` 里（页面会写明是哪一个） |
 | 面板是灰的、按钮点不动 | 账号库不可写。页面顶部有原因，`esc-gateway check` 也会列 |
 | 改了 `gateway.toml` 里的口令但不生效 | 该账号在账号库里也有同名条目，后者优先。看启动日志的 WARN 或面板里的「覆盖」标记 |
