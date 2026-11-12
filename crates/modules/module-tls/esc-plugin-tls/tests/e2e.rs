@@ -803,9 +803,9 @@ async fn alpn_negotiates_http11_only() {
 // 运行期改配置：不重启宿主
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// 下面这几条针对的是这一版新增的能力：面板上「保存」之后，配置要**立刻**生效，
-// 且失败时不能留下半成品。单元测试能证明"投影对了""往返无损"，但证明不了
-// 「换上游之后同一端口上的下一个连接真的走新上游」—— 那必须真握手、真转发。
+// 下面这几条针对的是「面板上保存之后立刻生效，且失败时不留半成品」。单元测试能
+// 证明"投影对了""往返无损"，但证明不了「换上游之后同一端口上的下一个连接真的走
+// 新上游」—— 那必须真握手、真转发。
 
 /// 起一个只回一个固定字符串的上游，用来判断"这次请求走到了哪个后端"。
 async fn started_tagged_upstream(tag: &'static str) -> SocketAddr {
@@ -842,11 +842,36 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-fn one_site_cfg(
-    cert: &SelfSigned,
-    listen: &[String],
-    upstream: SocketAddr,
-) -> TlsModuleConfig {
+/// 一份「一个站点」的 apply 入参。
+///
+/// 抽出来是因为四个测试都要构造它，而字段有八个 —— 各写一遍，改一个字段就要改
+/// 四处，漏掉的那处会让断言看起来是别的原因失败。
+fn one_site_input(cert: &SelfSigned, listens: &[String], upstream: SocketAddr) -> TlsConfigInput {
+    TlsConfigInput {
+        defaults: TlsDefaultsInput::default(),
+        cert: vec![TlsCertInput {
+            name: "self".into(),
+            cert: cert.cert_path.display().to_string(),
+            key: cert.key_path.display().to_string(),
+            sni: vec![],
+        }],
+        site: vec![TlsSiteInput {
+            name: "app".into(),
+            listen: listens.to_vec(),
+            upstream: Some(upstream.to_string()),
+            redirect: None,
+            websocket: false,
+            log_query: false,
+            read_timeout_secs: 30,
+            max_body_bytes: None,
+            hsts: None,
+        }],
+    }
+}
+
+/// 同上，但是 **config 形态** —— `Runtime::start` 吃的是这一份（它对应磁盘上的
+/// `tls.toml`），跟 `apply_config` 吃的 input 形态是两回事。
+fn one_site_cfg(cert: &SelfSigned, listens: &[String], upstream: SocketAddr) -> TlsModuleConfig {
     TlsModuleConfig {
         defaults: Defaults::default(),
         cert: vec![CertConfig {
@@ -857,7 +882,7 @@ fn one_site_cfg(
         }],
         site: vec![SiteConfig {
             name: "app".into(),
-            listen: listen.to_vec(),
+            listen: listens.to_vec(),
             upstream: Some(upstream.to_string()),
             redirect: None,
             websocket: false,
@@ -871,10 +896,11 @@ fn one_site_cfg(
 }
 
 /// 起一个 Runtime（真绑端口、真读证书），返回它与它实际监听的地址。
-///
-/// 配置里用 `:0`，拿到真实端口再重建一份 —— 后续 `apply` 必须带真实端口，
-/// 否则 `sync` 会以为"要新增一个 :0 端口"。
-async fn start_runtime(cert: &SelfSigned, listen: &str, upstream: SocketAddr) -> (Arc<Runtime>, SocketAddr) {
+async fn start_runtime(
+    cert: &SelfSigned,
+    listen: &str,
+    upstream: SocketAddr,
+) -> (Arc<Runtime>, SocketAddr) {
     let cfg = one_site_cfg(cert, &[listen.to_string()], upstream);
     let rt = Runtime::start(cfg, Metrics::new(), None).expect("Runtime 应能启动");
     let addr = rt.addrs()[0];
@@ -898,28 +924,8 @@ async fn applying_a_new_upstream_keeps_the_port_open() {
     assert_eq!(st, 200);
     assert_eq!(body, "A");
 
-    // 换成 B，监听地址不变
     let outcome = rt
-        .apply_config(TlsConfigInput {
-            defaults: TlsDefaultsInput::default(),
-            cert: vec![TlsCertInput {
-                name: "self".into(),
-                cert: cert.cert_path.display().to_string(),
-                key: cert.key_path.display().to_string(),
-                sni: vec![],
-            }],
-            site: vec![TlsSiteInput {
-                name: "app".into(),
-                listen: vec![addr.to_string()],
-                upstream: Some(b.to_string()),
-                redirect: None,
-                websocket: false,
-                log_query: false,
-                read_timeout_secs: 30,
-                max_body_bytes: None,
-                hsts: None,
-            }],
-        })
+        .apply_config(one_site_input(&cert, &[addr.to_string()], b))
         .await
         .expect("换上游不该失败");
 
@@ -942,33 +948,30 @@ async fn applying_new_ports_binds_then_releases() {
     let up = started_tagged_upstream("UP").await;
 
     let (rt, first) = start_runtime(&cert, "127.0.0.1:0", up).await;
-    let second: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let connector = client_trusting(&cert.cert_pem);
 
     // ── 加端口 ──
-    let outcome = rt
-        .apply_config(TlsConfigInput {
-            defaults: TlsDefaultsInput::default(),
-            cert: vec![TlsCertInput {
-                name: "self".into(),
-                cert: cert.cert_path.display().to_string(),
-                key: cert.key_path.display().to_string(),
-                sni: vec![],
-            }],
-            site: vec![TlsSiteInput {
-                name: "app".into(),
-                listen: vec![first.to_string(), second.to_string()],
-                upstream: Some(up.to_string()),
-                redirect: None,
-                websocket: false,
-                log_query: false,
-                read_timeout_secs: 30,
-                max_body_bytes: None,
-                hsts: None,
-            }],
-        })
-        .await
-        .expect("加端口不该失败");
+    //
+    // `free_port()` 是「bind(:0) → drop → 待会儿 bind 那个端口」，中间有空档：
+    // 同一台机器上并行的测试（本仓 e2e 就有一批）可能正好抢走它。这是这个手法的
+    // 固有竞态，不是被测代码的问题（`esc-gateway` 的 `pick_port` 是同一个取舍）。
+    // 所以换端口重试几次，而不是把测试写成一次定生死。
+    let (outcome, second) = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let cand: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            let body = one_site_input(&cert, &[first.to_string(), cand.to_string()], up);
+            match rt.apply_config(body).await {
+                Ok(o) => break (o, cand),
+                Err(e) if attempt < 8 && e.message.contains("无法监听") => {
+                    // 端口被抢走了。上一次 apply 是 fail-closed 的，监听没动过，
+                    // 直接换一个重试即可。
+                }
+                Err(e) => panic!("加端口应当成功（第 {attempt} 次）: {}", e.message),
+            }
+        }
+    };
 
     assert_eq!(outcome.rebound, vec![second.to_string()], "只该绑新端口");
     assert_eq!(outcome.unchanged, 1, "旧端口不该动");
@@ -979,32 +982,12 @@ async fn applying_new_ports_binds_then_releases() {
 
     // ── 摘掉旧端口 ──
     let outcome = rt
-        .apply_config(TlsConfigInput {
-            defaults: TlsDefaultsInput::default(),
-            cert: vec![TlsCertInput {
-                name: "self".into(),
-                cert: cert.cert_path.display().to_string(),
-                key: cert.key_path.display().to_string(),
-                sni: vec![],
-            }],
-            site: vec![TlsSiteInput {
-                name: "app".into(),
-                listen: vec![second.to_string()],
-                upstream: Some(up.to_string()),
-                redirect: None,
-                websocket: false,
-                log_query: false,
-                read_timeout_secs: 30,
-                max_body_bytes: None,
-                hsts: None,
-            }],
-        })
+        .apply_config(one_site_input(&cert, &[second.to_string()], up))
         .await
         .expect("摘端口不该失败");
 
     assert_eq!(outcome.released, vec![first.to_string()]);
     assert_eq!(rt.addrs(), vec![second]);
-    // 旧端口连不上了
     assert!(
         TcpStream::connect(first).await.is_err(),
         "摘掉的端口不该还能连"
@@ -1024,26 +1007,7 @@ async fn a_rejected_config_leaves_the_running_one_untouched() {
     let connector = client_trusting(&cert.cert_pem);
 
     // 上游指回自己的监听端口 —— 必然 502，validate 会拒
-    let bad = TlsConfigInput {
-        defaults: TlsDefaultsInput::default(),
-        cert: vec![TlsCertInput {
-            name: "self".into(),
-            cert: cert.cert_path.display().to_string(),
-            key: cert.key_path.display().to_string(),
-            sni: vec![],
-        }],
-        site: vec![TlsSiteInput {
-            name: "app".into(),
-            listen: vec![addr.to_string()],
-            upstream: Some(addr.to_string()), // ← 自环
-            redirect: None,
-            websocket: false,
-            log_query: false,
-            read_timeout_secs: 30,
-            max_body_bytes: None,
-            hsts: None,
-        }],
-    };
+    let bad = one_site_input(&cert, &[addr.to_string()], addr);
 
     let err = rt.apply_config(bad).await.expect_err("自环配置必须被拒");
     assert!(

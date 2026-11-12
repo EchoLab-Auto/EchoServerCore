@@ -127,6 +127,21 @@ for (const [name, url, tab] of [
       results.at(-1).tlsEditable = await saveBtn.isVisible()
       await page.getByRole('button', { name: '取消', exact: true }).last().click()
       await saveBtn.waitFor({ state: 'hidden' })
+
+      // 就地编辑：链路表第一行的「编辑」→ 那一行下方展开输入框 → 取消。
+      // 同样**不点保存**。这里能抓到的是"表格里的行真的能进入编辑态"，
+      // 而"改完能不能生效"由 esc-plugin-tls 的 e2e 用真握手验（那里可以随便改）。
+      const chainTable = page.locator('table.esc-table:visible').filter({ hasText: '链路终点' }).first()
+      await chainTable.getByRole('button', { name: '编辑', exact: true }).first().click()
+      const rowCancel = chainTable.getByRole('button', { name: '取消', exact: true }).first()
+      await rowCancel.waitFor({ state: 'visible' })
+      // 展开面板里的「类型」下拉是就地编辑独有的，用它确认展开区真的渲染了，
+      // 而不是只有按钮换了文案。
+      results.at(-1).tlsRowEditable =
+        (await chainTable.locator('input').count()) > 0 &&
+        (await page.getByText('上游超时（秒）').count()) > 0
+      await rowCancel.click()
+      await rowCancel.waitFor({ state: 'hidden' })
       await page.screenshot({ path: '/tmp/esc-tls-chain.png', fullPage: true })
       await page.getByRole('tab', { name: 'Docker 网络', exact: true }).click()
     }

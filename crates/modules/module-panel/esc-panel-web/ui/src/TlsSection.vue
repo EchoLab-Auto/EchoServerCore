@@ -90,6 +90,35 @@ function emptyForm() {
   }
 }
 
+/** 一个站点（配置形态）→ 表单形态。
+ *
+ *  独立成函数是因为它有两个调用方：整份表单（`formFromConfig`）与链路表里的
+ *  就地编辑。两处各写一遍字段映射，迟早会漏一个 —— 而漏掉的表现是「改完保存，
+ *  某一项悄悄回到默认值」，那是最难查的一类。
+ *
+ *  就地编辑只用到其中一部分字段（不含 `name`：改名影响该站点的所有端口，
+ *  留给整份表单）。多出来的字段原样带着走，提交时不会丢。 */
+function siteForm(s: any) {
+  return {
+    _k: nextKey(),
+    name: text(s?.name),
+    // 多端口在表单里是逗号分隔的一行：一个站点挂 443 + 2224 是常态，做成
+    // 动态行会让"改其中一个端口"要点三次。
+    listen: (s?.listen || []).join(', '),
+    // 两个互斥字段里哪个非空就是哪种类型；都空时先按转发展示，保存前的
+    // 自查会把它拦下来（后端也会拦）。
+    kind: s?.redirect ? 'redirect' : 'proxy',
+    upstream: text(s?.upstream),
+    redirect: text(s?.redirect),
+    websocket: !!s?.websocket,
+    log_query: !!s?.log_query,
+    read_timeout: text(s?.read_timeout_secs ?? 300),
+    // 空串 = 继承全局默认（三态的第一态）。写成 0 意思就完全变了。
+    max_body: s?.max_body_bytes === null || s?.max_body_bytes === undefined ? '' : text(s?.max_body_bytes),
+    hsts: s?.hsts === null || s?.hsts === undefined ? 'inherit' : s?.hsts ? 'on' : 'off',
+  }
+}
+
 /** `status.config` → 表单。字段名与提交体基本一致，转换只发生在"表达不了的东西"上：
  *  多端口 ↔ 逗号分隔的一行、`upstream`/`redirect` ↔ 一个类型选择、`null` ↔ 空/继承。 */
 function formFromConfig(cfg: any) {
@@ -103,24 +132,7 @@ function formFromConfig(cfg: any) {
       handshake: text(d.handshake_timeout_secs),
       hsts: !!d.hsts,
     },
-    sites: (cfg?.site || []).map((s: any) => ({
-      _k: nextKey(),
-      name: text(s.name),
-      // 多端口在表单里是逗号分隔的一行：一个站点挂 443 + 2224 是常态，做成
-      // 动态行会让"改其中一个端口"要点三次。
-      listen: (s.listen || []).join(', '),
-      // 两个互斥字段里哪个非空就是哪种类型；都空时先按转发展示，保存前的
-      // 自查会把它拦下来（后端也会拦）。
-      kind: s.redirect ? 'redirect' : 'proxy',
-      upstream: text(s.upstream),
-      redirect: text(s.redirect),
-      websocket: !!s.websocket,
-      log_query: !!s.log_query,
-      read_timeout: text(s.read_timeout_secs ?? 300),
-      // 空串 = 继承全局默认（三态的第一态）。写成 0 意思就完全变了。
-      max_body: s.max_body_bytes === null || s.max_body_bytes === undefined ? '' : text(s.max_body_bytes),
-      hsts: s.hsts === null || s.hsts === undefined ? 'inherit' : s.hsts ? 'on' : 'off',
-    })),
+    sites: (cfg?.site || []).map(siteForm),
     certs: (cfg?.cert || []).map((c: any) => ({
       _k: nextKey(),
       name: text(c.name),
@@ -197,8 +209,9 @@ function splitList(raw: string): string[] {
 }
 
 /** 表单 → 提交体（形状 = `tls.config.apply` 的入参）。 */
-function payload() {
-  const f = form.value
+function payloadOf(f: any) {
+  // 参数化是为了让就地编辑能复用同一套 → 提交体的映射（见 siteForm 的注释）。
+  // 不传就还是整份表单。
   const n = (v: string) => Number(v.trim())
   return {
     defaults: {
@@ -259,9 +272,8 @@ function addrProblem(raw: string): string | null {
 
 /** 提交前自查。后端才是权威（它还要查证书文件读不读得到、端口能不能绑），
  *  这里只挡"一眼就能看出错"的那几条，省一次往返。 */
-function validate(): string[] {
+function validateForm(f: any): string[] {
   const bad: string[] = []
-  const f = form.value
 
   const body = intOf(f.defaults.max_body)
   if (body === null || body < 1) bad.push('全局默认：请求体上限要填一个 ≥ 1 的整数（字节）；留空不会变成"不限制"')
@@ -337,10 +349,27 @@ function validate(): string[] {
   return bad
 }
 
+/** 提交整份配置。成功返回回执，失败**抛**（消息原样来自后端）。
+ *
+ *  两个调用方（整份表单、链路表就地编辑）的差别只在"错误显示在哪"，所以这里
+ *  只做三件共用的事：发请求、用回执刷新视图、清掉速率基准。 */
+async function submitConfig(body: any) {
+  const out: any = await json('POST', '/api/tunnel/tls/config', body)
+  // 用回执里的 status 刷新，**不再**发一次 GET：这份就是应用之后的实际状态，
+  // 再查一次只会把"两次请求之间又被改了一版"的结果混进来。
+  if (out?.status) tls.value = out.status
+  // 计数基准清掉：status 里带着新的 counts，留着旧基准会算出负速率或一个
+  // 巨大的瞬时值（见 tickRate）。
+  prev.value = null
+  rate.value = null
+  tickRate()
+  return out
+}
+
 /** 保存。成功 → 用回执里的 status 刷新 + 退出编辑态；失败 → 原样显示后端的话。 */
 async function save() {
   if (saving.value) return
-  const bad = validate()
+  const bad = validateForm(form.value)
   if (bad.length) {
     // 和后端同一个排版（`·` 打头的逐条），两条信息看起来才是一回事。
     formError.value = '提交前自查发现问题：\n' + bad.map(t => `  · ${t}`).join('\n')
@@ -349,15 +378,7 @@ async function save() {
   saving.value = true
   formError.value = ''
   try {
-    const out: any = await json('POST', '/api/tunnel/tls/config', payload())
-    // 用回执里的 status 刷新，**不再**发一次 GET：这份就是应用之后的实际状态，
-    // 再查一次只会把"两次请求之间又被改了一版"的结果混进来。
-    if (out?.status) tls.value = out.status
-    // 计数基准清掉：status 里带着新的 counts，留着旧基准会算出负速率或一个
-    // 巨大的瞬时值（见 tickRate）。
-    prev.value = null
-    rate.value = null
-    tickRate()
+    const out: any = await submitConfig(payloadOf(form.value))
     editing.value = false
     flash(outcomeText(out), out?.warn ? 'error' : 'success')
   } catch (e) {
@@ -383,6 +404,247 @@ function outcomeText(out: any): string {
     : '只在内存生效，重启后回到 host.toml 的基线'
   const head = `已生效：重绑 ${n} 个端口、释放 ${m} 个、${k} 个未受影响；${where}`
   return out?.warn ? `${head}。${out.warn}` : head
+}
+
+// ── 就地编辑：在链路表里改一行 ──────────────────────────────────────────────
+//
+// 「把 2222 的上游换掉」是这一页最高频的改动，而整份表单要展开三张表才找得到
+// 那个字段。就地编辑只为一件事：让最常见的改动少两次点击 —— 它不是另一套提交
+// 机制，仍然读 `status.config` → 改一处 → **整份** POST。逐条 upsert 会让中间
+// 态非法（端口重复、上游自环），那正是后端不接受逐条的原因。
+
+/** 链路表的一行在 config 里的位置。一行 = 一个监听地址 = `site[si].listen[li]`。 */
+type RowRef = { si: number; li: number }
+
+/** 靠**地址字符串相等**定位，不靠顺序。
+ *
+ *  顺序（先按 site、再按 listen 展开）是后端的实现细节。把 UI 绑到它上面，
+ *  后端哪天调一下顺序，就地编辑就会静默改到别的站点上 —— 那种 bug 不报错，
+ *  只是「我改的是 2222」变成了改掉 443。 */
+function locateRow(cfg: any, listen: string): RowRef | null {
+  const want = String(listen || '').trim()
+  if (!want) return null
+  const sites = cfg?.site || []
+  for (let si = 0; si < sites.length; si++) {
+    const ls = sites[si]?.listen || []
+    for (let li = 0; li < ls.length; li++) {
+      if (String(ls[li] || '').trim() === want) return { si, li }
+    }
+  }
+  return null
+}
+
+/** 逗号分隔的端口列表里换掉第 `idx` 项。表单形态是多端口合并成一行的（见 siteForm）。 */
+function replaceListAt(raw: string, idx: number, value: string): string {
+  const arr = splitList(raw)
+  while (arr.length <= idx) arr.push('')
+  arr[idx] = value
+  return arr.join(', ')
+}
+
+const rowKey = (c: any) => String(c?.site?.listen || '')
+
+function blankRow() {
+  return {
+    /** 空串 = 当前没有行在编辑。用"字段为空"而不是 `null` 表达，是为了让模板里
+     *  `rowEdit.xxx` 永远安全 —— 不必在每个绑定上写 `rowEdit!`。 */
+    key: '',
+    /** 提交基座：打开编辑那一刻的**整份**配置（表单形态）。
+     *  用快照而不是提交时现取，是为了所见即所得：输入框里的初值与最终被提交的
+     *  基座是同一份（提交时现取，中间那几秒别人改的东西会被静默覆盖）。 */
+    cfg: null as any,
+    si: -1,
+    li: -1,
+    listen: '',
+    kind: 'proxy',
+    upstream: '',
+    redirect: '',
+    websocket: false,
+    log_query: false,
+    read_timeout: '',
+    max_body: '',
+    hsts: 'inherit',
+  }
+}
+
+const rowEdit = ref<any>(blankRow())
+const rowSaving = ref(false)
+/** 就地编辑/删除失败的原文。显示在链路表**上方**：编辑行里的位置放不下多行逐条
+ *  错误，而"为什么没存上"是那一刻唯一该看的东西。 */
+const rowError = ref('')
+/** 正在二次确认删除的行（存 `rowKey`）。 */
+const rowConfirm = ref<string | null>(null)
+
+const isRowEditing = (c: any) => !!rowEdit.value.key && rowEdit.value.key === rowKey(c)
+
+/** 就地编辑的 HSTS 三态选项。**不能**复用整份表单那份 `triOptions` —— 那一份的
+ *  "当前"取自 `form`，而就地编辑时 `form` 可能是空的，于是会把"全局当前是开启"
+ *  显示成关闭。这种错比不显示更糟。 */
+const rowHstsDefault = computed(() => !!tls.value?.config?.defaults?.hsts)
+const rowTriOptions = computed(() => [
+  { label: `继承全局（当前：${rowHstsDefault.value ? '开启' : '关闭'}）`, value: 'inherit' },
+  { label: '显式开启', value: 'on' },
+  { label: '显式关闭', value: 'off' },
+])
+const rowBodyPlaceholder = computed(
+  () => `继承（${bytes(tls.value?.config?.defaults?.max_body_bytes)}）`,
+)
+
+/** 一个站点挂多个端口时，说明"这一格和那些格的影响范围不一样"。
+ *
+ *  不说清楚会很困惑：改了 2222 的上游，443 也跟着变了 —— 因为它们在配置里是
+ *  **同一个站点**，`upstream` 是站点级字段。 */
+const rowScope = computed(() => {
+  const r = rowEdit.value
+  const cfg = r.cfg
+  if (!cfg || r.si < 0) return ''
+  const ports = splitList(cfg.sites[r.si]?.listen || '')
+  if (ports.length <= 1) return ''
+  const others = ports.filter((_: string, i: number) => i !== r.li)
+  return (
+    `这个站点还监听 ${others.join('、')}：类型、上游 / 301、开关与超时都是站点级的，` +
+    '改动会一起作用于它们。只有「监听」那一格是当前端口自己的。'
+  )
+})
+
+function startRowEdit(c: any) {
+  if (!canEdit.value || editing.value || rowSaving.value) return
+  const cfg = formFromConfig(tls.value?.config)
+  const loc = locateRow(cfg, c.site.listen)
+  if (!loc) {
+    rowError.value =
+      `面板上的 ${c.site.listen} 这一行在 status.config 里找不到（可能刚被别人改过）。` +
+      '点「刷新」重读一遍再试。'
+    return
+  }
+  const site = cfg.sites[loc.si]
+  rowError.value = ''
+  rowConfirm.value = null
+  rowEdit.value = {
+    ...blankRow(),
+    key: rowKey(c),
+    cfg,
+    si: loc.si,
+    li: loc.li,
+    listen: splitList(site.listen)[loc.li] ?? c.site.listen,
+    kind: site.kind,
+    upstream: site.upstream,
+    redirect: site.redirect,
+    websocket: site.websocket,
+    log_query: site.log_query,
+    read_timeout: site.read_timeout,
+    max_body: site.max_body,
+    hsts: site.hsts,
+  }
+}
+
+function cancelRowEdit() {
+  rowEdit.value = blankRow()
+  rowError.value = ''
+}
+
+/** 类型切换要把另一半清掉：`upstream` 与 `redirect` 同时有值时后端会直接拒，
+ *  而"看不见的那个旧值"下次会被一起提交。 */
+function onRowKindChange() {
+  if (rowEdit.value.kind === 'proxy') rowEdit.value.redirect = ''
+  else rowEdit.value.upstream = ''
+}
+
+async function saveRowEdit() {
+  const r = rowEdit.value
+  if (!r.cfg || r.si < 0 || rowSaving.value) return
+  // 从定位基线里取站点：它是快照里那一个对象，改它就是改提交体。
+  const site = r.cfg.sites[r.si]
+  if (!site) {
+    rowError.value = '这一行对应的站点已经不在配置里了（可能刚被别人改过）。点「刷新」再试。'
+    return
+  }
+
+  // 改一处，其余原样。submitConfig 发的仍是**整份**配置。
+  site.listen = replaceListAt(site.listen, r.li, String(r.listen).trim())
+  site.kind = r.kind
+  site.upstream = r.kind === 'proxy' ? String(r.upstream).trim() : ''
+  site.redirect = r.kind === 'redirect' ? String(r.redirect).trim() : ''
+  site.websocket = r.kind === 'proxy' && !!r.websocket
+  site.log_query = !!r.log_query
+  site.read_timeout = String(r.read_timeout).trim()
+  site.max_body = String(r.max_body).trim()
+  site.hsts = r.hsts
+
+  // 跑**整份**自查：提交的就是整份，后端也会整份校验。这里少查一遍只会让
+  // 用户先看到"保存成功"再看到后端的一堆错误。
+  const bad = validateForm(r.cfg)
+  if (bad.length) {
+    rowError.value = '提交前自查发现问题（其中可能有不属于这一行的）：\n'
+      + bad.map(t => `  · ${t}`).join('\n')
+    return
+  }
+
+  rowSaving.value = true
+  rowError.value = ''
+  try {
+    const out = await submitConfig(payloadOf(r.cfg))
+    rowEdit.value = blankRow()
+    flash(outcomeText(out), out?.warn ? 'error' : 'success')
+  } catch (e) {
+    // 原样显示：后端返回的已是逐条中文。
+    rowError.value = (e as Error).message
+  } finally {
+    rowSaving.value = false
+  }
+}
+
+function cancelRemove() {
+  rowConfirm.value = null
+}
+
+function askRemoveRow(c: any) {
+  if (!canEdit.value || editing.value || rowSaving.value) return
+  rowError.value = ''
+  rowConfirm.value = rowKey(c)
+}
+
+async function removeRow(c: any) {
+  if (rowSaving.value) return
+  const cfg = formFromConfig(tls.value?.config)
+  const loc = locateRow(cfg, c.site.listen)
+  if (!loc) {
+    rowError.value =
+      `面板上的 ${c.site.listen} 这一行在 status.config 里找不到（可能刚被别人改过）。` +
+      '点「刷新」重读一遍再试。'
+    rowConfirm.value = null
+    return
+  }
+
+  const site = cfg.sites[loc.si]
+  const ports = splitList(site.listen)
+  // 一个站点可能有多个端口：只移除这一个，除非它是最后一个 —— 那就等于删站点。
+  const dropWholeSite = ports.length <= 1
+  if (dropWholeSite && cfg.sites.length <= 1) {
+    rowError.value =
+      '这是最后一个站点。TLS 终结至少要有一个监听端口；要停掉整层请改 host.toml 的 ' +
+      '[tls] enabled = false（那需要重启宿主）。'
+    rowConfirm.value = null
+    return
+  }
+  if (dropWholeSite) cfg.sites.splice(loc.si, 1)
+  else site.listen = ports.filter((_: string, i: number) => i !== loc.li).join(', ')
+
+  rowSaving.value = true
+  rowError.value = ''
+  try {
+    const out = await submitConfig(payloadOf(cfg))
+    rowConfirm.value = null
+    const what = dropWholeSite
+      ? `已删除站点「${c.site.name}」`
+      : `已从「${c.site.name}」移除 ${c.site.listen}`
+    flash(`${what}。${outcomeText(out)}`, out?.warn ? 'error' : 'success')
+  } catch (e) {
+    rowError.value = (e as Error).message
+    rowConfirm.value = null
+  } finally {
+    rowSaving.value = false
+  }
 }
 
 // ── 编辑态用到的选项与提示 ──────────────────────────────────────────────────
@@ -477,9 +739,9 @@ onMounted(() => {
   load()
   timer = setInterval(() => {
     if (document.hidden) return
-    // 编辑中不刷新：表单是打开那一刻的快照，刷新也不会同步过来，而只读视图
-    // 在底下变了只会让"我看到的值"和"我要提交的值"分家。
-    if (editing.value) return
+    // 编辑中不刷新：表单（或就地编辑的那一行）是打开那一刻的快照，刷新也不会
+    // 同步过来，而只读视图在底下变了只会让"我看到的值"和"我要提交的值"分家。
+    if (editing.value || rowEdit.value.key) return
     load(true)
     tickRate()
   }, 5000)
@@ -720,69 +982,169 @@ onBeforeUnmount(() => clearInterval(timer))
       <NeumorphismButton size="small" @click="load(); tickRate()">刷新</NeumorphismButton>
     </div>
 
+    <!-- 就地编辑/删除失败的原文放这里，不放在展开的编辑行里：后端会一次列好几条，
+         那格里放不下；而"为什么没生效"是此刻唯一该看的东西。 -->
+    <div v-if="rowError" class="esc-form-error">
+      <NeumorphismAlert type="error" title="这一行没有生效（改动还在，可以继续改）" :message="rowError" :closable="false" />
+    </div>
+
     <NeumorphismCard>
       <div v-if="!sortedChains.length" class="esc-empty">没有配置任何 TLS 站点</div>
       <div v-else class="esc-table-wrap">
         <table class="esc-table">
           <thead>
             <tr>
-              <th>监听</th><th>站点</th><th>终结之后</th><th>隧道</th><th>链路终点</th><th>状态</th><th>选项</th>
+              <th>监听</th><th>站点</th><th>终结之后</th><th>隧道</th><th>链路终点</th><th>状态</th><th>选项</th><th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="c in sortedChains" :key="c.site.name + c.site.listen">
-              <td class="mono">
-                <strong>{{ c.site.listen }}</strong>
-                <div class="esc-hint">{{ isPublic(c.site.listen) ? '所有网卡' : '仅本机' }}</div>
-              </td>
-              <td>
-                {{ c.site.name }}
-                <div class="esc-hint">{{ c.site.kind === 'redirect' ? '301 跳转' : '转发' }}</div>
-              </td>
-              <td class="mono">
-                {{ c.site.target }}
-                <!--
-                  这条箭头是本页的重点：TLS 与隧道从前是两个世界，
-                  现在 target 就是 mapping.listen，指向同一条链路。
-                -->
-                <div v-if="c.mapping" class="esc-hint">↳ 就是这条映射的监听地址</div>
-              </td>
-              <td>
-                <template v-if="c.mapping">
-                  <strong>{{ c.mapping.name }}</strong>
-                  <div class="esc-hint">{{ c.provider || '无提供者' }}</div>
-                </template>
-                <span v-else class="esc-hint">—（不经隧道）</span>
-              </td>
-              <td class="mono">
-                <template v-if="c.endpoint">{{ c.endpoint }}</template>
-                <span v-else class="esc-hint">本机服务</span>
-              </td>
-              <td>
-                <NeumorphismTag
-                  v-if="c.state"
-                  size="small"
-                  :variant="c.state === 'active' ? 'success' : c.state === 'error' ? 'error' : 'default'"
-                >{{ c.state }}</NeumorphismTag>
-                <NeumorphismTag v-else size="small">—</NeumorphismTag>
-                <div v-if="c.mapping?.error" class="esc-hint">{{ c.mapping.error }}</div>
-              </td>
-              <td>
-                <div class="esc-actions">
-                  <NeumorphismTag v-if="c.site.websocket" size="small" variant="primary">WS</NeumorphismTag>
-                  <NeumorphismTag v-if="c.site.hsts" size="small">HSTS</NeumorphismTag>
-                  <!--
-                    `log_query = false` 是承载令牌的端口用来保证凭据不落盘的设置。
-                    它应该被看见，而不是藏在配置里 —— 所以这里明确标出来。
-                  -->
-                  <NeumorphismTag v-if="!c.site.log_query" size="small" variant="success">不记录查询串</NeumorphismTag>
-                  <NeumorphismTag v-else size="small" variant="warning">记录查询串</NeumorphismTag>
-                </div>
-                <div class="esc-hint">
-                  超时 {{ duration(c.site.read_timeout_secs) }} · 体上限 {{ bytes(c.site.max_body_bytes) }}
-                </div>
-              </td>
-            </tr>
+            <!-- 一行 = 一个监听地址。就地编辑在这一行上展开：换上游、改端口、开关
+                 都不用离开这张表 —— 「把 2222 的上游换掉」是这一页最高频的操作。 -->
+            <template v-for="c in sortedChains" :key="c.site.name + c.site.listen">
+              <tr :class="{ 'esc-row-editing': isRowEditing(c) }">
+                <td class="mono">
+                  <!-- 编辑态里只有「监听」这一格是本端口自己的；其余格是站点级的，
+                       站点挂多个端口时会一起变（见下方 rowScope 的提示）。 -->
+                  <NeumorphismInput
+                    v-if="isRowEditing(c)"
+                    v-model="rowEdit.listen"
+                    placeholder="0.0.0.0:2222"
+                    :size="36"
+                  />
+                  <template v-else>
+                    <strong>{{ c.site.listen }}</strong>
+                    <div class="esc-hint">{{ isPublic(c.site.listen) ? '所有网卡' : '仅本机' }}</div>
+                  </template>
+                </td>
+                <td>
+                  {{ c.site.name }}
+                  <div class="esc-hint">
+                    <template v-if="isRowEditing(c)">{{ rowEdit.kind === 'redirect' ? '301 跳转' : '转发' }}</template>
+                    <template v-else>{{ c.site.kind === 'redirect' ? '301 跳转' : '转发' }}</template>
+                  </div>
+                </td>
+                <td class="mono">
+                  <NeumorphismInput
+                    v-if="isRowEditing(c) && rowEdit.kind === 'proxy'"
+                    v-model="rowEdit.upstream"
+                    placeholder="127.0.0.1:18790"
+                    :size="36"
+                  />
+                  <NeumorphismInput
+                    v-else-if="isRowEditing(c)"
+                    v-model="rowEdit.redirect"
+                    placeholder="https://{hostname}:2224{uri}"
+                    :size="36"
+                  />
+                  <template v-else>
+                    {{ c.site.target }}
+                    <!--
+                      这条箭头是本页的重点：TLS 与隧道从前是两个世界，
+                      现在 target 就是 mapping.listen，指向同一条链路。
+                    -->
+                    <div v-if="c.mapping" class="esc-hint">↳ 就是这条映射的监听地址</div>
+                  </template>
+                </td>
+                <td>
+                  <template v-if="c.mapping">
+                    <strong>{{ c.mapping.name }}</strong>
+                    <div class="esc-hint">{{ c.provider || '无提供者' }}</div>
+                  </template>
+                  <span v-else class="esc-hint">—（不经隧道）</span>
+                </td>
+                <td class="mono">
+                  <template v-if="c.endpoint">{{ c.endpoint }}</template>
+                  <span v-else class="esc-hint">本机服务</span>
+                </td>
+                <td>
+                  <NeumorphismTag
+                    v-if="c.state"
+                    size="small"
+                    :variant="c.state === 'active' ? 'success' : c.state === 'error' ? 'error' : 'default'"
+                  >{{ c.state }}</NeumorphismTag>
+                  <NeumorphismTag v-else size="small">—</NeumorphismTag>
+                  <div v-if="c.mapping?.error" class="esc-hint">{{ c.mapping.error }}</div>
+                </td>
+                <td>
+                  <!-- 编辑态不显示旧值：这一列讲的是"现在生效的是什么"，而草稿还没
+                       生效。显示旧值会让人以为改动已经加上去了。 -->
+                  <NeumorphismTag v-if="isRowEditing(c)" size="small" variant="warning">改动未保存</NeumorphismTag>
+                  <template v-else>
+                    <div class="esc-actions">
+                      <NeumorphismTag v-if="c.site.websocket" size="small" variant="primary">WS</NeumorphismTag>
+                      <NeumorphismTag v-if="c.site.hsts" size="small">HSTS</NeumorphismTag>
+                      <!--
+                        `log_query = false` 是承载令牌的端口用来保证凭据不落盘的设置。
+                        它应该被看见，而不是藏在配置里 —— 所以这里明确标出来。
+                      -->
+                      <NeumorphismTag v-if="!c.site.log_query" size="small" variant="success">不记录查询串</NeumorphismTag>
+                      <NeumorphismTag v-else size="small" variant="warning">记录查询串</NeumorphismTag>
+                    </div>
+                    <div class="esc-hint">
+                      超时 {{ duration(c.site.read_timeout_secs) }} · 体上限 {{ bytes(c.site.max_body_bytes) }}
+                    </div>
+                  </template>
+                </td>
+                <td>
+                  <div class="esc-actions">
+                    <template v-if="isRowEditing(c)">
+                      <NeumorphismButton size="small" variant="primary" :loading="rowSaving" @click="saveRowEdit">保存</NeumorphismButton>
+                      <NeumorphismButton size="small" :disabled="rowSaving" @click="cancelRowEdit">取消</NeumorphismButton>
+                    </template>
+                    <!-- 删除要二次确认：这一下会改公网暴露面，不能一步到位。 -->
+                    <template v-else-if="rowConfirm === rowKey(c)">
+                      <NeumorphismButton size="small" class="esc-danger" :loading="rowSaving" @click="removeRow(c)">确认删除</NeumorphismButton>
+                      <NeumorphismButton size="small" :disabled="rowSaving" @click="cancelRemove">取消</NeumorphismButton>
+                    </template>
+                    <template v-else>
+                      <NeumorphismButton
+                        size="small"
+                        :disabled="!canEdit || editing || rowSaving || !!rowEdit.key"
+                        title="就地把这一行的上游 / 端口 / 开关改掉"
+                        @click="startRowEdit(c)"
+                      >编辑</NeumorphismButton>
+                      <NeumorphismButton
+                        size="small"
+                        class="esc-danger"
+                        :disabled="!canEdit || editing || rowSaving || !!rowEdit.key"
+                        @click="askRemoveRow(c)"
+                      >删除</NeumorphismButton>
+                    </template>
+                  </div>
+                </td>
+              </tr>
+              <!-- 展开的编辑区：一行里塞不下九个字段，横着摊在下面而不是弹窗 -->
+              <tr v-if="isRowEditing(c)" class="esc-row-panel">
+                <td colspan="8">
+                  <div class="esc-edit-grid">
+                    <NeumorphismSelect v-model="rowEdit.kind" :options="kindOptions" label="类型" :size="36" @change="onRowKindChange" />
+                    <NeumorphismInput v-model="rowEdit.read_timeout" label="上游超时（秒）" inputmode="numeric" :size="36" />
+                    <NeumorphismInput
+                      v-model="rowEdit.max_body"
+                      label="请求体上限（字节）"
+                      :placeholder="rowBodyPlaceholder"
+                      inputmode="numeric"
+                      :size="36"
+                    />
+                    <NeumorphismSelect v-model="rowEdit.hsts" :options="rowTriOptions" label="HSTS" :size="36" />
+                  </div>
+                  <div class="esc-edit-foot">
+                    <div class="esc-check">
+                      <NeumorphismSwitch v-model="rowEdit.websocket" :size="24" :disabled="rowEdit.kind === 'redirect'" />透传 WebSocket
+                    </div>
+                    <div class="esc-check">
+                      <NeumorphismSwitch v-model="rowEdit.log_query" :size="24" />把查询串写进访问日志
+                    </div>
+                  </div>
+                  <p v-if="rowScope" class="esc-hint">{{ rowScope }}</p>
+                  <p v-if="rowEdit.kind === 'redirect'" class="esc-hint">
+                    占位符：<code>{host}</code> 是<b>带端口</b>的 Host、<code>{hostname}</code> 去掉端口、
+                    <code>{uri}</code> 路径 + 查询串、<code>{path}</code> 只有路径。跳到<b>另一个端口</b>时
+                    必须用 <code>{hostname}</code>。
+                  </p>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
       </div>
@@ -842,6 +1204,15 @@ onBeforeUnmount(() => clearInterval(timer))
 
 /* 一个站点/一张证书 = 一块。做成行块而不是九列表格：九个可编辑字段挤进一张表，
    每列不到 150px，输入框里连 `0.0.0.0:443` 都显示不全，也没地方放字段名。 */
+/* 就地编辑：整行淡底色 + 展开面板，让人一眼看出"这一行在改、还没保存"。
+   底色只做极轻的一层 —— 表格里的输入框本身已经足够显眼，重底色反而糊。 */
+.esc-row-editing > td { background: rgba(127, 127, 127, 0.06); vertical-align: top; }
+.esc-row-panel > td {
+  background: rgba(127, 127, 127, 0.06);
+  padding-top: 4px;
+  border-top: 0;
+}
+
 .esc-edit-row { padding: 14px 0; border-top: 1px solid var(--nm-color-border); }
 .esc-edit-row:first-child { border-top: 0; padding-top: 2px; }
 .esc-edit-head { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; }
