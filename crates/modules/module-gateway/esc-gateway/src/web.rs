@@ -569,4 +569,35 @@ mod tests {
             problems.join("\n  ")
         );
     }
+
+    /// `STYLE` 里 `var(--nm-*)` 引用的每个名字，都必须在 `STYLE` 的 `:root` 里声明过。
+    ///
+    /// 上一条测试只比**声明**，管不到**使用**：把 `var(--nm-border-radius-sm)` 打成
+    /// `var(--nm-radius-sm)`，声明侧完全合法，浏览器却会取空值 → 圆角变 0。
+    /// 新拟态的观感全押在圆角和阴影上，这种错在截图里能看出来，在代码里看不出来。
+    ///
+    /// 所以不查 CSS 语义，只查这个封闭集合的自洽性：引用了谁，就得声明谁。
+    #[test]
+    fn style_references_only_declared_tokens() {
+        let declared = declarations(&block_after(STYLE, ":root").expect("STYLE 里应有 :root"));
+
+        let mut used: Vec<&str> = Vec::new();
+        let mut rest = STYLE;
+        while let Some(i) = rest.find("var(--nm-") {
+            rest = &rest[i + 4..]; // 跳过 `var(`
+            let end = rest.find(')').expect("var() 没有闭合");
+            let name = rest[..end].trim();
+            if !used.contains(&name) {
+                used.push(name);
+            }
+        }
+        assert!(!used.is_empty(), "一个 var(--nm-*) 都没扫到，测试会是空转");
+
+        let missing: Vec<&&str> = used.iter().filter(|n| !declared.contains_key(**n)).collect();
+        assert!(
+            missing.is_empty(),
+            "STYLE 引用了没声明的令牌，浏览器会取空值：{missing:?}\n已声明：{:?}",
+            declared.keys().collect::<Vec<_>>()
+        );
+    }
 }
