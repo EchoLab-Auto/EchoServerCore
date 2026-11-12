@@ -1006,13 +1006,14 @@ onBeforeUnmount(() => clearInterval(timer))
             <!-- 一行 = 一个监听地址。就地编辑在这一行上展开：换上游、改端口、开关
                  都不用离开这张表 —— 「把 2222 的上游换掉」是这一页最高频的操作。 -->
             <template v-for="c in sortedChains" :key="c.site.name + c.site.listen">
-              <tr :class="{ 'esc-row-editing': isRowEditing(c) }">
+              <tr :class="{ 'esc-row-editing': isRowEditing(c) }" :data-listen="c.site.listen">
                 <td class="mono">
                   <!-- 编辑态里只有「监听」这一格是本端口自己的；其余格是站点级的，
                        站点挂多个端口时会一起变（见下方 rowScope 的提示）。 -->
                   <NeumorphismInput
                     v-if="isRowEditing(c)"
                     v-model="rowEdit.listen"
+                    data-field="listen"
                     placeholder="0.0.0.0:2222"
                     :size="36"
                   />
@@ -1032,12 +1033,14 @@ onBeforeUnmount(() => clearInterval(timer))
                   <NeumorphismInput
                     v-if="isRowEditing(c) && rowEdit.kind === 'proxy'"
                     v-model="rowEdit.upstream"
+                    data-field="target"
                     placeholder="127.0.0.1:18790"
                     :size="36"
                   />
                   <NeumorphismInput
                     v-else-if="isRowEditing(c)"
                     v-model="rowEdit.redirect"
+                    data-field="target"
                     placeholder="https://{hostname}:2224{uri}"
                     :size="36"
                   />
