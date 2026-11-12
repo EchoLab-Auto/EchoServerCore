@@ -55,12 +55,17 @@ pub mod method {
     pub const EDGE_ROUTE_DELETE: &str = "edge.route.delete";
     pub const EDGE_ROUTE_STATUS: &str = "edge.status";
 
-    /// TLS 终结层的状态（站点 + 证书 + 计数）。
-    ///
-    /// 只有 `status` 一个方法：证书与监听端口的**改动**要重启宿主才生效
-    /// （见 `docs/TLS-MODULE.md`「证书续期」），所以这里没有 upsert/delete。
-    /// 加一套只能改内存、活不过重启的写接口，比没有更误导。
+    /// TLS 终结层的状态（站点 + 证书 + 计数 + 全局默认）。
     pub const TLS_STATUS: &str = "tls.status";
+
+    /// 提交**整份** TLS 配置：校验 → 热切换 → 落盘。
+    ///
+    /// 为什么是整份而不是逐条 upsert：站点之间有约束（端口不能重复、上游不能指回
+    /// 自己、`defaults.cert` 必须指向存在的证书），逐条提交会让中间态非法，而合法
+    /// 的中间态又不知道按哪一版校验。一次提交 = 一次校验 = 一次切换。
+    ///
+    /// 热切换的粒度见 `TlsApplyOutcome`：只改上游/301/超时不变端口，改端口才重绑。
+    pub const TLS_CONFIG_APPLY: &str = "tls.config.apply";
 }
 
 /// 一次控制调用。
@@ -167,10 +172,20 @@ pub trait EdgeRouteControl: Send + Sync + 'static {
 /// 永远是同一份清单。
 /// TLS 终结层的控制面。
 ///
-/// 只读：见 `method::TLS_STATUS` 的注释（改动要重启，不做只能改内存的写接口）。
+/// # 写路径的边界
+///
+/// 改的是**运行中的这一层**：`apply_config` 校验通过后立刻生效（能不变的端口
+/// 不重绑），并尽量落盘到状态文件。它不碰 `host.toml`——那份是只读基线，理由
+/// 与边缘路由同一套（`ReadOnlyPaths=/etc/esc`、注释会被重写、改坏了起不来）。
 #[async_trait::async_trait]
 pub trait TlsControl: Send + Sync + 'static {
     async fn status(&self) -> Result<crate::model::TlsStatus, ControlError>;
+
+    /// 提交整份配置。失败时**不留半成品**：旧监听、旧证书、旧配置原样继续跑。
+    async fn apply_config(
+        &self,
+        cfg: crate::model::TlsConfigInput,
+    ) -> Result<crate::model::TlsApplyOutcome, ControlError>;
 }
 
 pub async fn dispatch(ctl: &dyn TunnelControl, req: ControlRequest) -> ControlResponse {
@@ -296,8 +311,8 @@ pub async fn dispatch_edge(ctl: &dyn EdgeRouteControl, req: ControlRequest) -> C
     }
 }
 
-/// TLS 终结层的 dispatch。只有一个方法，保留 dispatch 这层是为了与
-/// `dispatch` / `dispatch_edge` 的形状一致 —— 宿主端的服务实现可以照抄。
+/// TLS 终结层的 dispatch。保留 dispatch 这层是为了与 `dispatch` /
+/// `dispatch_edge` 的形状一致 —— 宿主端的服务实现可以照抄。
 pub async fn dispatch_tls(ctl: &dyn TlsControl, req: ControlRequest) -> ControlResponse {
     use method::*;
     match req.method.as_str() {
@@ -305,6 +320,16 @@ pub async fn dispatch_tls(ctl: &dyn TlsControl, req: ControlRequest) -> ControlR
             Ok(v) => ControlResponse::ok(v),
             Err(e) => ControlResponse::err(e),
         },
+        TLS_CONFIG_APPLY => {
+            let cfg: crate::model::TlsConfigInput = match req.parse() {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::err(e),
+            };
+            match ctl.apply_config(cfg).await {
+                Ok(v) => ControlResponse::ok(v),
+                Err(e) => ControlResponse::err(e),
+            }
+        }
         other => ControlResponse::err(ControlError::invalid(format!(
             "unknown tls method: {other}"
         ))),

@@ -45,6 +45,7 @@ pub mod config;
 pub mod control;
 pub mod proxy;
 pub mod serve;
+pub mod store;
 
 use std::sync::{Arc, Mutex};
 
@@ -53,14 +54,15 @@ use echo_plugin::{MountContext, Plugin, PluginManifest, PluginMountError, Plugin
 use tracing::info;
 
 pub use config::{Action, CertConfig, Defaults, Site, SiteConfig, TlsModuleConfig};
-pub use control::{resolve, Metrics, TlsControlImpl, TLS_CONTROL};
+pub use control::{resolve, Metrics, Runtime, State, TLS_CONTROL};
+pub use store::ConfigStore;
 
 /// 插件在注册表里的 id（与 crate 名对应：`esc-plugin-tls` ↔ `esc.tls`）。
 pub const PLUGIN_ID: &str = "esc.tls";
 
-/// 运行中的监听，放在插件里只为了 `unmount` 时能关掉。
+/// 运行中的插件实例，放在这里只为了 `unmount` 时能关掉。
 struct Running {
-    handle: serve::ServerHandle,
+    rt: Arc<Runtime>,
 }
 
 pub struct TlsPlugin {
@@ -96,78 +98,56 @@ impl Plugin for TlsPlugin {
     }
 
     fn mount(&self, mctx: &MountContext) -> PluginMountResult {
-        // Ctx 在这里其实用不到（没有要注册的服务键），但宿主没给说明接线错了，
-        // 早报比晚报好。
-        if mctx.context().is_none() {
-            return Err(PluginMountError::Mount("宿主没有提供 Ctx".into()));
-        }
-        let _: Option<&Arc<Ctx>> = mctx.context();
+        // Ctx 用来注册控制面服务。宿主没给说明接线错了，早报比晚报好。
+        let ctx: Arc<Ctx> = Arc::clone(
+            mctx.context()
+                .ok_or_else(|| PluginMountError::Mount("宿主没有提供 Ctx".into()))?,
+        );
 
-        // ── 配置：一次把所有问题都报出来 ────────────────────────────────────
-        let cfg: TlsModuleConfig = serde_json::from_value(mctx.config().clone())
+        // ── 配置来源：状态文件优先，其次 host.toml 的 [tls.config] ──────────
+        //
+        // 「整体覆盖」而不是「合并」：面板删掉一个站点后，重启不该让它从
+        // host.toml 里复活。想回到基线就删掉状态文件（见 store.rs）。
+        let baseline: TlsModuleConfig = serde_json::from_value(mctx.config().clone())
             .map_err(|e| PluginMountError::Mount(format!("TLS 配置无法解析: {e}")))?;
 
-        let validated = cfg.validate().map_err(|errs| {
-            // 逐条列出来。配置错通常是一批（复制粘贴改了一半），只报第一条会让
-            // 人改一轮跑一轮。
-            let mut msg = String::from("TLS 配置有误：");
-            for e in errs {
-                msg.push_str("\n  · ");
-                msg.push_str(&e);
-            }
-            PluginMountError::Mount(msg)
-        })?;
+        let store = baseline.store.clone().map(ConfigStore::new);
+        let cfg = match &store {
+            Some(s) => match s.load() {
+                Ok(Some(saved)) => {
+                    info!(path = %s.path().display(), "TLS 配置取自运行期状态文件");
+                    saved
+                }
+                Ok(None) => baseline,
+                // 状态文件坏了就**不启动**：静默回落基线会让面板显示的东西和
+                // 实际跑的东西分家，那比一次明确的启动失败难查得多。
+                Err(e) => return Err(PluginMountError::Mount(e)),
+            },
+            None => baseline,
+        };
 
-        // ── 证书：读盘失败即失败（fail-closed）──────────────────────────────
+        // ── 起运行期：校验 → 读证书 → 绑端口 ────────────────────────────────
         //
-        // 一个"大部分端口能用、某个域名握手失败"的部署，排查成本远高于启动时报错。
-        let store = Arc::new(
-            certs::CertStore::load(&cfg.cert, &validated.default_cert)
-                .map_err(|e| PluginMountError::Mount(format!("{e:#}")))?,
-        );
-        let tls_config = certs::server_config(Arc::clone(&store), validated.tls12)
-            .map_err(|e| PluginMountError::Mount(format!("TLS 配置构建失败: {e:#}")))?;
-
-        // ── 绑定：同步做，失败即挂载失败 ────────────────────────────────────
-        let bound = serve::bind(&validated.sites)
-            .map_err(|e| PluginMountError::Mount(format!("TLS 终结无法监听: {e}")))?;
-
+        // 绑端口在这里同步做，失败即挂载失败（fail-closed）。等「挂载成功但每个
+        // 连接都失败」再排查，那已经是一次线上事故了。
         let metrics = Metrics::new();
-        let handle = serve::spawn(
-            bound,
-            tls_config,
-            validated.handshake_timeout,
-            Arc::clone(&metrics),
-        )
-        .map_err(|e| PluginMountError::Mount(format!("TLS 终结启动失败: {e}")))?;
+        let rt = Runtime::start(cfg, Arc::clone(&metrics), store)
+            .map_err(PluginMountError::Mount)?;
 
-        // 注册控制面。面板靠它把「:2222 ──TLS──▶ 18790 ──隧道──▶ 4090:8080」
-        // 这条链路在一屏里画出来 —— 从前 nginx 那一层面板是看不见的。
-        //
-        // 注册失败要把刚起的监听关掉：挂载失败但端口还占着，下次重试会报
-        // "Address already in use"，而真正的原因是服务键冲突。
-        let ctl: Arc<dyn esc_control_api::TlsControl> =
-            Arc::new(TlsControlImpl::new(&validated, &cfg.cert, Arc::clone(&metrics)));
-        let ctx = mctx.context().expect("上面已确认存在");
+        // 注册控制面。面板靠它读状态、也靠它保存改动。
+        let rt_arc: Arc<Runtime> = Arc::clone(&rt);
+        let ctl: Arc<dyn esc_control_api::TlsControl> = rt_arc;
         let disposer = match ctx.provide(&TLS_CONTROL, ctl) {
             Ok(d) => d,
             Err(e) => {
-                handle.shutdown();
+                // 注册失败要把刚起的监听关掉：挂载失败但端口还占着，下次重试会
+                // 报 "Address already in use"，而真正的原因是服务键冲突。
+                rt.shutdown();
                 return Err(PluginMountError::Mount(format!(
                     "无法注册 TLS 控制面服务: {e}"
                 )));
             }
         };
-
-        info!(
-            sites = validated.sites.len(),
-            certs = ?store.names(),
-            sni = ?store.sni_names(),
-            default_cert = ?validated.default_cert,
-            tls12 = validated.tls12,
-            addrs = ?handle.addrs(),
-            "TLS 终结已挂载"
-        );
 
         let mut guard = self
             .running
@@ -176,9 +156,9 @@ impl Plugin for TlsPlugin {
         // 重复挂载：先把旧的关掉，否则端口冲突（错误信息会指向"地址被占用"，
         // 误导性很强）。
         if let Some(old) = guard.take() {
-            old.handle.shutdown();
+            old.rt.shutdown();
         }
-        *guard = Some(Running { handle });
+        *guard = Some(Running { rt });
         Ok(vec![disposer])
     }
 
@@ -188,7 +168,7 @@ impl Plugin for TlsPlugin {
             .lock()
             .map_err(|_| PluginMountError::Mount("TLS 插件状态锁中毒".into()))?;
         if let Some(r) = guard.take() {
-            r.handle.shutdown();
+            r.rt.shutdown();
             info!("TLS 终结已停止");
         }
         Ok(())

@@ -15,6 +15,7 @@
 //! 握手有超时是必须的：没有它，一个只连不发数据的客户端能把连接槽位一直占着
 //! （slowloris）。这里用的是 `defaults.handshake_timeout_secs`。
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,28 +72,240 @@ pub fn bind(sites: &[Site]) -> Result<Vec<Bound>, String> {
     Ok(out)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 运行期可替换的活配置
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 每个连接建立时读一次的**活配置**。
+///
+/// 有了它，「只改上游 / 301 / 超时」就不必重绑端口 —— 监听 socket 一直开着，
+/// 下一个连接自然用新配置。已经建立的连接继续用它建立时的那一份（与 nginx
+/// reload 同一个语义：老 worker 处理完在途连接才退）。
+///
+/// 三把锁分开而不是合成一把：换证书、换站点表、换超时是三次独立的原子操作。
+/// 合成一把会让「只换证书」也去抢站点表的写锁，而站点表是每连接都要读的。
+pub struct Shared {
+    sites: std::sync::RwLock<Arc<HashMap<SocketAddr, Arc<Site>>>>,
+    tls: std::sync::RwLock<Arc<rustls::ServerConfig>>,
+    handshake_timeout: std::sync::RwLock<Duration>,
+}
+
+impl Shared {
+    fn new(sites: &[Site], tls: Arc<rustls::ServerConfig>, handshake_timeout: Duration) -> Self {
+        Self {
+            sites: std::sync::RwLock::new(Arc::new(index(sites))),
+            tls: std::sync::RwLock::new(tls),
+            handshake_timeout: std::sync::RwLock::new(handshake_timeout),
+        }
+    }
+
+    /// 这个端口当前的站点定义。端口已从配置里消失时返回 `None`。
+    pub fn site(&self, addr: SocketAddr) -> Option<Arc<Site>> {
+        let g = self.sites.read().ok()?;
+        g.get(&addr).cloned()
+    }
+
+    /// 当前的 TLS 配置（证书解析器在它里面）。
+    ///
+    /// 锁中毒时退回**上一次的值**而不是 panic：这函数在 accept 循环的热路径上，
+    /// 让它 panic 等于整个端口不再接受连接 —— 比用一份旧证书糟得多。
+    pub fn tls_config(&self) -> Arc<rustls::ServerConfig> {
+        match self.tls.read() {
+            Ok(g) => Arc::clone(&g),
+            Err(p) => Arc::clone(&p.into_inner()),
+        }
+    }
+
+    pub fn handshake_timeout(&self) -> Duration {
+        match self.handshake_timeout.read() {
+            Ok(g) => *g,
+            Err(p) => *p.into_inner(),
+        }
+    }
+
+    fn set_sites(&self, sites: &[Site]) {
+        let next = Arc::new(index(sites));
+        match self.sites.write() {
+            Ok(mut g) => *g = next,
+            Err(p) => *p.into_inner() = next,
+        }
+    }
+
+    fn set_tls(&self, tls: Arc<rustls::ServerConfig>) {
+        match self.tls.write() {
+            Ok(mut g) => *g = tls,
+            Err(p) => *p.into_inner() = tls,
+        }
+    }
+
+    fn set_timeout(&self, d: Duration) {
+        match self.handshake_timeout.write() {
+            Ok(mut g) => *g = d,
+            Err(p) => *p.into_inner() = d,
+        }
+    }
+}
+
+/// 按监听地址建索引。
+///
+/// 用 `addr` 而不是 site 名当键：同一个名字可以挂多个端口（`listen` 是数组时
+/// 校验阶段就展开成多条 Site），而端口才是 accept 之后拿得到的那个东西。
+fn index(sites: &[Site]) -> HashMap<SocketAddr, Arc<Site>> {
+    sites.iter().map(|s| (s.addr, Arc::new(s.clone()))).collect()
+}
+
+/// 一次 [`ServerHandle::sync`] 的结果。
+#[derive(Debug, Clone, Default)]
+pub struct SyncReport {
+    /// 这次新绑定的端口。
+    pub added: Vec<SocketAddr>,
+    /// 这次关掉的端口。
+    pub removed: Vec<SocketAddr>,
+    /// 完全没动的端口数。
+    pub unchanged: usize,
+}
+
 /// 运行中的服务句柄。`shutdown` 之后所有监听与在途连接都停。
 pub struct ServerHandle {
-    addrs: Vec<SocketAddr>,
+    shared: Arc<Shared>,
+    root: CancellationToken,
+    ports: std::sync::Mutex<HashMap<SocketAddr, PortTask>>,
+    metrics: Arc<Metrics>,
+}
+
+struct PortTask {
     cancel: CancellationToken,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
-    pub fn addrs(&self) -> &[SocketAddr] {
-        &self.addrs
+    /// 当前在监听的端口（升序，日志里读起来稳定）。
+    pub fn addrs(&self) -> Vec<SocketAddr> {
+        let mut v: Vec<SocketAddr> = match self.ports.lock() {
+            Ok(g) => g.keys().copied().collect(),
+            Err(p) => p.into_inner().keys().copied().collect(),
+        };
+        v.sort();
+        v
+    }
+
+    /// 活配置的共享句柄（测试与状态查询用）。
+    pub fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// 把运行中的监听同步到 `sites`，同时替换证书与握手超时。
+    ///
+    /// # 为什么是这个顺序
+    ///
+    /// ```text
+    /// ① 先绑新增端口   → 失败就整体放弃，旧监听一个都没动，线上无变化
+    /// ② 再换活配置     → 从这一刻起所有端口用新表；没被移除的端口零中断
+    /// ③ 最后停移除端口 → 在途连接自然结束
+    /// ```
+    ///
+    /// 反过来（先停再绑）会出现一个窗口：该端口上的请求直接连接失败。而如果
+    /// 新端口绑不上（被别的进程占了），这个窗口就变成了永久中断。
+    pub fn sync(
+        &self,
+        sites: Vec<Site>,
+        tls: Arc<rustls::ServerConfig>,
+        handshake_timeout: Duration,
+    ) -> Result<SyncReport, String> {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "TLS 终结需要 tokio 运行时".to_string())?;
+
+        let want: HashSet<SocketAddr> = sites.iter().map(|s| s.addr).collect();
+        let have: HashSet<SocketAddr> = match self.ports.lock() {
+            Ok(g) => g.keys().copied().collect(),
+            Err(p) => p.into_inner().keys().copied().collect(),
+        };
+
+        let added: Vec<SocketAddr> = want.difference(&have).copied().collect();
+        let removed: Vec<SocketAddr> = have.difference(&want).copied().collect();
+        let unchanged = want.intersection(&have).count();
+
+        // ── ① 先绑新增。任一失败就返回，`fresh` 随函数返回被 drop，端口释放 ──
+        let mut fresh: Vec<(SocketAddr, PortTask)> = Vec::with_capacity(added.len());
+        for addr in &added {
+            let site = sites
+                .iter()
+                .find(|s| s.addr == *addr)
+                .expect("差的集合是从 sites 里算出来的");
+            let listener = std::net::TcpListener::bind(addr).map_err(|e| {
+                format!(
+                    "site {:?} 无法监听 {addr}: {e}\n\
+                     （整体放弃：旧监听一个都没有改动）",
+                    site.name
+                )
+            })?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| format!("site {:?} 设置非阻塞失败: {e}", site.name))?;
+            let listener = TcpListener::from_std(listener)
+                .map_err(|e| format!("接管监听 {addr} 失败: {e}"))?;
+
+            let cancel = self.root.child_token();
+            let token = cancel.clone();
+            let shared = Arc::clone(&self.shared);
+            let metrics = Arc::clone(&self.metrics);
+            let a = *addr;
+            let task = rt.spawn(async move {
+                accept_loop(shared, a, listener, token, metrics).await;
+            });
+            fresh.push((*addr, PortTask { cancel, task }));
+        }
+
+        // ── ② 换活配置。此后新连接一律看到新配置 ──
+        self.shared.set_sites(&sites);
+        self.shared.set_tls(tls);
+        self.shared.set_timeout(handshake_timeout);
+
+        // ── ③ 停掉被移除的端口 ──
+        {
+            let mut g = match self.ports.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            for addr in &removed {
+                if let Some(pt) = g.remove(addr) {
+                    pt.cancel.cancel();
+                    pt.task.abort();
+                }
+            }
+            for (addr, pt) in fresh {
+                g.insert(addr, pt);
+            }
+        }
+
+        Ok(SyncReport {
+            added,
+            removed,
+            unchanged,
+        })
     }
 
     /// 停掉。幂等。
     pub fn shutdown(&self) {
-        self.cancel.cancel();
-        for t in &self.tasks {
-            t.abort();
+        self.root.cancel();
+        let mut g = match self.ports.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for (_, pt) in g.drain() {
+            pt.cancel.cancel();
+            pt.task.abort();
         }
     }
 
     pub fn is_running(&self) -> bool {
-        !self.cancel.is_cancelled() && self.tasks.iter().any(|t| !t.is_finished())
+        if self.root.is_cancelled() {
+            return false;
+        }
+        match self.ports.lock() {
+            Ok(g) => g.values().any(|pt| !pt.task.is_finished()),
+            Err(p) => p.into_inner().values().any(|pt| !pt.task.is_finished()),
+        }
     }
 }
 
@@ -103,6 +316,9 @@ impl Drop for ServerHandle {
 }
 
 /// 为每个监听起一个 accept 循环。
+///
+/// 站点定义不再按连接捕获，而是每次 accept 时从 [`Shared`] 里读 —— 这是
+/// 「改上游不用重绑端口」的实现方式。
 pub fn spawn(
     bound: Vec<Bound>,
     tls: Arc<rustls::ServerConfig>,
@@ -112,22 +328,29 @@ pub fn spawn(
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "TLS 终结需要 tokio 运行时（宿主必须在 runtime 内挂载插件）".to_string())?;
 
-    let cancel = CancellationToken::new();
-    let mut addrs = Vec::with_capacity(bound.len());
-    let mut tasks = Vec::with_capacity(bound.len());
+    let root = CancellationToken::new();
 
+    // `:0` 要换成系统分配的真实端口：`Shared` 按 addr 索引，不换就永远查不到
+    // （端口写在配置里是 :0，实际监听的是 :38xxx）。
+    let mut sites: Vec<Site> = Vec::with_capacity(bound.len());
+    let mut prepared: Vec<(SocketAddr, TcpListener)> = Vec::with_capacity(bound.len());
     for Bound { site, listener } in bound {
         let addr = listener
             .local_addr()
             .map_err(|e| format!("读取监听地址失败: {e}"))?;
         let listener = TcpListener::from_std(listener)
             .map_err(|e| format!("接管监听 {addr} 失败: {e}"))?;
-        addrs.push(addr);
+        let mut site = site;
+        site.addr = addr;
+        sites.push(site);
+        prepared.push((addr, listener));
+    }
 
-        let site = Arc::new(site);
-        let tls = Arc::clone(&tls);
-        let token = cancel.child_token();
+    let shared = Arc::new(Shared::new(&sites, tls, handshake_timeout));
+    let mut ports = HashMap::with_capacity(prepared.len());
 
+    for (addr, listener) in prepared {
+        let site = shared.site(addr).expect("刚建好的索引");
         // 启动日志要能回答「哪个端口接受什么」——这是排障时第一个要确认的事。
         info!(
             site = %site.name,
@@ -138,33 +361,31 @@ pub fn spawn(
             "TLS 终结监听已启动"
         );
 
+        let cancel = root.child_token();
+        let token = cancel.clone();
+        let s = Arc::clone(&shared);
         let metrics = Arc::clone(&metrics);
         let task = rt.spawn(async move {
-            accept_loop(site, listener, tls, handshake_timeout, token, metrics).await;
+            accept_loop(s, addr, listener, token, metrics).await;
         });
-        tasks.push(task);
+        ports.insert(addr, PortTask { cancel, task });
     }
 
     Ok(ServerHandle {
-        addrs,
-        cancel,
-        tasks,
+        shared,
+        root,
+        ports: std::sync::Mutex::new(ports),
+        metrics,
     })
 }
 
 async fn accept_loop(
-    site: Arc<Site>,
+    shared: Arc<Shared>,
+    addr: SocketAddr,
     listener: TcpListener,
-    tls: Arc<rustls::ServerConfig>,
-    handshake_timeout: Duration,
     cancel: CancellationToken,
     metrics: Arc<Metrics>,
 ) {
-    let addr = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".into());
-
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -174,14 +395,22 @@ async fn accept_loop(
                     Err(e) => {
                         // accept 失败通常意味着 fd 耗尽。立刻继续会把它变成忙循环，
                         // 所以让出一下再试。
-                        warn!(site = %site.name, error = %e, "accept 失败");
+                        warn!(%addr, error = %e, "accept 失败");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
-                let site = Arc::clone(&site);
-                let tls = Arc::clone(&tls);
+
+                // 每次 accept 都读一次活配置。查不到 = 这个端口已被 `sync` 摘掉，
+                // 但它这个循环还没收到 cancel（几微秒的窗口）——让出一下即可。
+                let Some(site) = shared.site(addr) else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let tls = shared.tls_config();
+                let handshake_timeout = shared.handshake_timeout();
                 let metrics = Arc::clone(&metrics);
+
                 tokio::spawn(async move {
                     if let Err(e) = serve_conn(site.as_ref(), tcp, peer, tls, handshake_timeout, metrics).await {
                         // 握手失败是**常态**（端口扫描器、健康检查探活、客户端

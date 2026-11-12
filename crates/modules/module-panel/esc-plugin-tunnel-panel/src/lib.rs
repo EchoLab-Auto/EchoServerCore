@@ -247,9 +247,10 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/spokes/kick", post(api_kick))
         .route("/api/export", get(api_export))
         // ── 边缘路由（可能不存在：未启用插件时全部返回 501）────────────
-        // TLS 终结层。**只读**：证书与端口改动要重启宿主（见 docs/TLS-MODULE.md），
-        // 所以这里只有 GET，没有写接口。
+        // TLS 终结层：读状态 + 提交整份配置。语义校验与热切换都在宿主侧，
+        // 这里只转发（形状检查见 api_tls_apply）。
         .route("/api/tls", get(api_tls_status))
+        .route("/api/tls/config", post(api_tls_apply))
         .route("/api/edge", get(api_edge_status))
         .route("/api/edge/routes", post(api_edge_upsert))
         .route(
@@ -407,6 +408,42 @@ async fn api_export(
 async fn api_tls_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         st.backend.call_tls(method::TLS_STATUS, Value::Null).await?,
+    ))
+}
+
+/// `POST /api/tls/config`：提交**整份** TLS 配置（校验 → 热切换 → 落盘）。
+///
+/// 为什么是整份而不是逐条 upsert：站点之间存在约束（端口不能重复、上游不能指回
+/// 自己、`defaults.cert` 必须指向存在的证书），逐条提交会让中间态非法，而合法的
+/// 中间态又不知道按哪一版校验。
+///
+/// 这里只做**形状**检查（缺字段、类型不对能早点点名）。语义校验在 `esc.tls` 的
+/// `validate()` 里 —— 那里能一次把一批问题全列出来，比这里逐条拦好读。也正因
+/// 如此，本文件不复制任何 TLS 的配置知识。
+async fn api_tls_apply(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if !body.is_object() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "请求体必须是一个对象：{ defaults, cert, site }".into(),
+        ));
+    }
+    for key in ["cert", "site"] {
+        match body.get(key) {
+            None => {}
+            Some(v) if v.is_array() => {}
+            Some(_) => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("{key} 必须是数组"),
+                ))
+            }
+        }
+    }
+    Ok(Json(
+        st.backend.call_tls(method::TLS_CONFIG_APPLY, body).await?,
     ))
 }
 

@@ -15,7 +15,8 @@ pub use dispatch::{
 pub use model::{
     ControlError, EdgeRoute, EdgeRouteUpsert, EdgeRouterCounters, EdgeRouterStatus, EngineStatus,
     ErrorKind, ExportedConfig, Mapping, MappingState, MappingStats, MappingUpsert, MappingView,
-    Role, SpokeView, TlsCertInfo, TlsCounters, TlsSite, TlsStatus,
+    Role, SpokeView, TlsApplyOutcome, TlsCertInfo, TlsCertInput, TlsConfigInput, TlsCounters,
+    TlsDefaultsInput, TlsSite, TlsSiteInput, TlsStatus,
 };
 pub use plugin_tree::{
     PluginTreeNode, PluginTreeSnapshot, PLUGIN_TREE_METHOD, PLUGIN_TREE_SERVICE,

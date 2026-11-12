@@ -22,6 +22,7 @@ rustls = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 # esc-gateway 也是直接声明这两个：它们只在这里用，进 workspace 反而多一层间接。
 bytes = "1"

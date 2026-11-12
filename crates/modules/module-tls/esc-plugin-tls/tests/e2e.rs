@@ -14,9 +14,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use esc_control_api::{TlsCertInput, TlsConfigInput, TlsControl, TlsDefaultsInput, TlsSiteInput};
 use esc_plugin_tls::certs::{self, CertStore};
-use esc_plugin_tls::config::{Action, CertConfig, Site};
-use esc_plugin_tls::control::Metrics;
+use esc_plugin_tls::config::{Action, CertConfig, Defaults, Site, SiteConfig, TlsModuleConfig};
+use esc_plugin_tls::control::{Metrics, Runtime};
 use esc_plugin_tls::serve;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -796,4 +797,296 @@ async fn alpn_negotiates_http11_only() {
         Some(b"http/1.1".as_slice()),
         "服务端只该接受 http/1.1"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 运行期改配置：不重启宿主
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 下面这几条针对的是这一版新增的能力：面板上「保存」之后，配置要**立刻**生效，
+// 且失败时不能留下半成品。单元测试能证明"投影对了""往返无损"，但证明不了
+// 「换上游之后同一端口上的下一个连接真的走新上游」—— 那必须真握手、真转发。
+
+/// 起一个只回一个固定字符串的上游，用来判断"这次请求走到了哪个后端"。
+async fn started_tagged_upstream(tag: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |_req: Request<Incoming>| async move {
+                            Ok::<_, std::convert::Infallible>(Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from_static(
+                                    tag.as_bytes(),
+                                )),
+                            ))
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// 探一个当前空闲的端口（bind 后立刻释放）。
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+fn one_site_cfg(
+    cert: &SelfSigned,
+    listen: &[String],
+    upstream: SocketAddr,
+) -> TlsModuleConfig {
+    TlsModuleConfig {
+        defaults: Defaults::default(),
+        cert: vec![CertConfig {
+            name: "self".into(),
+            cert: cert.cert_path.clone(),
+            key: cert.key_path.clone(),
+            sni: vec![],
+        }],
+        site: vec![SiteConfig {
+            name: "app".into(),
+            listen: listen.to_vec(),
+            upstream: Some(upstream.to_string()),
+            redirect: None,
+            websocket: false,
+            log_query: false,
+            read_timeout_secs: 30,
+            max_body_bytes: None,
+            hsts: None,
+        }],
+        store: None,
+    }
+}
+
+/// 起一个 Runtime（真绑端口、真读证书），返回它与它实际监听的地址。
+///
+/// 配置里用 `:0`，拿到真实端口再重建一份 —— 后续 `apply` 必须带真实端口，
+/// 否则 `sync` 会以为"要新增一个 :0 端口"。
+async fn start_runtime(cert: &SelfSigned, listen: &str, upstream: SocketAddr) -> (Arc<Runtime>, SocketAddr) {
+    let cfg = one_site_cfg(cert, &[listen.to_string()], upstream);
+    let rt = Runtime::start(cfg, Metrics::new(), None).expect("Runtime 应能启动");
+    let addr = rt.addrs()[0];
+    (rt, addr)
+}
+
+/// 只换上游：**监听 socket 不动**，下一个连接就走新后端。
+///
+/// 这是「面板保存后不中断连接」的核心承诺。断了的话表现是：保存一次，正在用的
+/// 人页面闪一下"连接已断开"—— 那种抖动会让人不敢在面板上改配置。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applying_a_new_upstream_keeps_the_port_open() {
+    let cert = self_signed("swap.example");
+    let a = started_tagged_upstream("A").await;
+    let b = started_tagged_upstream("B").await;
+
+    let (rt, addr) = start_runtime(&cert, "127.0.0.1:0", a).await;
+    let connector = client_trusting(&cert.cert_pem);
+
+    let (st, body, _) = get(addr, "swap.example", &connector, "/", &[]).await;
+    assert_eq!(st, 200);
+    assert_eq!(body, "A");
+
+    // 换成 B，监听地址不变
+    let outcome = rt
+        .apply_config(TlsConfigInput {
+            defaults: TlsDefaultsInput::default(),
+            cert: vec![TlsCertInput {
+                name: "self".into(),
+                cert: cert.cert_path.display().to_string(),
+                key: cert.key_path.display().to_string(),
+                sni: vec![],
+            }],
+            site: vec![TlsSiteInput {
+                name: "app".into(),
+                listen: vec![addr.to_string()],
+                upstream: Some(b.to_string()),
+                redirect: None,
+                websocket: false,
+                log_query: false,
+                read_timeout_secs: 30,
+                max_body_bytes: None,
+                hsts: None,
+            }],
+        })
+        .await
+        .expect("换上游不该失败");
+
+    assert!(outcome.rebound.is_empty(), "没有端口变动，不该重绑: {:?}", outcome.rebound);
+    assert_eq!(outcome.released.len(), 0);
+    assert_eq!(outcome.unchanged, 1);
+    assert_eq!(rt.addrs(), vec![addr], "监听地址不该变");
+
+    let (st, body, _) = get(addr, "swap.example", &connector, "/", &[]).await;
+    assert_eq!(st, 200);
+    assert_eq!(body, "B", "同一端口上的下一个连接必须走新上游");
+}
+
+/// 加一个端口、再摘掉一个端口。
+///
+/// 顺序是「先绑新增 → 换配置 → 停移除」，所以新端口在旧端口关掉之前就已经能用了。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn applying_new_ports_binds_then_releases() {
+    let cert = self_signed("ports.example");
+    let up = started_tagged_upstream("UP").await;
+
+    let (rt, first) = start_runtime(&cert, "127.0.0.1:0", up).await;
+    let second: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let connector = client_trusting(&cert.cert_pem);
+
+    // ── 加端口 ──
+    let outcome = rt
+        .apply_config(TlsConfigInput {
+            defaults: TlsDefaultsInput::default(),
+            cert: vec![TlsCertInput {
+                name: "self".into(),
+                cert: cert.cert_path.display().to_string(),
+                key: cert.key_path.display().to_string(),
+                sni: vec![],
+            }],
+            site: vec![TlsSiteInput {
+                name: "app".into(),
+                listen: vec![first.to_string(), second.to_string()],
+                upstream: Some(up.to_string()),
+                redirect: None,
+                websocket: false,
+                log_query: false,
+                read_timeout_secs: 30,
+                max_body_bytes: None,
+                hsts: None,
+            }],
+        })
+        .await
+        .expect("加端口不该失败");
+
+    assert_eq!(outcome.rebound, vec![second.to_string()], "只该绑新端口");
+    assert_eq!(outcome.unchanged, 1, "旧端口不该动");
+    let mut want = vec![first, second];
+    want.sort();
+    assert_eq!(rt.addrs(), want);
+    assert_eq!(get(second, "ports.example", &connector, "/", &[]).await.1, "UP");
+
+    // ── 摘掉旧端口 ──
+    let outcome = rt
+        .apply_config(TlsConfigInput {
+            defaults: TlsDefaultsInput::default(),
+            cert: vec![TlsCertInput {
+                name: "self".into(),
+                cert: cert.cert_path.display().to_string(),
+                key: cert.key_path.display().to_string(),
+                sni: vec![],
+            }],
+            site: vec![TlsSiteInput {
+                name: "app".into(),
+                listen: vec![second.to_string()],
+                upstream: Some(up.to_string()),
+                redirect: None,
+                websocket: false,
+                log_query: false,
+                read_timeout_secs: 30,
+                max_body_bytes: None,
+                hsts: None,
+            }],
+        })
+        .await
+        .expect("摘端口不该失败");
+
+    assert_eq!(outcome.released, vec![first.to_string()]);
+    assert_eq!(rt.addrs(), vec![second]);
+    // 旧端口连不上了
+    assert!(
+        TcpStream::connect(first).await.is_err(),
+        "摘掉的端口不该还能连"
+    );
+}
+
+/// 非法配置：**一个字节都不改**，旧配置继续跑。
+///
+/// 这条比前两条更重要。面板上改配置很容易手滑（端口重复、上游指回自己），
+/// 如果「保存失败」顺带把监听停了，那就是「点错一下，线上全挂」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_config_leaves_the_running_one_untouched() {
+    let cert = self_signed("reject.example");
+    let up = started_tagged_upstream("STILL-WORKS").await;
+
+    let (rt, addr) = start_runtime(&cert, "127.0.0.1:0", up).await;
+    let connector = client_trusting(&cert.cert_pem);
+
+    // 上游指回自己的监听端口 —— 必然 502，validate 会拒
+    let bad = TlsConfigInput {
+        defaults: TlsDefaultsInput::default(),
+        cert: vec![TlsCertInput {
+            name: "self".into(),
+            cert: cert.cert_path.display().to_string(),
+            key: cert.key_path.display().to_string(),
+            sni: vec![],
+        }],
+        site: vec![TlsSiteInput {
+            name: "app".into(),
+            listen: vec![addr.to_string()],
+            upstream: Some(addr.to_string()), // ← 自环
+            redirect: None,
+            websocket: false,
+            log_query: false,
+            read_timeout_secs: 30,
+            max_body_bytes: None,
+            hsts: None,
+        }],
+    };
+
+    let err = rt.apply_config(bad).await.expect_err("自环配置必须被拒");
+    assert!(
+        err.message.contains("指回了 TLS 终结自己"),
+        "错误信息要点名问题: {}",
+        err.message
+    );
+
+    // 旧配置继续跑
+    assert_eq!(rt.addrs(), vec![addr]);
+    let (st, body, _) = get(addr, "reject.example", &connector, "/", &[]).await;
+    assert_eq!(st, 200);
+    assert_eq!(body, "STILL-WORKS", "拒绝之后旧上游必须还在服务");
+}
+
+/// 证书路径写错：也要拒绝，且不换掉正在用的证书。
+///
+/// 与上一条同类但触发点不同（在读盘这一步），值得单独覆盖：如果它在 `sync`
+/// 之后才报错，端口就已经被重绑过一次了。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_certificate_is_rejected_before_touching_ports() {
+    let cert = self_signed("nocert.example");
+    let up = started_tagged_upstream("OK").await;
+    let (rt, addr) = start_runtime(&cert, "127.0.0.1:0", up).await;
+    let connector = client_trusting(&cert.cert_pem);
+
+    let err = rt
+        .apply_config(TlsConfigInput {
+            defaults: TlsDefaultsInput::default(),
+            cert: vec![TlsCertInput {
+                name: "self".into(),
+                cert: "/nonexistent/does-not-exist.crt".into(),
+                key: "/nonexistent/does-not-exist.key".into(),
+                sni: vec![],
+            }],
+            site: vec![],
+        })
+        .await
+        .expect_err("证书不存在必须被拒");
+    assert!(!err.message.is_empty(), "要有一句能看懂的话");
+
+    // 旧证书、旧端口都还在
+    let (st, body, _) = get(addr, "nocert.example", &connector, "/", &[]).await;
+    assert_eq!(st, 200);
+    assert_eq!(body, "OK");
 }

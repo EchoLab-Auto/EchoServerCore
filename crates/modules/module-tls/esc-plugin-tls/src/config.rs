@@ -24,10 +24,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// 一整份模块配置。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsModuleConfig {
     /// 全局默认值。省略时用 [`Defaults::default`]。
@@ -39,17 +39,25 @@ pub struct TlsModuleConfig {
     /// 监听端口 + 转发规则。
     #[serde(default)]
     pub site: Vec<SiteConfig>,
+    /// 运行期改动的**落盘位置**（面板保存时写这里）。
+    ///
+    /// 省略 = 只改内存：面板保存成功、重启后回到 `host.toml` 的基线。这个取舍与
+    /// `esc.edge-router` 的 `store` 一致 —— 状态文件必须落在
+    /// `StateDirectory=` 覆盖的目录里（通常是 `/var/lib/esc/tls.toml`），
+    /// 而 `/etc/esc` 在宿主的沙箱下是只读的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<PathBuf>,
 }
 
 /// 全局默认值。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// SNI 没匹配上时用哪张证书（按 `[[cert]].name` 引用）。
     ///
     /// 省略 = 用第一张。一份证书都没有时挂载直接失败 —— 一个「端口开着但握手
     /// 永远失败」的 TLS 终结器比没起来更难查。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert: Option<String>,
     /// 允许 TLS 1.2。默认 `true`，与 nginx 那份配置一致。
     ///
@@ -99,7 +107,7 @@ fn default_handshake_timeout() -> u64 {
 }
 
 /// 一张证书。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertConfig {
     /// 引用名，`defaults.cert` 与 `site.cert` 用它指过来。
@@ -121,7 +129,7 @@ pub struct CertConfig {
 /// `name` 必须唯一：它出现在日志、错误信息、以及（将来）控制面的标识里。
 /// 不用端口号当标识是因为端口会变，而日志里一句 `site=panel` 比
 /// `site=0.0.0.0:2222` 好认。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteConfig {
     pub name: String,
@@ -130,7 +138,7 @@ pub struct SiteConfig {
     #[serde(deserialize_with = "string_or_vec")]
     pub listen: Vec<String>,
     /// 明文转发目标，如 `127.0.0.1:18790`。与 `redirect` 二选一。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
     /// 301 跳转目标模板，如 `https://{host}:2224{uri}`。与 `upstream` 二选一。
     ///
@@ -140,7 +148,7 @@ pub struct SiteConfig {
     /// 要「跳到另一个端口」时用 `{hostname}` —— nginx 的 `$host` 不含端口，
     /// 而 `{host}` 是**含**端口的（对应 nginx 的 `$http_host`）。写成
     /// `https://{host}:2224{uri}` 会拼出 `https://x:2223:2224/…`。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect: Option<String>,
     /// 透传 WebSocket 升级。默认 `false` —— 显式打开，因为「能升级」意味着这条
     /// 链路可以被用来跑任意长连接，不该是默认行为。
@@ -157,10 +165,10 @@ pub struct SiteConfig {
     #[serde(default = "default_upstream_timeout")]
     pub read_timeout_secs: u64,
     /// 这个端口的请求体上限，覆盖 `defaults.max_body_bytes`。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<u64>,
     /// 这个端口是否发 HSTS，覆盖 `defaults.hsts`。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hsts: Option<bool>,
 }
 
@@ -341,6 +349,32 @@ impl TlsModuleConfig {
             }
         }
 
+        // ── 上游指回自己：必然 502，而且启动时完全看不出来 ────────────────────
+        //
+        // 这种配置 bind 会成功、TCP 也能连上，只是那个端口在等 ClientHello 而代理
+        // 发过去的是明文 HTTP —— 第一次请求就断，面板上表现为「站点在、但每个
+        // 请求都 502」。实测一次请求会让 `upstream_errors` 与 `handshake_failures`
+        // 同时 +1，这是自环独有的特征。
+        //
+        // 判定用「同端口 + 地址相互可达」：`0.0.0.0:2222` 占用了本机所有 IP 的
+        // 2222，所以连 `127.0.0.1:2222` 就是连到自己。
+        let listens: Vec<(SocketAddr, String)> =
+            sites.iter().map(|s| (s.addr, s.name.clone())).collect();
+        for s in &sites {
+            let Action::Proxy(up) = &s.action else { continue };
+            for (addr, owner) in &listens {
+                if !loops_back_to_self(addr, up) {
+                    continue;
+                }
+                errors.push(format!(
+                    "site {:?}: upstream {up} 指回了 TLS 终结自己的监听端口（site {owner:?} 在 {addr} 上）\
+                     —— 那个端口在等 TLS 握手，代理发过去的是明文 HTTP，每个请求都会 502。\
+                     要转发到本机服务，请填那个服务自己的端口。",
+                    s.name
+                ));
+            }
+        }
+
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -362,6 +396,22 @@ pub struct Validated {
     pub tls12: bool,
     pub handshake_timeout: std::time::Duration,
     pub sites: Vec<Site>,
+}
+
+/// 从监听地址 `listen` 连过去会不会连到自己？
+///
+/// * 端口不同 → 一定是别的服务；
+/// * 监听通配地址（`0.0.0.0` / `::`）→ 占用了本机所有 IP 的这个端口，所以同端口
+///   的任意本机地址都是自己；
+/// * `127.0.0.1` 与 `::1` → 同一个 loopback，同端口互为自己。
+fn loops_back_to_self(listen: &SocketAddr, target: &SocketAddr) -> bool {
+    if listen.port() != target.port() {
+        return false;
+    }
+    if listen.ip().is_unspecified() || listen.ip() == target.ip() {
+        return true;
+    }
+    listen.ip().is_loopback() && target.ip().is_loopback()
 }
 
 fn keys(map: &BTreeMap<String, ()>) -> String {
@@ -459,6 +509,68 @@ mod tests {
         );
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("什么都不做")), "{errs:?}");
+    }
+
+    /// upstream 指回自己的监听端口：必然 502，必须在配置阶段拦下。
+    ///
+    /// 这种配置 bind 成功、TCP 也连得上，只是那个端口在等 ClientHello 而代理发
+    /// 过去的是明文 HTTP。表现是「站点在、每个请求都 502」—— 事后排查要绕一大圈，
+    /// 而在这里只是一句话。
+    #[test]
+    fn upstream_pointing_at_itself_is_rejected() {
+        let cfg = parse(
+            r#"{
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [{"name":"loop","listen":"127.0.0.1:2222","upstream":"127.0.0.1:2222"}]
+            }"#,
+        );
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("指回了 TLS 终结自己")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("502")), "错误信息要说清后果: {errs:?}");
+    }
+
+    /// 通配监听覆盖本机所有 IP，所以 `127.0.0.1` 回连同端口也是自环。
+    #[test]
+    fn wildcard_listen_makes_loopback_upstream_a_loop() {
+        let cfg = parse(
+            r#"{
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [{"name":"loop","listen":"0.0.0.0:2222","upstream":"127.0.0.1:2222"}]
+            }"#,
+        );
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("指回了 TLS 终结自己")), "{errs:?}");
+    }
+
+    /// 跨站点也算：A 的上游是 B 的监听端口，同样连到的是 TLS 那一侧。
+    #[test]
+    fn upstream_pointing_at_another_site_is_rejected() {
+        let cfg = parse(
+            r#"{
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [
+                {"name":"a","listen":"127.0.0.1:2222","upstream":"127.0.0.1:2223"},
+                {"name":"b","listen":"127.0.0.1:2223","upstream":"127.0.0.1:8080"}
+              ]
+            }"#,
+        );
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("指回了 TLS 终结自己")), "{errs:?}");
+    }
+
+    /// 不同端口就是正常配置 —— 别把这条检查做成"任何上游都拒"。
+    #[test]
+    fn upstream_on_other_port_is_fine() {
+        let cfg = parse(
+            r#"{
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [
+                {"name":"panel","listen":"0.0.0.0:2222","upstream":"127.0.0.1:18790"},
+                {"name":"admin","listen":"0.0.0.0:2226","upstream":"127.0.0.1:18786"}
+              ]
+            }"#,
+        );
+        cfg.validate().expect("正常配置不该被拦");
     }
 
     /// 主机名当 upstream 是常见错误：解析需要 DNS，而这里只接受已解析的 SocketAddr。

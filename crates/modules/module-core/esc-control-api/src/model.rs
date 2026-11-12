@@ -319,10 +319,23 @@ pub struct TlsStatus {
     #[serde(default)]
     pub default_cert: Option<String>,
     /// 是否允许 TLS 1.2。
+    ///
+    /// 与 [`TlsDefaultsView::tls12`] 是同一个值，保留它是为了不破坏老面板的
+    /// 反序列化。新代码请读 `defaults.tls12`。
     #[serde(default)]
     pub tls12: bool,
     #[serde(default)]
     pub counters: TlsCounters,
+    /// 面板编辑用的**原始配置**：形状与 `tls.config.apply` 的入参**完全一致**。
+    ///
+    /// 为什么不给一堆 `defaults.*` 平铺字段、让面板自己拼：上面的展示字段已经
+    /// 合并过默认值、把 `upstream`/`redirect` 拼成了 `target`，从它们反推会把
+    /// 「继承默认」写成「显式指定」（同一个数字，语义变了——改默认值不再影响
+    /// 这个站点）。另外**私钥路径不在展示字段里**，不给原始配置就没法编辑证书。
+    ///
+    /// 面板的用法是：`structuredClone(status.config)` → 改 → 原样 POST 回去。
+    #[serde(default)]
+    pub config: TlsConfigInput,
 }
 
 /// 一个 TLS 终结站点（一个监听端口）。
@@ -383,6 +396,173 @@ pub struct TlsCounters {
     /// 因请求体超限被拒的次数。
     #[serde(default)]
     pub body_too_large: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS 终结：写请求（面板编辑证书与站点）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 与上面的 `TlsSite` / `TlsCertInfo` **分开定义**，而不是复用：
+//
+// * 读结构里是**派生字段**（`kind`、`target` 已经拼成字符串，`max_body_bytes` 是
+//   合并默认后的生效值）；写结构要的是**原始字段**（`upstream` / `redirect` 两个
+//   Option，`max_body_bytes` 是可继承的 Option）。混用会让"把 status 改一改发
+//   回来"变成一件要推理的事。
+// * 读结构承诺稳定，写结构随"允许改什么"变化。分开才好各自演化。
+//
+// 这里**不加** `deny_unknown_fields`：面板很可能把 status 里的一条原样带回来
+// （多出 `kind` / `default` 之类），宽容忽略比报 "unknown field `kind`" 友好。
+// 真正的字段校验在插件侧——那里面对的是 TOML，拼错必须报错。
+
+/// 一张证书的输入。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsCertInput {
+    /// 引用名。`defaults.cert` 与站点按它互相指认。
+    pub name: String,
+    /// PEM 证书链路径（叶子在前，中间证书在后）。
+    pub cert: String,
+    /// PEM 私钥路径。
+    pub key: String,
+    /// 这张证书服务哪些 SNI 名字。空 = 只作默认证书用。
+    #[serde(default)]
+    pub sni: Vec<String>,
+}
+
+/// 一个站点的输入。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsSiteInput {
+    pub name: String,
+    /// 监听地址。一个或多个（同一后端挂多个端口，例如 443 与 2224）。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub listen: Vec<String>,
+    /// 明文转发目标，如 `127.0.0.1:18790`。与 `redirect` 二选一。
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// 301 目标模板，如 `https://{hostname}:2224{uri}`。与 `upstream` 二选一。
+    #[serde(default)]
+    pub redirect: Option<String>,
+    #[serde(default)]
+    pub websocket: bool,
+    #[serde(default)]
+    pub log_query: bool,
+    /// 等上游响应的超时，秒。缺省 300；最小 1（0 不会被解释成"不限制"）。
+    #[serde(default = "default_read_timeout")]
+    pub read_timeout_secs: u64,
+    /// 这个端口的请求体上限，覆盖 `defaults.max_body_bytes`。`None` = 继承。
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+    /// 这个端口是否发 HSTS，覆盖 `defaults.hsts`。`None` = 继承。
+    #[serde(default)]
+    pub hsts: Option<bool>,
+}
+
+/// `defaults` 段的输入。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsDefaultsInput {
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default = "yes")]
+    pub tls12: bool,
+    #[serde(default = "default_body_limit")]
+    pub max_body_bytes: u64,
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+    #[serde(default)]
+    pub hsts: bool,
+}
+
+impl Default for TlsDefaultsInput {
+    fn default() -> Self {
+        Self {
+            cert: None,
+            tls12: true,
+            max_body_bytes: default_body_limit(),
+            handshake_timeout_secs: default_handshake_timeout(),
+            hsts: false,
+        }
+    }
+}
+
+/// 整份配置 —— `tls.config.apply` 的入参。
+///
+/// 一次提交**整份**而不是逐条 upsert，是刻意的：站点之间有约束（端口不能重复、
+/// 自环要拒、`defaults.cert` 必须指向存在的证书），逐条提交会让中间态非法，
+/// 而合法的中间态又不知该按哪一版校验。整份提交 = 一次校验 = 一次热切换。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsConfigInput {
+    #[serde(default)]
+    pub defaults: TlsDefaultsInput,
+    #[serde(default)]
+    pub cert: Vec<TlsCertInput>,
+    #[serde(default)]
+    pub site: Vec<TlsSiteInput>,
+}
+
+/// `tls.config.apply` 的结果。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsApplyOutcome {
+    /// 应用之后的**实际**状态（与 `tls.status` 同形）。
+    ///
+    /// 回给调用方而不是让它再查一次：中间若有人又改了一次，两次结果会不一致。
+    #[serde(default)]
+    pub status: TlsStatus,
+    /// 这次新绑定（或重绑）的监听地址。
+    #[serde(default)]
+    pub rebound: Vec<String>,
+    /// 这次关掉的监听地址。
+    #[serde(default)]
+    pub released: Vec<String>,
+    /// 完全没动的端口数 —— 面板用它说明"其余 N 个端口未受影响"。
+    #[serde(default)]
+    pub unchanged: usize,
+    /// 落盘路径。`None` = **没有写盘**（没配 `store`，或写盘失败——见 `warn`）。
+    ///
+    /// 面板必须把它显示出来：不然「保存成功了」和「重启后没了」之间的落差
+    /// 要等到重启那天才发现。
+    #[serde(default)]
+    pub store: Option<String>,
+    /// 需要当场告诉用户的坏消息。
+    ///
+    /// 目前只有一种：配置**已经在运行期生效**，但写盘失败。这时候返回 `Err`
+    /// 是错的（用户会以为没生效，再点一次），返回纯成功也是错的（重启就丢）。
+    /// 所以带上这句话，让面板原样显示。
+    #[serde(default)]
+    pub warn: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_body_limit() -> u64 {
+    12 * 1024 * 1024
+}
+
+fn default_handshake_timeout() -> u64 {
+    10
+}
+
+fn default_read_timeout() -> u64 {
+    300
+}
+
+/// `listen = "0.0.0.0:1"` 与 `listen = ["0.0.0.0:1", "0.0.0.0:2"]` 都接受。
+///
+/// 手写 curl 时人人都会写成字符串；面板发的是数组。两种都收，省一次往返。
+fn one_or_many<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// 引擎侧的错误。用字符串是为了能跨进程边界无损传递。
