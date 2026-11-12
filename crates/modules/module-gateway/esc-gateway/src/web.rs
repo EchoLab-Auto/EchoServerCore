@@ -18,6 +18,17 @@
 //!
 //! 留下的这两个页面仍然**单文件内联、零外部资源**：如果登录页依赖 CDN 上的字体
 //! 或脚本，那么在网络受限的机器上就白屏——而那正是你需要登录进去改配置的时候。
+//!
+//! # 样式为什么是手写的一份 `STYLE`
+//!
+//! 登录页是用户看到的**第一屏**，紧接着就是 Vue 面板。两个界面风格不接续，观感上
+//! 就是"跳"了一下。所以 `STYLE` 逐值复刻了 `vendor/ui-frame/src/styles/tokens.scss`
+//! 里 `[data-theme='dark']` 的那套新拟态令牌（背景 `#1c1c1c`、主色 `#cdfa4e`、
+//! 双向阴影、8/24px 圆角），而不是自己另起一套配色。
+//!
+//! 手写而不是引 Vue 组件库，是因为这一刻前端还没跑起来（见上一段）。
+//! **代价是这份 CSS 会漂移**：改 `tokens.scss` 的暗色值时要回来同步这几个变量。
+//! 判断标准很简单——登录页与面板并排放，两者之间不该有可见的色差。
 
 use serde::Serialize;
 
@@ -30,90 +41,108 @@ fn esc(s: &str) -> String {
 }
 
 const STYLE: &str = r#"
-:root{--bg:#0e1116;--bg2:#161b22;--bg3:#1c2230;--line:#252d3a;
-  --fg:#d7dee8;--fg2:#8b98a9;--fg3:#5b6675;--err:#f85149;--info:#58a6ff;
-  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace}
+/* 与 ui-frame 的 dark 主题（`tokens.scss` 的 [data-theme=dark]）逐值对齐。
+   登录页是用户看到的第一屏，颜色/圆角/阴影跟面板对不上就会"咔"一下。
+   —— 值来自 vendor/ui-frame，改那边时这里要跟着改。 */
+:root{
+  --nm-bg-color:#1c1c1c;
+  --nm-text-primary:#c0c0c0;
+  --nm-text-secondary:#999999;
+  --nm-text-placeholder:#777777;
+  --nm-primary-color:#cdfa4e;
+  --nm-text-on-primary:#000000;
+  --nm-color-error:#f85149;
+  --nm-color-info:#58a6ff;
+  --nm-shadow-dark:rgba(0,0,0,.5);
+  --nm-shadow-light:rgba(255,255,255,.14);
+  --nm-shadow-dark-strong:rgba(0,0,0,.6);
+  --nm-shadow-light-strong:rgba(255,255,255,.18);
+  --nm-radius-sm:8px;
+  --nm-radius-lg:24px;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
 *{box-sizing:border-box}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);min-height:100%;
-  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-body{display:flex;align-items:center;justify-content:center;padding:24px}
-.card{width:100%;max-width:380px;background:var(--bg2);border:1px solid var(--line);
-  border-radius:12px;padding:26px 26px 22px;box-shadow:0 18px 50px #000000aa}
-h1{font-size:17px;margin:0 0 4px;font-weight:600;letter-spacing:.2px}
-.sub{font-size:12.5px;color:var(--fg2);margin:0 0 20px}
-.sub code{font-family:var(--mono);background:var(--bg3);padding:1px 6px;border-radius:4px;
-  border:1px solid var(--line)}
-label{display:block;font-size:12px;color:var(--fg2);margin:0 0 5px}
-input{width:100%;font:inherit;background:#0a0d12;color:var(--fg);
-  border:1px solid var(--line);border-radius:7px;padding:9px 11px;margin-bottom:14px}
-input:focus{outline:none;border-color:#3d6fd4;box-shadow:0 0 0 3px #3d6fd422}
-button{width:100%;font:inherit;font-weight:500;cursor:pointer;color:#fff;
-  background:#1f6feb;border:1px solid #1f6feb;border-radius:7px;padding:9px 12px;transition:.15s}
-button:hover{background:#2a7cf5}
-.err{background:#f8514914;border:1px solid #f8514944;color:#ff9d97;border-radius:7px;
-  padding:9px 12px;font-size:12.5px;margin:0 0 16px}
-.foot{margin-top:16px;font-size:11.5px;color:var(--fg3);text-align:center}
-.detail{font-size:13px;color:var(--fg2);line-height:1.65}
-.detail code{font-family:var(--mono);background:var(--bg3);padding:1px 6px;border-radius:4px;
-  border:1px solid var(--line)}
-a{color:var(--info)}
-/* ── 管理面板 ── */
-body.wide{display:block;padding:0}
-.wrap{max-width:980px;margin:0 auto;padding:22px 20px 60px}
-.top{display:flex;align-items:center;gap:14px;padding:14px 20px;background:var(--bg2);
-  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
-.brand{font-weight:600;font-size:14.5px;margin-right:6px}
-.nav{display:flex;gap:2px;flex-wrap:wrap}
-.nav a{padding:6px 11px;border-radius:7px;font-size:13px;color:var(--fg2);text-decoration:none}
-.nav a:hover{background:var(--bg3);color:var(--fg)}
-.nav a.on{background:#1f6feb22;color:#7cb0ff}
-.who{margin-left:auto;font-size:12.5px;color:var(--fg2);display:flex;gap:12px;align-items:center}
-h2{font-size:16px;margin:22px 0 12px;font-weight:600}
-h2:first-of-type{margin-top:4px}
-.banner{border-radius:8px;padding:10px 13px;font-size:12.5px;margin:0 0 14px;line-height:1.6}
-.banner.warn{background:#bb800914;border:1px solid #bb800944;color:#e3b341}
-.banner.err{background:#f8514914;border:1px solid #f8514944;color:#ff9d97}
-.banner.ok{background:#3fb95014;border:1px solid #3fb95044;color:#7ee787}
-.banner code{font-family:var(--mono);background:#00000044;padding:1px 5px;border-radius:4px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;font-weight:500;color:var(--fg2);font-size:11.5px;letter-spacing:.4px;
-  text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line)}
-td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tbody tr:hover{background:#ffffff05}
-.mono{font-family:var(--mono);font-size:12.5px}
-.dim{color:var(--fg2)}
-.badge{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:99px;
-  border:1px solid var(--line);color:var(--fg2);margin-left:6px;white-space:nowrap}
-.badge.adm{background:#1f6feb1a;border-color:#1f6feb55;color:#7cb0ff}
-.badge.ro{background:#bb80091a;border-color:#bb800955;color:#e3b341}
-.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.btn{font:inherit;font-size:12.5px;cursor:pointer;color:var(--fg);background:var(--bg3);
-  border:1px solid var(--line);border-radius:7px;padding:6px 11px;transition:.15s;width:auto}
-.btn:hover{border-color:#3d6fd4;color:#fff}
-.btn.pri{background:#1f6feb;border-color:#1f6feb;color:#fff}
-.btn.pri:hover{background:#2a7cf5}
-.btn.danger{color:#ff9d97;border-color:#f8514944}
-.btn.danger:hover{background:#f8514914;border-color:#f85149}
-.btn:disabled{opacity:.45;cursor:not-allowed}
-form.inline{display:inline}
-fieldset{border:1px solid var(--line);border-radius:9px;padding:14px 15px;margin:0 0 16px}
-legend{font-size:12px;color:var(--fg2);padding:0 6px}
-label.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);margin:0 0 8px}
-label.chk input{width:auto;margin:0}
-label.chk .mono{margin:0}
-.hint{font-size:11.5px;color:var(--fg3);line-height:1.6;margin:6px 0 0}
-.field{margin:0 0 14px}
-.field input[type=password],.field input[type=text]{margin-bottom:0}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:640px){.grid2{grid-template-columns:1fr}}
-.empty{color:var(--fg3);font-size:13px;padding:18px 0;text-align:center}
+html,body{margin:0;padding:0;min-height:100%}
+body{
+  background:var(--nm-bg-color);color:var(--nm-text-primary);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,
+    "PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  display:flex;align-items:center;justify-content:center;padding:28px 20px;
+}
+/* 新拟态靠双向阴影表达层次 —— 所以卡片**不描边**，描边会把它打回普通卡片 */
+.card{
+  width:100%;max-width:392px;background:var(--nm-bg-color);
+  border-radius:var(--nm-radius-lg);padding:30px 30px 26px;
+  box-shadow:10px 10px 22px var(--nm-shadow-dark),-10px -10px 22px var(--nm-shadow-light);
+}
+h1{font-size:17px;margin:0 0 5px;font-weight:600;letter-spacing:.2px}
+.sub{font-size:12.5px;color:var(--nm-text-secondary);margin:0 0 22px}
+.sub code,.detail code{
+  font-family:var(--mono);background:var(--nm-bg-color);padding:2px 7px;
+  border-radius:6px;box-shadow:inset 2px 2px 5px var(--nm-shadow-dark),inset -2px -2px 5px var(--nm-shadow-light);
+}
+label{display:block;font-size:12px;color:var(--nm-text-secondary);margin:0 0 6px}
+input{
+  width:100%;font:inherit;color:var(--nm-text-primary);
+  background:var(--nm-bg-color);border:0;border-radius:var(--nm-radius-sm);
+  padding:11px 13px;margin-bottom:16px;
+  box-shadow:inset 4px 4px 9px var(--nm-shadow-dark),inset -4px -4px 9px var(--nm-shadow-light);
+  transition:box-shadow .18s ease;
+}
+input::placeholder{color:var(--nm-text-placeholder)}
+/* 焦点：新拟态的阴影变化对高对比需求不够，额外套一圈主色 */
+input:focus{
+  outline:none;
+  box-shadow:inset 4px 4px 9px var(--nm-shadow-dark),inset -4px -4px 9px var(--nm-shadow-light),
+    0 0 0 2px var(--nm-primary-color);
+}
+button{
+  width:100%;font:inherit;font-weight:600;cursor:pointer;
+  color:var(--nm-text-on-primary);background:var(--nm-primary-color);
+  border:0;border-radius:var(--nm-radius-sm);padding:11px 14px;
+  box-shadow:5px 5px 12px var(--nm-shadow-dark-strong),-5px -5px 12px var(--nm-shadow-light-strong);
+  transition:transform .12s ease,box-shadow .12s ease,filter .12s ease;
+}
+@media(hover:hover){button:hover{filter:brightness(1.06)}}
+button:active{
+  transform:translateY(1px);
+  box-shadow:inset 3px 3px 8px rgba(0,0,0,.3),inset -3px -3px 8px rgba(255,255,255,.22);
+}
+button:focus-visible{outline:2px solid var(--nm-primary-color);outline-offset:3px}
+/* 错误条：照 NeumorphismAlert 的做法——红色文字 + 左侧实色竖线，底用内凹 */
+.err{
+  display:flex;gap:9px;align-items:flex-start;
+  color:var(--nm-color-error);font-size:12.5px;line-height:1.6;
+  border-radius:var(--nm-radius-sm);border-left:3px solid var(--nm-color-error);
+  padding:10px 13px;margin:0 0 16px;background:rgba(248,81,73,.08);
+}
+.err svg{flex:none;margin-top:2px}
+.foot{margin-top:18px;font-size:11.5px;color:var(--nm-text-placeholder);text-align:center;line-height:1.75}
+.detail{font-size:13px;color:var(--nm-text-secondary);line-height:1.7}
+a{color:var(--nm-color-info);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible{outline:2px solid var(--nm-primary-color);outline-offset:2px;border-radius:4px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
 "#;
 
 /// 登录页。
 pub fn login_page(title: &str, route: &str, next: &str, error: Option<&str>) -> String {
+    // 错误条照 NeumorphismAlert 的 error 变体：circle-close 图标 + 左竖线 + `role=alert`。
+    // 图标内联 SVG —— 这个页面不许有外部资源（网络受限时正是要登录进来改配置的时候）。
     let err_html = error
-        .map(|e| format!("<div class=\"err\">{}</div>", esc(e)))
+        .map(|e| {
+            format!(
+                concat!(
+                    r#"<div class="err" role="alert" aria-live="assertive">"#,
+                    r#"<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">"#,
+                    r#"<circle cx="8" cy="8" r="6.6" fill="none" stroke="currentColor" stroke-width="1.4"/>"#,
+                    r#"<path d="M5.7 5.7l4.6 4.6M10.3 5.7l-4.6 4.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>"#,
+                    r#"</svg><span>{}</span></div>"#
+                ),
+                esc(e)
+            )
+        })
         .unwrap_or_default();
     format!(
         r#"<!DOCTYPE html>

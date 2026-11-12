@@ -774,3 +774,62 @@ WS 真正升级要用带 `Upgrade` 头的请求验，`curl` 不带：
 启用令牌后，首次访问（`localStorage` 还空着）可能有**一个** `/api/upstreams`
 先于令牌播种发出而拿到 401；刷新一次即消失。属于对端面板前端的启动时序问题，
 不影响使用（下一次轮询会成功）。
+
+## 更新 cloud2 上的网关与面板（两个二进制，两种生效方式）
+
+`esc-gateway` 跑在容器里、`esc-server-panel` 跑在 systemd 下，更新路径不一样。
+在**本机**交叉编译完推过去（cloud2 上没有 Rust 工具链）：
+
+```bash
+cargo build --release -p esc-gateway -p esc-server-panel
+scp target/release/esc-gateway target/release/esc-server-panel cloud2:/root/
+```
+
+### 网关：必须**重建容器**，`docker restart` 不管用
+
+```bash
+# cloud2 上
+cd /root && printf 'FROM esc-gateway:fix\nCOPY esc-gateway /usr/local/bin/esc-gateway\n' > Dockerfile.gw
+docker tag esc-gateway:fix esc-gateway:before-$(date +%m%d-%H%M)    # 回滚点
+docker build -q -f Dockerfile.gw -t esc-gateway:fix /root
+
+docker stop esc-gateway && docker rm -f esc-gateway-old 2>/dev/null; docker rename esc-gateway esc-gateway-old
+docker run -d --name esc-gateway --network host --restart unless-stopped --user 65532:65532 \
+  -e RUST_LOG="info,esc_gateway=info" -e ESC_GATEWAY_CONFIG=/etc/esc/gateway.toml \
+  -v /var/lib/esc-gateway:/var/lib/esc-gateway \
+  -v /etc/esc/gateway.toml:/etc/esc/gateway.toml:ro \
+  esc-gateway:fix -c /etc/esc/gateway.toml
+```
+
+> **`docker restart esc-gateway` 换不了版本。** 容器在 `docker run` 那一刻就把
+> 镜像 ID 钉死了，重建镜像之后 restart 只是用旧层再起一次 —— 表现是「改了代码、
+> 重启了、行为没变」，很容易误判成改动没生效。必须是 stop → rename → run。
+>
+> 保留 `esc-gateway-old` 容器便于对日志；确认没问题后再 `docker rm`。
+
+**必须 `--network host`**：路由要转发到宿主机的 `127.0.0.1:18787`，bridge 网络里
+那个地址是容器自己。
+
+### 面板：换二进制 + restart
+
+```bash
+# cloud2 上
+cp -a /usr/local/libexec/esc/esc-server-panel /usr/local/libexec/esc/esc-server-panel.bak-$(date +%m%d-%H%M)
+install -o root -g root -m 755 /root/esc-server-panel /usr/local/libexec/esc/esc-server-panel
+systemctl restart esc-server-panel.service
+systemctl is-active esc-server-panel
+```
+
+面板的前端资源**编译期嵌在二进制里**（`esc-panel-web` 的 `web/` 目录，由
+`cargo test` 的 `artifacts_are_fresh` 守着），所以改前端也要换二进制——
+不是往某个目录拷 `dist/`。本机先 `cd crates/modules/module-panel/esc-panel-web/ui && npm run build`。
+
+### 验证
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18783/    # 401（未登录）
+docker logs --tail 5 esc-gateway                                    # gateway starting routes=2 users=1
+```
+
+浏览器侧至少走一遍登录 → 面板首页，确认新二进制真的生效（版本号看不出来，
+行为能看出来）。

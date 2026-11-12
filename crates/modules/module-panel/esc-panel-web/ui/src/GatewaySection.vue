@@ -354,7 +354,7 @@ onMounted(loadAll)
             <NeumorphismInput v-model="password.old" label="当前口令" type="password" />
             <NeumorphismInput v-model="password.pass" label="新口令" type="password" />
             <NeumorphismInput v-model="password.pass2" label="再输一次" type="password" />
-            <div v-if="formError" class="esc-hint" style="color: #dc2626">{{ formError }}</div>
+            <NeumorphismAlert v-if="formError" type="error" :message="formError" />
             <NeumorphismButton :disabled="!me.writable" @click="changePassword">保存新口令</NeumorphismButton>
             <p class="esc-hint">
               改完其他设备的会话会立刻失效。如果这个账号原本来自 <code>gateway.toml</code>，
@@ -377,7 +377,7 @@ onMounted(loadAll)
           placeholder="*"
         />
         <p class="esc-hint">当前可用端口：{{ (overview?.routes || []).map((r: any) => r.name).join('、') || '（没有）' }}</p>
-        <div v-if="formError" class="esc-hint" style="color: #dc2626">{{ formError }}</div>
+        <NeumorphismAlert v-if="formError" type="error" :message="formError" />
         <div class="esc-actions">
           <NeumorphismButton :disabled="saving" @click="saveUser">{{ saving ? '保存中…' : '保存' }}</NeumorphismButton>
           <NeumorphismButton variant="pressed" @click="editingUser = null">取消</NeumorphismButton>
@@ -394,7 +394,7 @@ onMounted(loadAll)
         <NeumorphismInput v-model="editingRoute.strip_prefix" label="剥离前缀（可选）" />
         <NeumorphismInput v-model="editingRoute.max_body_bytes" label="请求体上限（字节，留空 = 10 MB）" />
         <NeumorphismInput v-model="editingRoute.allowed_cidrs" label="来源白名单（一行一个或逗号分隔）" />
-        <div v-if="formError" class="esc-hint" style="color: #dc2626">{{ formError }}</div>
+        <NeumorphismAlert v-if="formError" type="error" :message="formError" />
         <div class="esc-actions">
           <NeumorphismButton :disabled="saving" @click="saveRoute">{{ saving ? '保存中…' : '保存' }}</NeumorphismButton>
           <NeumorphismButton variant="pressed" @click="editingRoute = null">取消</NeumorphismButton>
