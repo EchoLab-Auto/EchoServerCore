@@ -3103,3 +3103,119 @@ host = "b.example.com"
     .await;
     assert_eq!(r.status, 302, "浏览器访问命中的 host 应当跳登录页");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 主机内部隔离网段
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 归属网段的路由：真的绑在网段地址上，管理接口能报出网段与归属。
+///
+/// 这条测试覆盖的是「拓扑承诺」而不是某个函数：`build()` 允不允许这样写、
+/// 套接字能不能真绑上、面板看到的是不是同一件事。三处只要有一处对不上，
+/// 上线之后就是「配置说在网段里、实际监听在别处」。
+#[tokio::test]
+async fn segment_routes_bind_on_the_segment_address_and_are_reported() {
+    let (up, _u) = start_upstream().await;
+    let admin_port = pick_port();
+
+    let gw = start_gateway(up, move |c| {
+        c.admin_listen = Some(format!("127.0.0.1:{admin_port}"));
+        c.users_file = Some(std::path::PathBuf::from("/dev/null"));
+        c.segment = vec![esc_gateway::segment::SegmentConfig {
+            name: "edge".into(),
+            cidr: "127.213.0.0/16".into(),
+            note: Some("测试网段".into()),
+        }];
+        // 把 panel 那条挪进网段：端口不变、地址换成网段里的具体地址。
+        let port = c.route[0]
+            .listen
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
+        c.route[0].listen = format!("127.213.0.1:{port}");
+        c.route[0].segment = Some("edge".into());
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+
+    // ① 监听地址就是网段地址（不是 127.0.0.1，更不是 0.0.0.0）
+    let panel = gw.addr();
+    assert_eq!(
+        panel.ip().to_string(),
+        "127.213.0.1",
+        "应当绑在网段地址上，实际 {panel}"
+    );
+
+    // ② 网段里进来照样要认证：这条链路并不因为是内网地址就少一道门
+    let r = http(panel, "GET", "/", &[], None).await;
+    assert_eq!(r.status, 401, "网段地址上仍要认证：{}", r.body);
+
+    // ③ 管理接口：/__admin/api/segments 报出网段、可用性、以及归属它的路由
+    let admin = gw.admin_addr();
+    let c = login_at(&gw, admin, "admin", "pw-123")
+        .await
+        .expect("管理员应能登录");
+    let r = http(
+        admin,
+        "GET",
+        "/__admin/api/segments",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let body = view(&r);
+    let segs = body["segments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("缺少 segments 数组：{body}"));
+    assert_eq!(segs.len(), 1, "{body}");
+    let edge = &segs[0];
+    assert_eq!(edge["name"], "edge");
+    assert_eq!(edge["cidr"], "127.213.0.0/16");
+    assert_eq!(edge["ready"], true, "回环网段在本机一定可用：{edge}");
+    let names: Vec<&str> = edge["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["panel"], "网段里应当只有 panel 一条：{edge}");
+
+    // ④ 端口列表的每一行都带 segment，前端据此画「网段」标签
+    let r = http(admin, "GET", "/__admin/api/routes", &[("cookie", &c)], None).await;
+    let list = view(&r);
+    assert_eq!(row(&list, "panel")["segment"], "edge", "{list}");
+    assert!(
+        row(&list, "admin-only")["segment"].is_null(),
+        "网段之外的端口没有归属：{list}"
+    );
+
+    // ⑤ 端口表单能拿到可选网段清单，并回填当前的归属
+    let r = http(
+        admin,
+        "GET",
+        "/__admin/api/routes/panel",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let form = view(&r);
+    assert_eq!(form["segment"], "edge", "编辑表单要回填归属：{form}");
+    assert_eq!(form["segments"][0], "edge", "下拉框要有可选值：{form}");
+
+    // ⑥ overview 里也带 segment 清单（新壳子启动时只拉这一个接口）
+    let r = http(
+        admin,
+        "GET",
+        "/__admin/api/overview",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let ov = view(&r);
+    assert_eq!(ov["segments"][0], "edge", "{ov}");
+}
