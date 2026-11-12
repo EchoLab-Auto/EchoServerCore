@@ -233,6 +233,13 @@ impl TlsModuleConfig {
         if self.site.is_empty() {
             errors.push("至少要在 [[site]] 里配一个监听端口".into());
         }
+        if self.defaults.handshake_timeout_secs == 0 {
+            errors.push(
+                "defaults.handshake_timeout_secs = 0 没有意义（不会被解释成「不限制」）——\
+                 那等于每个连接握手都不用等，任何一次慢半拍的握手都会失败"
+                    .into(),
+            );
+        }
 
         // 证书名唯一
         let mut cert_names = BTreeMap::new();
@@ -312,6 +319,19 @@ impl TlsModuleConfig {
                 }
             };
 
+            // 0 秒不能静默钳成 1 秒。
+            //
+            // 写 0 的人通常是想表达"不限制"（nginx 里 `proxy_read_timeout 0` 不是这个
+            // 意思，但 `client_body_timeout 0` 常被这么用）。钳成 1 秒的结果是：偶发
+            // 502，而且只在慢请求上出现 —— 那是线上最难查的一类症状。宁可启动时拒绝。
+            if s.read_timeout_secs == 0 {
+                errors.push(format!(
+                    "site {:?}: read_timeout_secs = 0 没有意义（不会被解释成「不限制」）。\
+                     要长时间等上游就写一个大数，例如 3600",
+                    s.name
+                ));
+            }
+
             if s.websocket && matches!(action, Action::Redirect(_)) {
                 errors.push(format!(
                     "site {:?}: redirect 的站点配 websocket 没有意义（301 不会升级）",
@@ -342,6 +362,7 @@ impl TlsModuleConfig {
                     action: action.clone(),
                     websocket: s.websocket,
                     log_query: s.log_query,
+                    // `.max(1)` 是最后防线：上面已拒绝 0，但 `Site` 也可能被测试或别的路径构造。
                     read_timeout: std::time::Duration::from_secs(s.read_timeout_secs.max(1)),
                     max_body_bytes: s.max_body_bytes.unwrap_or(self.defaults.max_body_bytes),
                     hsts: s.hsts.unwrap_or(self.defaults.hsts),
@@ -381,6 +402,7 @@ impl TlsModuleConfig {
         Ok(Validated {
             default_cert,
             tls12: self.defaults.tls12,
+            // 同上：上面已拒绝 0，这里的 `.max(1)` 只防构造路径。
             handshake_timeout: std::time::Duration::from_secs(
                 self.defaults.handshake_timeout_secs.max(1),
             ),
@@ -527,6 +549,36 @@ mod tests {
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("指回了 TLS 终结自己")), "{errs:?}");
         assert!(errs.iter().any(|e| e.contains("502")), "错误信息要说清后果: {errs:?}");
+    }
+
+    /// 超时写 0 要报错，不能静默钳成 1 秒。
+    ///
+    /// 钳的后果是"偶发 502，只在慢请求上出现"——线上最难查的那类症状，
+    /// 而写 0 的人多半以为它表示"不限制"。
+    #[test]
+    fn zero_timeouts_are_rejected_not_clamped() {
+        let cfg = parse(
+            r#"{
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [{"name":"p","listen":"127.0.0.1:1","upstream":"127.0.0.1:2",
+                        "read_timeout_secs": 0}]
+            }"#,
+        );
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("read_timeout_secs = 0")), "{errs:?}");
+
+        let cfg = parse(
+            r#"{
+              "defaults": {"handshake_timeout_secs": 0},
+              "cert": [{"name":"self","cert":"/a.crt","key":"/a.key"}],
+              "site": [{"name":"p","listen":"127.0.0.1:1","upstream":"127.0.0.1:2"}]
+            }"#,
+        );
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("handshake_timeout_secs = 0")),
+            "{errs:?}"
+        );
     }
 
     /// 通配监听覆盖本机所有 IP，所以 `127.0.0.1` 回连同端口也是自环。

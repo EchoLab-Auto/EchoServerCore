@@ -436,6 +436,9 @@ pub struct TlsSiteInput {
     #[serde(default, deserialize_with = "one_or_many")]
     pub listen: Vec<String>,
     /// 明文转发目标，如 `127.0.0.1:18790`。与 `redirect` 二选一。
+    ///
+    /// **必须是 `IP:端口` 字面量**，不查 DNS —— 主机名（`localhost:8080`）会被拒。
+    /// 面板要在提交前自查，就得知道这条；写在这里而不是只在插件源码里。
     #[serde(default)]
     pub upstream: Option<String>,
     /// 301 目标模板，如 `https://{hostname}:2224{uri}`。与 `upstream` 二选一。
@@ -445,7 +448,10 @@ pub struct TlsSiteInput {
     pub websocket: bool,
     #[serde(default)]
     pub log_query: bool,
-    /// 等上游响应的超时，秒。缺省 300；最小 1（0 不会被解释成"不限制"）。
+    /// 等上游响应的超时，秒。缺省 300。
+    ///
+    /// **0 会被拒绝**（不是"不限制"、也不是钳到 1 秒）——把它静默钳成 1 秒的结果
+    /// 是「偶发 502，只在慢请求上出现」，那是线上最难查的一类症状。
     #[serde(default = "default_read_timeout")]
     pub read_timeout_secs: u64,
     /// 这个端口的请求体上限，覆盖 `defaults.max_body_bytes`。`None` = 继承。
