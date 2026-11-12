@@ -105,11 +105,12 @@ pub struct GatewayConfig {
     /// segment = "edge"
     /// ```
     ///
-    /// 一旦某条路由声明了 `segment`，网关就强制三件事（见
+    /// 一旦某条路由声明了 `segment`，网关就强制四件事（见
     /// [`check_segment_rules`]）：listen 必须是网段内的**具体地址**（不许
-    /// `0.0.0.0`）、upstream 必须是本机回环、网段内的监听不许"不声明归属"。
-    /// 于是拓扑变成「外部 → TLS 终结 → 隔离网段 → 认证 → 回环」，那条
-    /// "直连网关端口绕过 TLS"的旁路在结构上就不存在了。
+    /// `0.0.0.0`）、upstream 必须是本机回环、**网段端口与回环端口一一对应**
+    /// （`127.213.0.1:18788 → 127.0.0.1:18788`，端口号必须相同）、网段内的
+    /// 监听不许"不声明归属"。于是拓扑变成「外部 → TLS 终结 → 隔离网段 →
+    /// 认证 → 回环」，那条"直连网关端口绕过 TLS"的旁路在结构上就不存在了。
     ///
     /// 语义与实现细节见 [`crate::segment`]。
     #[serde(default)]
@@ -214,11 +215,14 @@ pub struct RouteConfig {
     pub host: Option<String>,
     /// 这条路由归属的隔离网段名（见 [`GatewayConfig::segment`]）。
     ///
-    /// 写了它就等于承诺三件事，网关在启动与热应用时都会校验：
+    /// 写了它就等于承诺四件事，网关在启动与热应用时都会校验：
     ///
     /// * `listen` 落在该网段里，且必须是**具体地址**（`0.0.0.0` 会被拒——
     ///   那等于把前门又铺回所有接口上）；
     /// * `upstream` 是本机回环地址（"认证后落到本机"是这条拓扑的语义）；
+    /// * **端口一一对应**：`listen` 的端口号必须等于 `upstream` 的端口号。
+    ///   网段因此是回环的**平行地址空间**——同一批端口号，只换地址。看到
+    ///   `127.213.0.1:18788` 就知道它对应本机的 18788，不用再查一张映射表；
     /// * 反过来说，`listen` 落在网段内却没写 `segment` 也是错的——网段里的
     ///   监听必须显式归属，否则"谁在这个网段里"就没人管。
     ///
@@ -444,6 +448,26 @@ pub fn validate_route_list(
             return Err(format!("route 名 {:?} 重复", rt.name));
         }
         check_segment_rules(&rt, segments)?;
+        // 网段内的端口号必须唯一：端口相等（上一条规则）加上这一条，网段里的
+        // 端口与回环端口就是严格的一一对应 —— 一个端口一个上游，反过来也一样。
+        //
+        // 允许同一网段两条路由共用一个监听端口（靠 host 分流），就等于允许
+        // `127.213.0.1:8080` 同时是 8080 和 9000 的入口 —— 那正是这套映射要
+        // 消灭的歧义。要按 Host 分流请在 TLS 终结那一层做（那里有 SNI 和证书，
+        // 本来就是分流的地方）。
+        if let Some(name) = &rt.segment {
+            if let Some(other) = out.iter().find(|o| {
+                o.segment.as_deref() == Some(name.as_str()) && o.listen.port() == rt.listen.port()
+            }) {
+                return Err(format!(
+                    "route {:?} 与 {:?} 都在网段 {name} 里监听端口 {} —— 网段与回环的端口是一一\
+                     对应的，一个端口号只能对应一个上游（现在分别是 {} 与 {}）。\
+                     给其中一条换端口，或把它移出网段；同一个端口要服务多个上游，应在 TLS \
+                     终结那一层按 SNI 分流",
+                    other.name, rt.name, rt.listen.port(), other.upstream, rt.upstream
+                ));
+            }
+        }
         if let Some(other) = out.iter().find(|o| routes_overlap(o, &rt)) {
             let why = match (&other.host, &rt.host) {
                 (None, None) => format!(
@@ -517,6 +541,28 @@ pub fn check_segment_rules(rt: &RouteRuntime, segments: &SegmentSet) -> Result<(
                     "route {:?} 归属网段 {name}，upstream 必须是本机回环地址（127.0.0.0/8 或 ::1），\
                      现在是 {}。网段路由的语义是「认证后落到本机回环」",
                     rt.name, rt.upstream
+                ));
+            }
+            // 端口必须一一对应：网段地址的端口号 == 回环上游的端口号。
+            //
+            // 这条不是洁癖，是**去掉一个可以记错的东西**。允许 `127.213.0.1:18784
+            // → 127.0.0.1:18788` 的话，网段就成了另一套端口编号：看到 18784 要去
+            // 别处查它对应谁，而"网关自己在 18784、面板在 18788"这种只差四位数
+            // 的映射，正是最容易把两件事记反的地方——cloud2 上就这么错过一次。
+            //
+            // 强制相等之后，网段是回环的**平行地址空间**：端口号完全一致，只有
+            // 地址不同。看到 `127.213.0.1:18788` 就知道那是本机 18788，反之亦然。
+            if rt.listen.port() != rt.upstream.port() {
+                return Err(format!(
+                    "route {:?} 归属网段 {name}：listen 的端口 {} 与 upstream 的端口 {} \
+                     必须相同（网段与回环的端口一一对应，看到网段地址就知道它对应本机哪个服务）。\
+                     写成 {} 才对；确实要把 {} 映射到 {} 就别把这条放进网段里",
+                    rt.name,
+                    rt.listen.port(),
+                    rt.upstream.port(),
+                    SocketAddr::new(rt.listen.ip(), rt.upstream.port()),
+                    rt.listen.port(),
+                    rt.upstream.port()
                 ));
             }
             Ok(())
@@ -1216,15 +1262,73 @@ upstream = "127.0.0.1:18787"
     }
 
     /// 网段里的一条路由 + TLS 指向它 —— 这是目标拓扑，必须能过。
+    ///
+    /// 注意 `18801 → 18801`：网段与回环的**端口号相同**，只有地址不同。
     #[test]
     fn segment_route_is_accepted() {
         let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
         let rts = validate_route_list(
-            &[route_in("panel", "127.213.0.1:18801", "127.0.0.1:18788", Some("edge"))],
+            &[route_in("panel", "127.213.0.1:18788", "127.0.0.1:18788", Some("edge"))],
             &segs,
         )
         .expect("网段内的具体地址 + 回环上游应当通过");
         assert_eq!(rts[0].segment.as_deref(), Some("edge"));
+        assert_eq!(rts[0].listen.port(), rts[0].upstream.port(), "端口一一对应");
+    }
+
+    /// 网段端口与回环端口不同 → 拒。网段是回环的平行地址空间，不是另一套编号。
+    #[test]
+    fn segment_route_ports_must_match_one_to_one() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("panel", "127.213.0.1:18784", "127.0.0.1:18788", Some("edge"))],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("必须相同"), "{err}");
+        // 错误信息要直接给出改法，而不是只说"不行"
+        assert!(err.contains("127.213.0.1:18788"), "{err}");
+    }
+
+    /// 同一网段里两条路由共用一个端口 → 拒。
+    ///
+    /// 端口相等 + 端口唯一，两条合起来才是「一一对应」：否则
+    /// `127.213.0.1:8080` 会同时是 8080 和 9000 的入口。
+    #[test]
+    fn segment_route_ports_must_be_unique_within_a_segment() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[
+                route_in("a", "127.213.0.1:8080", "127.0.0.1:8080", Some("edge")),
+                // 换一个 host 也不行：端口映射的唯一性先于 Host 分流
+                RouteConfig {
+                    host: Some("b.example.com".into()),
+                    ..route_in("b", "127.213.0.1:8080", "127.0.0.1:8080", Some("edge"))
+                },
+            ],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("一一"), "{err}");
+    }
+
+    /// 不同网段可以各自映射同一个回环端口：地址不同，映射不冲突。
+    #[test]
+    fn different_segments_may_map_the_same_port() {
+        let segs = SegmentSet::parse(&[
+            seg_cfg("edge", "127.213.0.0/16"),
+            seg_cfg("dmz", "127.214.0.0/16"),
+        ])
+        .unwrap();
+        let rts = validate_route_list(
+            &[
+                route_in("a", "127.213.0.1:18788", "127.0.0.1:18788", Some("edge")),
+                route_in("b", "127.214.0.1:18788", "127.0.0.1:18788", Some("dmz")),
+            ],
+            &segs,
+        )
+        .expect("两个网段各映射一次同一个上游，不算冲突");
+        assert_eq!(rts.len(), 2);
     }
 
     /// `0.0.0.0` 会把同一个端口又铺回公网口上——网段白建，必须拒。

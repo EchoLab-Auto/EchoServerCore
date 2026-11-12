@@ -1559,12 +1559,21 @@ impl RouteInput {
         //
         // `config` 层只拦得住 `upstream == listen` 这一种，因为它看不到
         // admin_listen，也没法在单条路由的上下文里判断"这还是我自己"。
+        //
+        // 判定必须看**地址**，不能只看端口：网段路由的关系天生是
+        // `127.213.0.1:18788 → 127.0.0.1:18788`（端口一一对应），只看端口的话
+        // 每一条网段路由都会被判成自环——改一次就再也存不进去了。
+        // 真正会打回自己的只有两种：地址全等，或者那条监听是 0.0.0.0（通配
+        // 所有本机地址）。`127.213.0.1:18788` 和 `127.0.0.1:18788` 是两个
+        // 独立的套接字，前者收到发往 127.0.0.1 的连接——不可能。
         if let Ok(up) = self.upstream.parse::<std::net::SocketAddr>() {
-            let mine = gw.routes.all().iter().any(|r| r.listen.port() == up.port())
-                || gw.cfg.admin_listen.map(|a| a.port()) == Some(up.port());
+            let loops_back =
+                |listen: std::net::SocketAddr| listen == up || (listen.ip().is_unspecified() && listen.port() == up.port());
+            let mine = gw.routes.all().iter().any(|r| loops_back(r.listen))
+                || gw.cfg.admin_listen.map(loops_back) == Some(true);
             if mine {
                 return Err(format!(
-                    "上游 {} 是这个网关自己的监听端口——转发过去会形成自环\
+                    "上游 {} 是这个网关自己的监听地址——转发过去会形成自环\
                      （表现是莫名其妙的 401 或者 CPU 打满）。上游应该是面板的地址。",
                     self.upstream
                 ));

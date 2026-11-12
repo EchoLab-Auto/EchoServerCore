@@ -3126,14 +3126,9 @@ async fn segment_routes_bind_on_the_segment_address_and_are_reported() {
             cidr: "127.213.0.0/16".into(),
             note: Some("测试网段".into()),
         }];
-        // 把 panel 那条挪进网段：端口不变、地址换成网段里的具体地址。
-        let port = c.route[0]
-            .listen
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .to_string();
-        c.route[0].listen = format!("127.213.0.1:{port}");
+        // 把 panel 那条挪进网段。端口号**不变**（这就是一一对应）：
+        // 网段地址 127.213.0.1:U → 回环 127.0.0.1:U，其中 U 是上游自己的端口。
+        c.route[0].listen = format!("127.213.0.1:{}", up.port());
         c.route[0].segment = Some("edge".into());
         for u in &mut c.user {
             if u.name == "admin" {
@@ -3218,4 +3213,73 @@ async fn segment_routes_bind_on_the_segment_address_and_are_reported() {
     .await;
     let ov = view(&r);
     assert_eq!(ov["segments"][0], "edge", "{ov}");
+}
+
+/// 一一对应的落地检验：网段路由在面板里**改得动**。
+///
+/// 这条防的是一个很隐蔽的回归：端口一一对应之后，`listen.port == upstream.port`
+/// 是每一条网段路由的常态。面板的自环检查如果只看端口，就会把它判成"上游指向
+/// 自己"，于是这类路由新建/编辑一律被拒——配置层说合法、面板层说不行，用户
+/// 只会看到一句莫名其妙的"会形成自环"。
+#[tokio::test]
+async fn a_segment_route_can_still_be_saved_from_the_panel() {
+    let (up, _u) = start_upstream().await;
+    let admin_port = pick_port();
+    let seg_port = free_port().await; // 一条要被网段接管的回环端口
+    let dir = tmpdir("segpanel");
+    let users = dir.join("gateway-users.toml");
+    let routes_file = dir.join("gateway-routes.toml");
+    let gw = start_gateway(up, move |c| {
+        c.admin_listen = Some(format!("127.0.0.1:{admin_port}"));
+        c.users_file = Some(users);
+        c.routes_file = Some(routes_file);
+        c.segment = vec![esc_gateway::segment::SegmentConfig {
+            name: "edge".into(),
+            cidr: "127.213.0.0/16".into(),
+            note: None,
+        }];
+        for u in &mut c.user {
+            if u.name == "admin" {
+                u.admin = true;
+            }
+        }
+    })
+    .await;
+
+    let admin = gw.admin_addr();
+    let c = login_at(&gw, admin, "admin", "pw-123").await.unwrap();
+
+    // 新建一条网段路由：127.213.0.1:U → 127.0.0.1:U（端口相同，地址不同）
+    let body = format!(
+        "name=segpanel&listen={}&upstream={}&segment=edge",
+        form_escape(&format!("127.213.0.1:{seg_port}")),
+        form_escape(&format!("127.0.0.1:{seg_port}")),
+    );
+    let r = post_form(admin, "/__admin/api/routes", &c, &body).await;
+    let msg = done_ok(&r);
+    assert!(msg.contains("segpanel"), "应能保存网段路由：{}", r.body);
+
+    // 真的在听，而且地址是网段地址
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(format!("127.213.0.1:{seg_port}")),
+    )
+    .await
+    .expect("连接不该超时")
+    .expect("网段地址应当能连上");
+    drop(r);
+
+    // 反向：故意把端口写成不一样的，必须被拒，并且错误里给出该怎么写
+    let body = format!(
+        "name=segpanel&listen={}&upstream={}&segment=edge",
+        form_escape(&format!("127.213.0.1:{}", seg_port + 1)),
+        form_escape(&format!("127.0.0.1:{seg_port}")),
+    );
+    let r = post_form(admin, "/__admin/api/routes/segpanel", &c, &body).await;
+    let (err, _form) = form_error(&r);
+    assert!(err.contains("必须相同"), "{err}");
+
+    gw.token.cancel();
+    _u.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
 }
