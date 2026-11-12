@@ -291,6 +291,100 @@ pub struct EdgeRouterStatus {
     pub counters: EdgeRouterCounters,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS 终结（`esc.tls`）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// TLS 终结层的运行时状态。
+///
+/// # 为什么要把它做成控制面的一部分
+///
+/// 这一层从前是 nginx（一个 Docker 容器），面板看不到它 —— 于是「2222 这个端口
+/// 是谁在听、转发到哪、要不要登录」这个问题只能在三个页面之间来回切才拼得出来。
+/// 收进 `esc-host` 之后它和隧道在同一个进程里，这条链路终于能在一屏内讲完：
+///
+/// ```text
+/// :2222  ──TLS──▶  127.0.0.1:18790  ──隧道──▶  4090 的 127.0.0.1:8080
+///  └─ site      ┘   └──── mapping.listen ────┘
+/// ```
+///
+/// 面板靠 `site.target == mapping.listen` 把两段接起来。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsStatus {
+    #[serde(default)]
+    pub sites: Vec<TlsSite>,
+    #[serde(default)]
+    pub certs: Vec<TlsCertInfo>,
+    /// SNI 没命中时用哪张证书（按 `TlsCertInfo::name`）。
+    #[serde(default)]
+    pub default_cert: Option<String>,
+    /// 是否允许 TLS 1.2。
+    #[serde(default)]
+    pub tls12: bool,
+    #[serde(default)]
+    pub counters: TlsCounters,
+}
+
+/// 一个 TLS 终结站点（一个监听端口）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsSite {
+    pub name: String,
+    /// 实际在听的地址，如 `0.0.0.0:2222`。
+    pub listen: String,
+    /// `proxy` = 转发到本机端口；`redirect` = 301。
+    ///
+    /// 用字符串而不是枚举：这是跨进程/跨版本的契约，加一个动作不该让老面板
+    /// 反序列化失败。
+    pub kind: String,
+    /// `kind = proxy` 时是上游地址（`127.0.0.1:18790`）；`redirect` 时是模板。
+    pub target: String,
+    #[serde(default)]
+    pub websocket: bool,
+    /// 是否把查询串写进访问日志。**面板要把它显示出来** —— 承载令牌的端口
+    /// 靠它保证凭据不落盘，这是一个应该被看见的设置，而不是藏在配置里。
+    #[serde(default)]
+    pub log_query: bool,
+    #[serde(default)]
+    pub read_timeout_secs: u64,
+    #[serde(default)]
+    pub max_body_bytes: u64,
+    #[serde(default)]
+    pub hsts: bool,
+}
+
+/// 一张已加载的证书。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsCertInfo {
+    /// 引用名（`[[tls.config.cert]].name`）。
+    pub name: String,
+    /// 证书文件路径。面板显示它，是因为**续期后要重新复制到这里再重启** ——
+    /// 这条运维路径只有看见路径才想得起来。
+    pub cert: String,
+    /// 服务的 SNI 名字（小写）。空 = 只作为默认证书用。
+    #[serde(default)]
+    pub sni: Vec<String>,
+    /// 是不是当前的默认证书。
+    #[serde(default)]
+    pub default: bool,
+}
+
+/// 累计计数。全部单调递增，面板可据此算速率。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TlsCounters {
+    /// 完成 TLS 握手并进入 HTTP 的请求数。
+    #[serde(default)]
+    pub requests_total: u64,
+    /// 握手失败次数。端口扫描器会造成零星几条，持续增长才是问题。
+    #[serde(default)]
+    pub handshake_failures: u64,
+    /// 连不上 / 超时 / 上游协议错误。
+    #[serde(default)]
+    pub upstream_errors: u64,
+    /// 因请求体超限被拒的次数。
+    #[serde(default)]
+    pub body_too_large: u64,
+}
+
 /// 引擎侧的错误。用字符串是为了能跨进程边界无损传递。
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
 #[error("{message}")]

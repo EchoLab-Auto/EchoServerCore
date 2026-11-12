@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use esc_control_api::{
     ErrorKind, CONTROL_SERVICE, EDGE_ROUTE_SERVICE, PLUGIN_TREE_METHOD, PLUGIN_TREE_SERVICE,
+    TLS_SERVICE,
 };
 
 /// 引擎侧操作都是毫秒级的，10 秒已是很宽松的上限。
@@ -35,6 +36,18 @@ pub trait ControlBackend: Send + Sync + 'static {
         Err((
             StatusCode::NOT_IMPLEMENTED,
             "这台机器没有启用边缘路由插件（esc.edge-router）".to_string(),
+        ))
+    }
+
+    /// 调 TLS 终结控制面（`esc.tls`）。
+    ///
+    /// `method` 目前只有 `tls.status`。留这个参数是为了与另外两个 call_* 同形，
+    /// 也为了将来真加读取类方法时不用改签名。
+    async fn call_tls(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
+        let _ = (method, params);
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "这台机器没有启用 TLS 终结（host.toml 里 [tls] enabled）".to_string(),
         ))
     }
 }
@@ -115,5 +128,9 @@ impl ControlBackend for HostCallBackend {
 
     async fn call_edge(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
         self.call_service(EDGE_ROUTE_SERVICE, method, params).await
+    }
+
+    async fn call_tls(&self, method: &str, params: Value) -> Result<Value, (StatusCode, String)> {
+        self.call_service(TLS_SERVICE, method, params).await
     }
 }

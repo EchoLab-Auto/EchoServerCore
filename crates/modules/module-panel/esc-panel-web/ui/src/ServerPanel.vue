@@ -55,6 +55,7 @@ const groupedContainers = computed(() => {
 // 都要读一遍错误信息才能确认"这台机器没有这个功能"。
 const tunnelReady = ref(false)
 const gatewayReady = ref(false)
+const tlsReady = ref(false)
 const navTabs = computed<[string, string][]>(() => {
   const tabs: [string, string][] = []
   if (navGroups.value.length) tabs.push(['nav', '导航'])
@@ -75,6 +76,19 @@ async function probeTunnel() {
   try { await api('/api/tunnel/mappings'); tunnelReady.value = true }
   catch { tunnelReady.value = false }
 }
+/**
+ * 探一下 TLS 终结层。501 = 这台机器没启用（`[tls] enabled = false`），
+ * 那就别显示这个子页；连不上隧道面板也归到"不可用"。
+ */
+async function probeTls() {
+  try { await api('/api/tunnel/tls'); tlsReady.value = true }
+  catch (e) {
+    const msg = (e as Error).message || ''
+    // 501 是"没启用"，其它（隧道面板本身不可达）也不该显示入口
+    tlsReady.value = !/501|没有启用 TLS/.test(msg)
+  }
+}
+
 /** 探一下网关管理接口。未登录时回 401——那也说明**它存在**，要显示出来。 */
 async function probeGateway() {
   try { await api('/__admin/api/overview'); gatewayReady.value = true }
@@ -160,6 +174,7 @@ onMounted(() => {
   loadNav()
   probeTunnel()
   probeGateway()
+  probeTls()
   // 探测有真实网络开销，60 秒一次够了（比指标轮询慢一档）。
   navTimer = setInterval(() => { if (tab.value === 'nav') loadNav() }, 60000)
   loadOverview()
@@ -182,6 +197,7 @@ onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer); clearInte
       :allow-delete="allowDelete"
       :tunnel-ready="tunnelReady"
       :gateway-ready="gatewayReady"
+      :tls-ready="tlsReady"
     />
     <PluginTree v-show="tab === 'plugins'" ref="plugins" />
 

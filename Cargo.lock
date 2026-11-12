@@ -709,10 +709,12 @@ name = "esc-plugin-tls"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes 1.12.1",
  "echo-context",
  "echo-plugin",
  "esc-common",
+ "esc-control-api",
  "http-body-util",
  "hyper",
  "hyper-util",

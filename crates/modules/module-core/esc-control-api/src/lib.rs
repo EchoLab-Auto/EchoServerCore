@@ -8,13 +8,14 @@ pub mod model;
 pub mod plugin_tree;
 
 pub use dispatch::{
-    dispatch, dispatch_edge, method, ControlRequest, ControlResponse, EdgeRouteControl,
-    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE,
+    dispatch, dispatch_edge, dispatch_tls, method, ControlRequest, ControlResponse,
+    EdgeRouteControl, TlsControl, TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE,
+    TLS_SERVICE,
 };
 pub use model::{
     ControlError, EdgeRoute, EdgeRouteUpsert, EdgeRouterCounters, EdgeRouterStatus, EngineStatus,
     ErrorKind, ExportedConfig, Mapping, MappingState, MappingStats, MappingUpsert, MappingView,
-    Role, SpokeView,
+    Role, SpokeView, TlsCertInfo, TlsCounters, TlsSite, TlsStatus,
 };
 pub use plugin_tree::{
     PluginTreeNode, PluginTreeSnapshot, PLUGIN_TREE_METHOD, PLUGIN_TREE_SERVICE,

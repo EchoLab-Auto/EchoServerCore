@@ -100,6 +100,24 @@ for (const [name, url, tab] of [
       return title
     }
 
+    // TLS 终结子页：把「:2222 ──TLS──▶ 18790 ──隧道──▶ 4090:8080」接起来的那一页。
+    // 它存在的意义就是让"某个端口是谁在听、转发到哪"能在一屏里看到。
+    if (subTabs.includes('TLS 终结')) {
+      await page.getByRole('tab', { name: 'TLS 终结', exact: true }).click()
+      await page.getByRole('heading', { name: '终结层', exact: true }).waitFor()
+      const chain = page.locator('table.esc-table:visible').filter({ hasText: '链路终点' }).first()
+      await chain.waitFor()
+      const rows = await chain.locator('tbody tr').count()
+      if (rows < 1) throw new Error('server: TLS 链路表是空的')
+      // "↳ 就是这条映射的监听地址" 是 TLS 与隧道被接上的标志。
+      // 没配隧道映射的部署不会有它，所以只在有映射时才要求。
+      const hasTunnelLink = await page.getByText('就是这条映射的监听地址').count()
+      results.at(-1).tlsSites = rows
+      results.at(-1).tlsChainLinked = hasTunnelLink > 0
+      await page.screenshot({ path: '/tmp/esc-tls-chain.png', fullPage: true })
+      await page.getByRole('tab', { name: 'Docker 网络', exact: true }).click()
+    }
+
     if (subTabs.includes('端口映射')) {
       await page.getByRole('tab', { name: '端口映射', exact: true }).click()
       await page.getByText('端口映射', { exact: true }).first().waitFor()

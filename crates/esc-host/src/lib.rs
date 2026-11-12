@@ -42,8 +42,10 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use esc_control_api::{
-    dispatch, dispatch_edge, ControlError, ControlRequest, ControlResponse, EdgeRouteControl,
-    TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE, PLUGIN_TREE_SERVICE,
+    dispatch, dispatch_edge, dispatch_tls, ControlError, ControlRequest, ControlResponse,
+    EdgeRouteControl,
+    TlsControl, TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE, PLUGIN_TREE_SERVICE,
+    TLS_SERVICE,
 };
 use esc_plugin_edge_router::EdgeRouterPlugin;
 use esc_plugin_tls::TlsPlugin;
@@ -293,6 +295,47 @@ impl AsyncHostService for EdgeHostService {
     }
 }
 
+/// `HostCall("esc.tls", "tls.status", null)` 的宿主端实现。
+///
+/// 与 [`EdgeHostService`] 同一个形状。分开一个服务是因为它们背后是**两个不同
+/// 插件**：没启用 TLS 终结的部署不该看到一个"永远空列表"的服务 —— 面板据
+/// 服务存不存在判断能力有没有。
+pub struct TlsHostService {
+    ctl: Arc<dyn TlsControl>,
+    policy: Arc<CallerPolicy>,
+}
+
+impl TlsHostService {
+    pub fn new(ctl: Arc<dyn TlsControl>, policy: Arc<CallerPolicy>) -> Self {
+        Self { ctl, policy }
+    }
+}
+
+#[async_trait]
+impl AsyncHostService for TlsHostService {
+    async fn call(
+        &self,
+        cx: CallContext,
+        method: &str,
+        payload: Value,
+    ) -> Result<Value, (String, String)> {
+        self.policy.check(&cx, TLS_SERVICE)?;
+        let req = ControlRequest {
+            method: method.to_string(),
+            params: payload,
+        };
+        let resp = dispatch_tls(self.ctl.as_ref(), req).await;
+        if resp.ok {
+            Ok(resp.data)
+        } else {
+            let err = resp
+                .error
+                .unwrap_or_else(|| ControlError::other("TLS 控制面调用失败"));
+            Err((err.kind.as_code().to_string(), err.message))
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Host
 // ─────────────────────────────────────────────────────────────────────────────
@@ -386,6 +429,21 @@ impl Host {
             )),
         );
         let mut host_services = vec![CONTROL_SERVICE.to_string(), PLUGIN_TREE_SERVICE.to_string()];
+
+        // TLS 终结控制面。同样按需注册：没启用 TLS 的部署不该看到这个服务。
+        //
+        // 它的存在让面板能把「:2222 ──TLS──▶ 18790 ──隧道──▶ 4090:8080」这条链路
+        // 画在一屏里 —— 从前 nginx 那一层是面板完全看不见的部分。
+        if cfg.tls.enabled {
+            let ctl = esc_plugin_tls::resolve(&ctx)
+                .map_err(|e| anyhow::anyhow!("TLS 控制面不可用: {}", e.message))?;
+            supervisor.host_services().register_async(
+                TLS_SERVICE,
+                Arc::new(TlsHostService::new(ctl, Arc::clone(&callers))),
+            );
+            host_services.push(TLS_SERVICE.to_string());
+            info!(service = TLS_SERVICE, "tls control service registered");
+        }
 
         // 边缘路由控制面：只有启用了插件才注册 —— 面板据此判断能力是否存在。
         if let Some(edge) = &edge_router {

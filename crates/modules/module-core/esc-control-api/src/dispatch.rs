@@ -35,6 +35,9 @@ pub const CONTROL_SERVICE: &str = "esc.control";
 /// 隧道控制而不给路由控制（反之亦然），绑在一起就得一起开。
 pub const EDGE_ROUTE_SERVICE: &str = "esc.edge";
 
+/// TLS 终结控制面的服务名（只在启用了 `esc.tls` 时注册）。
+pub const TLS_SERVICE: &str = "esc.tls";
+
 /// 面板的菜单/命令键。名字进 JSON，所以一律小写点分。
 pub mod method {
     pub const STATUS: &str = "status";
@@ -51,6 +54,13 @@ pub mod method {
     pub const EDGE_ROUTE_UPSERT: &str = "edge.route.upsert";
     pub const EDGE_ROUTE_DELETE: &str = "edge.route.delete";
     pub const EDGE_ROUTE_STATUS: &str = "edge.status";
+
+    /// TLS 终结层的状态（站点 + 证书 + 计数）。
+    ///
+    /// 只有 `status` 一个方法：证书与监听端口的**改动**要重启宿主才生效
+    /// （见 `docs/TLS-MODULE.md`「证书续期」），所以这里没有 upsert/delete。
+    /// 加一套只能改内存、活不过重启的写接口，比没有更误导。
+    pub const TLS_STATUS: &str = "tls.status";
 }
 
 /// 一次控制调用。
@@ -155,6 +165,14 @@ pub trait EdgeRouteControl: Send + Sync + 'static {
 ///
 /// 引擎与测试共用这一个实现，保证「面板能调到的」和「引擎真正支持的」
 /// 永远是同一份清单。
+/// TLS 终结层的控制面。
+///
+/// 只读：见 `method::TLS_STATUS` 的注释（改动要重启，不做只能改内存的写接口）。
+#[async_trait::async_trait]
+pub trait TlsControl: Send + Sync + 'static {
+    async fn status(&self) -> Result<crate::model::TlsStatus, ControlError>;
+}
+
 pub async fn dispatch(ctl: &dyn TunnelControl, req: ControlRequest) -> ControlResponse {
     use method::*;
     macro_rules! run {
@@ -274,6 +292,21 @@ pub async fn dispatch_edge(ctl: &dyn EdgeRouteControl, req: ControlRequest) -> C
         }
         other => ControlResponse::err(ControlError::invalid(format!(
             "unknown edge method: {other}"
+        ))),
+    }
+}
+
+/// TLS 终结层的 dispatch。只有一个方法，保留 dispatch 这层是为了与
+/// `dispatch` / `dispatch_edge` 的形状一致 —— 宿主端的服务实现可以照抄。
+pub async fn dispatch_tls(ctl: &dyn TlsControl, req: ControlRequest) -> ControlResponse {
+    use method::*;
+    match req.method.as_str() {
+        TLS_STATUS => match ctl.status().await {
+            Ok(v) => ControlResponse::ok(v),
+            Err(e) => ControlResponse::err(e),
+        },
+        other => ControlResponse::err(ControlError::invalid(format!(
+            "unknown tls method: {other}"
         ))),
     }
 }

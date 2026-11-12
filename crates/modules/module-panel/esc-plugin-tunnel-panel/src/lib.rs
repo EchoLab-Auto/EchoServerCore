@@ -247,6 +247,9 @@ pub fn router(backend: Arc<dyn ControlBackend>, cfg: &PanelConfig) -> Router {
         .route("/api/spokes/kick", post(api_kick))
         .route("/api/export", get(api_export))
         // ── 边缘路由（可能不存在：未启用插件时全部返回 501）────────────
+        // TLS 终结层。**只读**：证书与端口改动要重启宿主（见 docs/TLS-MODULE.md），
+        // 所以这里只有 GET，没有写接口。
+        .route("/api/tls", get(api_tls_status))
         .route("/api/edge", get(api_edge_status))
         .route("/api/edge/routes", post(api_edge_upsert))
         .route(
@@ -397,6 +400,16 @@ async fn api_export(
 // 而不是弹一堆报错。
 
 /// `GET /api/edge`：监听地址 + 路由表 + 计数器（一次拿全，前端只发一个请求）。
+/// `GET /api/tls`：TLS 终结层的站点、证书、计数。
+///
+/// 面板拿它和 `/api/mappings` 拼起来，就能把「:2222 ──TLS──▶ 18790 ──隧道──▶
+/// 4090:8080」画成一条链 —— 这正是把 nginx 收进宿主的意义。
+async fn api_tls_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        st.backend.call_tls(method::TLS_STATUS, Value::Null).await?,
+    ))
+}
+
 async fn api_edge_status(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         st.backend
@@ -485,7 +498,7 @@ async fn api_edge_delete(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 插件本体
-// ─────────────────────────────────────────────────────────────���───────────────
+// ───────────────────────────────────────────────────────────────────────────────
 
 pub struct Panel {
     cfg: RwLock<PanelConfig>,

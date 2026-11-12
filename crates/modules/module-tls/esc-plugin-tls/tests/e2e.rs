@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use esc_plugin_tls::certs::{self, CertStore};
 use esc_plugin_tls::config::{Action, CertConfig, Site};
+use esc_plugin_tls::control::Metrics;
 use esc_plugin_tls::serve;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -124,7 +125,8 @@ async fn start_tls(sites: Vec<Site>, certs: Vec<CertConfig>, default: &str) -> S
     let store = Arc::new(CertStore::load(&certs, &Some(default.to_string())).expect("证书应能加载"));
     let tls = certs::server_config(store, true).expect("TLS 配置应能构建");
     let bound = serve::bind(&sites).expect("应能绑定");
-    let handle = serve::spawn(bound, tls, Duration::from_secs(5)).expect("应能启动");
+    let handle =
+        serve::spawn(bound, tls, Duration::from_secs(5), Metrics::new()).expect("应能启动");
     let addr = handle.addrs()[0];
     // 句柄随任务泄漏到测试结束（Drop 会关掉，所以这里必须 leak）：
     // 测试进程退出时 OS 会回收，而提前 drop 会把监听关掉。
@@ -687,7 +689,7 @@ async fn each_listen_port_forwards_to_its_own_upstream() {
         .iter()
         .map(|b| b.listener.local_addr().unwrap())
         .collect();
-    let handle = serve::spawn(bound, tls, Duration::from_secs(5)).unwrap();
+    let handle = serve::spawn(bound, tls, Duration::from_secs(5), Metrics::new()).unwrap();
     std::mem::forget(handle);
 
     let connector = client_trusting(&cert.cert_pem);
@@ -730,7 +732,7 @@ async fn hsts_header_only_when_enabled() {
         .iter()
         .map(|b| b.listener.local_addr().unwrap())
         .collect();
-    let handle = serve::spawn(bound, tls, Duration::from_secs(5)).unwrap();
+    let handle = serve::spawn(bound, tls, Duration::from_secs(5), Metrics::new()).unwrap();
     std::mem::forget(handle);
 
     let connector = client_trusting(&cert.cert_pem);

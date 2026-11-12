@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::Site;
+use crate::control::Metrics;
 use crate::proxy;
 
 /// 同一个地址上「客户端迟迟不发完请求头」的上限。
@@ -106,6 +107,7 @@ pub fn spawn(
     bound: Vec<Bound>,
     tls: Arc<rustls::ServerConfig>,
     handshake_timeout: Duration,
+    metrics: Arc<Metrics>,
 ) -> Result<ServerHandle, String> {
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|_| "TLS 终结需要 tokio 运行时（宿主必须在 runtime 内挂载插件）".to_string())?;
@@ -136,8 +138,9 @@ pub fn spawn(
             "TLS 终结监听已启动"
         );
 
+        let metrics = Arc::clone(&metrics);
         let task = rt.spawn(async move {
-            accept_loop(site, listener, tls, handshake_timeout, token).await;
+            accept_loop(site, listener, tls, handshake_timeout, token, metrics).await;
         });
         tasks.push(task);
     }
@@ -155,6 +158,7 @@ async fn accept_loop(
     tls: Arc<rustls::ServerConfig>,
     handshake_timeout: Duration,
     cancel: CancellationToken,
+    metrics: Arc<Metrics>,
 ) {
     let addr = listener
         .local_addr()
@@ -177,8 +181,9 @@ async fn accept_loop(
                 };
                 let site = Arc::clone(&site);
                 let tls = Arc::clone(&tls);
+                let metrics = Arc::clone(&metrics);
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(site.as_ref(), tcp, peer, tls, handshake_timeout).await {
+                    if let Err(e) = serve_conn(site.as_ref(), tcp, peer, tls, handshake_timeout, metrics).await {
                         // 握手失败是**常态**（端口扫描器、健康检查探活、客户端
                         // 提前断开），所以只记 debug。真正需要报警的是"每个连接
                         // 都失败"，那会在日志里形成一片而不是零星几条。
@@ -198,6 +203,7 @@ async fn serve_conn(
     peer: SocketAddr,
     tls: Arc<rustls::ServerConfig>,
     handshake_timeout: Duration,
+    metrics: Arc<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = tcp.set_nodelay(true);
 
@@ -205,13 +211,19 @@ async fn serve_conn(
     // 固定的 ServerConfig，不需要 LazyConfigAcceptor。
     let acceptor = TlsAcceptor::from(tls);
     let stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
-        Err(_) => return Err("TLS 握手超时".into()),
-        Ok(Err(e)) => return Err(Box::new(e)),
+        Err(_) => {
+            metrics.record_handshake_failure();
+            return Err("TLS 握手超时".into());
+        }
+        Ok(Err(e)) => {
+            metrics.record_handshake_failure();
+            return Err(Box::new(e));
+        }
         Ok(Ok(s)) => s,
     };
 
     let io = TokioIo::new(stream);
-    let service = proxy::service(Arc::new(site.clone()), peer);
+    let service = proxy::service(Arc::new(site.clone()), peer, metrics);
 
     // `with_upgrades()` 是 WebSocket 的开关。少了它，`hyper::upgrade::on` 会立刻
     // 返回错误，于是 101 之后拼接的两条流都拿不到 —— 表现是面板一直「正在连接」。

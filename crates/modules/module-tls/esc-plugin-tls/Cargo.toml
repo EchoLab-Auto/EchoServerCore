@@ -9,6 +9,8 @@ description = "TLS termination as an in-process plugin (SNI cert selection -> lo
 
 [dependencies]
 esc-common = { workspace = true }
+esc-control-api = { workspace = true }
+async-trait = { workspace = true }
 echo-context = { workspace = true }
 echo-plugin = { workspace = true }
 hyper = { workspace = true }

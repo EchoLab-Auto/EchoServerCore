@@ -24,6 +24,7 @@
 
 import { computed, onMounted, ref, watch } from 'vue'
 import GatewaySection from './GatewaySection.vue'
+import TlsSection from './TlsSection.vue'
 import Networks from './Networks.vue'
 import TunnelSection from './TunnelSection.vue'
 
@@ -33,14 +34,16 @@ const props = defineProps<{
   allowDelete: boolean
   tunnelReady: boolean
   gatewayReady: boolean
+  tlsReady: boolean
 }>()
 
-type Sub = 'docker' | 'tunnel' | 'gateway'
+type Sub = 'docker' | 'tls' | 'tunnel' | 'gateway'
 
 const sub = ref<Sub>('docker')
 
 const tabs = computed<[Sub, string][]>(() => {
   const out: [Sub, string][] = [['docker', 'Docker 网络']]
+  if (props.tlsReady) out.push(['tls', 'TLS 终结'])
   if (props.tunnelReady) out.push(['tunnel', '端口映射'])
   if (props.gatewayReady) out.push(['gateway', '网关'])
   return out
@@ -99,6 +102,10 @@ defineExpose({ load: () => docker.value?.load() })
           :allow-delete="props.allowDelete"
         />
       </div>
+    </div>
+
+    <div v-if="props.tlsReady && visited.has('tls')">
+      <div v-show="showing('tls')"><TlsSection /></div>
     </div>
 
     <div v-if="props.tunnelReady && visited.has('tunnel')">

@@ -39,6 +39,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::config::{Action, Site};
+use crate::control::Metrics;
 
 /// 响应与上游请求共用的体类型。
 ///
@@ -68,7 +69,13 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// 处理一个请求。
-pub async fn handle(site: Arc<Site>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+pub async fn handle(
+    site: Arc<Site>,
+    req: Request<Incoming>,
+    peer: SocketAddr,
+    metrics: Arc<Metrics>,
+) -> Response<Body> {
+    metrics.record_request();
     let started = Instant::now();
     let method = req.method().clone();
     // 日志用：`log_query = false` 时只留路径（`?token=` 不能落盘）
@@ -81,7 +88,7 @@ pub async fn handle(site: Arc<Site>, req: Request<Incoming>, peer: SocketAddr) -
     let (response, upstream_label) = match &site.action {
         Action::Redirect(template) => (redirect(site.as_ref(), &req, template), "—".to_string()),
         Action::Proxy(upstream) => {
-            let r = forward(site.as_ref(), req, peer, *upstream).await;
+            let r = forward(site.as_ref(), req, peer, *upstream, Arc::clone(&metrics)).await;
             (r, upstream.to_string())
         }
     };
@@ -197,6 +204,7 @@ async fn forward(
     mut req: Request<Incoming>,
     peer: SocketAddr,
     upstream: SocketAddr,
+    metrics: Arc<Metrics>,
 ) -> Response<Body> {
     // ── 请求体上限 ─────────────────────────────────────────────────────────
     //
@@ -210,6 +218,7 @@ async fn forward(
         .and_then(|v| v.parse::<u64>().ok())
     {
         if len > site.max_body_bytes {
+            metrics.record_body_too_large();
             return text_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
@@ -257,6 +266,7 @@ async fn forward(
         Ok(s) => s,
         Err(e) => {
             warn!(site = %site.name, %upstream, error = %e, "连不上上游");
+            metrics.record_upstream_error();
             return gateway_error(StatusCode::BAD_GATEWAY, &format!("连不上上游 {upstream}"));
         }
     };
@@ -268,6 +278,7 @@ async fn forward(
         Ok(v) => v,
         Err(e) => {
             warn!(site = %site.name, %upstream, error = %e, "上游 HTTP 握手失败");
+            metrics.record_upstream_error();
             return gateway_error(StatusCode::BAD_GATEWAY, "上游 HTTP 握手失败");
         }
     };
@@ -318,10 +329,12 @@ async fn forward(
     let mut upstream_resp = match sent {
         Err(_) => {
             warn!(site = %site.name, %upstream, timeout = ?site.read_timeout, "上游超时");
+            metrics.record_upstream_error();
             return gateway_error(StatusCode::GATEWAY_TIMEOUT, "上游超时");
         }
         Ok(Err(e)) => {
             warn!(site = %site.name, %upstream, error = %e, "上游请求失败");
+            metrics.record_upstream_error();
             return gateway_error(StatusCode::BAD_GATEWAY, "上游请求失败");
         }
         Ok(Ok(r)) => r,
@@ -488,6 +501,7 @@ fn log_access(
 pub fn service(
     site: Arc<Site>,
     peer: SocketAddr,
+    metrics: Arc<Metrics>,
 ) -> impl hyper::service::Service<
     Request<Incoming>,
     Response = Response<Body>,
@@ -496,7 +510,8 @@ pub fn service(
 > {
     service_fn(move |req: Request<Incoming>| {
         let site = Arc::clone(&site);
-        async move { Ok::<_, std::convert::Infallible>(handle(site, req, peer).await) }
+        let metrics = Arc::clone(&metrics);
+        async move { Ok::<_, std::convert::Infallible>(handle(site, req, peer, metrics).await) }
     })
 }
 

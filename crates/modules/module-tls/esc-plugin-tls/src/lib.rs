@@ -42,6 +42,7 @@
 
 pub mod certs;
 pub mod config;
+pub mod control;
 pub mod proxy;
 pub mod serve;
 
@@ -52,6 +53,7 @@ use echo_plugin::{MountContext, Plugin, PluginManifest, PluginMountError, Plugin
 use tracing::info;
 
 pub use config::{Action, CertConfig, Defaults, Site, SiteConfig, TlsModuleConfig};
+pub use control::{resolve, Metrics, TlsControlImpl, TLS_CONTROL};
 
 /// 插件在注册表里的 id（与 crate 名对应：`esc-plugin-tls` ↔ `esc.tls`）。
 pub const PLUGIN_ID: &str = "esc.tls";
@@ -130,8 +132,32 @@ impl Plugin for TlsPlugin {
         let bound = serve::bind(&validated.sites)
             .map_err(|e| PluginMountError::Mount(format!("TLS 终结无法监听: {e}")))?;
 
-        let handle = serve::spawn(bound, tls_config, validated.handshake_timeout)
-            .map_err(|e| PluginMountError::Mount(format!("TLS 终结启动失败: {e}")))?;
+        let metrics = Metrics::new();
+        let handle = serve::spawn(
+            bound,
+            tls_config,
+            validated.handshake_timeout,
+            Arc::clone(&metrics),
+        )
+        .map_err(|e| PluginMountError::Mount(format!("TLS 终结启动失败: {e}")))?;
+
+        // 注册控制面。面板靠它把「:2222 ──TLS──▶ 18790 ──隧道──▶ 4090:8080」
+        // 这条链路在一屏里画出来 —— 从前 nginx 那一层面板是看不见的。
+        //
+        // 注册失败要把刚起的监听关掉：挂载失败但端口还占着，下次重试会报
+        // "Address already in use"，而真正的原因是服务键冲突。
+        let ctl: Arc<dyn esc_control_api::TlsControl> =
+            Arc::new(TlsControlImpl::new(&validated, &cfg.cert, Arc::clone(&metrics)));
+        let ctx = mctx.context().expect("上面已确认存在");
+        let disposer = match ctx.provide(&TLS_CONTROL, ctl) {
+            Ok(d) => d,
+            Err(e) => {
+                handle.shutdown();
+                return Err(PluginMountError::Mount(format!(
+                    "无法注册 TLS 控制面服务: {e}"
+                )));
+            }
+        };
 
         info!(
             sites = validated.sites.len(),
@@ -153,9 +179,7 @@ impl Plugin for TlsPlugin {
             old.handle.shutdown();
         }
         *guard = Some(Running { handle });
-        // 没有要注册的服务键，所以不产出 Disposer —— 清理全靠 `unmount`。
-        // （Disposer 是给"mount 时往 Ctx 里塞了东西"的插件撤销用的。）
-        Ok(Vec::new())
+        Ok(vec![disposer])
     }
 
     fn unmount(&self) -> Result<(), PluginMountError> {
