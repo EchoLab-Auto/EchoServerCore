@@ -114,6 +114,19 @@ for (const [name, url, tab] of [
       const hasTunnelLink = await page.getByText('就是这条映射的监听地址').count()
       results.at(-1).tlsSites = rows
       results.at(-1).tlsChainLinked = hasTunnelLink > 0
+
+      // 编辑入口必须存在 —— 这一页从"只能看"变成"能改"是这次改动的全部意义。
+      // 只断言按钮在、能打开表单，**不点保存**：烟测跑在有真实流量的机器上，
+      // 不该顺手改掉线上监听。
+      await page.getByRole('button', { name: '编辑配置', exact: true }).click()
+      // 用「保存」按钮判断编辑态开没开：它只在编辑态渲染。
+      // 不要用 `locator('input')` —— 页面上还有别的隐藏输入（Docker 网络的过滤框），
+      // 抓到的第一个往往是它。
+      const saveBtn = page.getByRole('button', { name: '保存', exact: true })
+      await saveBtn.waitFor({ state: 'visible' })
+      results.at(-1).tlsEditable = await saveBtn.isVisible()
+      await page.getByRole('button', { name: '取消', exact: true }).last().click()
+      await saveBtn.waitFor({ state: 'hidden' })
       await page.screenshot({ path: '/tmp/esc-tls-chain.png', fullPage: true })
       await page.getByRole('tab', { name: 'Docker 网络', exact: true }).click()
     }

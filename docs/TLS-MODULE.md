@@ -283,7 +283,21 @@ tls.toml                  运行期状态 —— 存在则整体覆盖基线
 
 想回到基线：`rm /var/lib/esc/tls.toml` → 重启 `esc-host`。
 
-`store` 指向 `/var/lib/esc/`（`StateDirectory=esc` 保证可写），不是 `/etc/esc`。
+`store` 指向 `/var/lib/esc/`（`StateDirectory=esc` 保证可写），不是 `/etc/esc`：
+
+```toml
+[tls.config]
+# 面板上「保存」写这里。省略 = 只在内存生效，重启回到下面这份基线。
+store = "/var/lib/esc/tls.toml"
+
+[tls.config.defaults]
+cert = "self"
+# …
+```
+
+省了这行不会报错，面板照样能保存 —— 但它会在回执里明确说「只在内存生效」。
+这个区别必须让用户看见，否则「保存成功」和「重启后变回去」之间的落差要等到
+重启那天才暴露。
 
 ### 返回里的 `warn`
 

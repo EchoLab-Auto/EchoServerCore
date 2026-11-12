@@ -561,6 +561,9 @@ onBeforeUnmount(() => clearInterval(timer))
             <div class="esc-edit-head">
               <NeumorphismTag size="small">{{ i + 1 }}</NeumorphismTag>
               <div class="esc-edit-name">
+                <NeumorphismInput v-model="s.name" label="站点名" placeholder="panel" :size="36" />
+              </div>
+              <div class="esc-edit-kind">
                 <NeumorphismSelect
                   v-model="s.kind"
                   :options="kindOptions"
