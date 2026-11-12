@@ -30,6 +30,7 @@ pub mod auth;
 pub mod config;
 pub mod proxy;
 pub mod routes;
+pub mod segment;
 pub mod store;
 pub mod web;
 
@@ -48,6 +49,20 @@ pub use store::AccountStore;
 /// 一半，比完全没起来更危险：你以为 2224 被保护着，其实它在裸跑。
 pub async fn run(cfg: RuntimeConfig, shutdown: CancellationToken) -> anyhow::Result<()> {
     let gw = Arc::new(Gateway::new(Arc::new(cfg)));
+
+    // 网段自检先于绑定：地址不在本机（容器没共享主机网络、或 link 网段的设备
+    // 没建出来）时，直接不起来。一个"以为自己在网段里、实际监听在 0.0.0.0 上"
+    // 的网关，比一个没起来的网关危险得多——后者只是 outage，前者是旁路。
+    for seg in gw.cfg.segments.all() {
+        seg.probe().map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::info!(
+            segment = %seg.name,
+            cidr = seg.cidr(),
+            kind = seg.kind.label(),
+            probe = %seg.probe_addr(),
+            "segment ready"
+        );
+    }
 
     // 先全部绑定，全部成功才开始服务。这样端口冲突会在启动时暴露，
     // 而不是等到某个用户访问那个端口才发现——一个认证网关只起来了一半，
@@ -73,6 +88,7 @@ pub async fn run(cfg: RuntimeConfig, shutdown: CancellationToken) -> anyhow::Res
 
     tracing::info!(
         routes = gw.route_count(),
+        segments = gw.cfg.segments.len(),
         users = gw.cfg.users.len(),
         admin_listen = ?gw.cfg.admin_listen,
         http_only = !gw.cfg.secure_cookie,

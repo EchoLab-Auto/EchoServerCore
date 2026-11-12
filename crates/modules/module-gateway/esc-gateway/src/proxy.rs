@@ -312,6 +312,7 @@ impl Gateway {
                     listen: rt.listen.to_string(),
                     upstream: rt.upstream.to_string(),
                     host: rt.host.clone(),
+                    segment: rt.segment.clone(),
                     allowed_cidrs: rt.allowed_cidrs_raw.clone(),
                     strip_prefix: rt.strip_prefix.clone(),
                     max_body_bytes: Some(rt.max_body_bytes),
@@ -327,6 +328,11 @@ impl Gateway {
     /// 生效的路由名（面板里画成复选框、校验引用时用）。
     pub fn route_names(&self) -> Vec<String> {
         self.routes.names()
+    }
+
+    /// 配置里声明的隔离网段名（面板表单的下拉框用）。
+    pub fn segment_names(&self) -> Vec<String> {
+        self.cfg.segments.names()
     }
 
     /// 用一份候选状态去算"合并后的完整列表"。
@@ -351,13 +357,14 @@ impl Gateway {
                 listen: rt.listen.to_string(),
                 upstream: rt.upstream.to_string(),
                 host: rt.host.clone(),
+                segment: rt.segment.clone(),
                 allowed_cidrs: rt.allowed_cidrs_raw.clone(),
                 strip_prefix: rt.strip_prefix.clone(),
                 max_body_bytes: Some(rt.max_body_bytes),
             })
             .chain(pending.routes.values().cloned())
             .collect();
-        crate::config::validate_route_list(&specs)
+        crate::config::validate_route_list(&specs, &self.cfg.segments)
     }
 
     /// 热应用第一步：算合并结果 + **现绑新端口**。

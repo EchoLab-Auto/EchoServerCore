@@ -723,6 +723,7 @@ mod tests {
             listen: listen.into(),
             upstream: upstream.into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -741,7 +742,7 @@ mod tests {
     /// 于是每接一个服务就要多占一个地址。
     #[test]
     fn host_routing_picks_the_right_route() {
-        let rts = crate::config::validate_route_list(&[
+        let rts = crate::config::validate_route_list_ns(&[
             spec_host("panel", "0.0.0.0:8080", "127.0.0.1:9001", Some("panel.example.com")),
             spec_host("cad", "0.0.0.0:8080", "127.0.0.1:9002", Some("cad.example.com")),
             spec_host("rest", "0.0.0.0:8080", "127.0.0.1:9003", None),
@@ -771,7 +772,7 @@ mod tests {
     /// 表现为「页面打不开」或「登录了但没权限」——最难查的那种。
     #[test]
     fn an_unknown_host_without_fallback_matches_nothing() {
-        let rts = crate::config::validate_route_list(&[
+        let rts = crate::config::validate_route_list_ns(&[
             spec_host("panel", "0.0.0.0:8080", "127.0.0.1:9001", Some("panel.example.com")),
             spec_host("cad", "0.0.0.0:8080", "127.0.0.1:9002", Some("cad.example.com")),
         ])
@@ -996,7 +997,7 @@ upstream = "127.0.0.1:18788"
 
     #[test]
     fn registry_looks_up_by_listen_address() {
-        let rts = crate::config::validate_route_list(&[
+        let rts = crate::config::validate_route_list_ns(&[
             spec("a", "0.0.0.0:2224", "127.0.0.1:18788"),
             spec("b", "0.0.0.0:2225", "127.0.0.1:18789"),
         ])
@@ -1012,11 +1013,11 @@ upstream = "127.0.0.1:18788"
     #[test]
     fn registry_replace_all_swaps_everything() {
         let reg = RouteRegistry::new(
-            crate::config::validate_route_list(&[spec("a", "0.0.0.0:2224", "127.0.0.1:1")])
+            crate::config::validate_route_list_ns(&[spec("a", "0.0.0.0:2224", "127.0.0.1:1")])
                 .unwrap(),
         );
         reg.replace_all(
-            crate::config::validate_route_list(&[spec("b", "0.0.0.0:2225", "127.0.0.1:2")])
+            crate::config::validate_route_list_ns(&[spec("b", "0.0.0.0:2225", "127.0.0.1:2")])
                 .unwrap(),
         );
         assert!(reg.get("a").is_none());

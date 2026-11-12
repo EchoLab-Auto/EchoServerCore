@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use esc_panel_auth::AllowRule;
 
+use crate::segment::{SegmentConfig, SegmentSet};
 /// 一整个网关配置。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +90,30 @@ pub struct GatewayConfig {
     /// 进去改账号」就填这里，不必为此多占一个端口。
     #[serde(default)]
     pub admin_allowed_cidrs: Vec<String>,
+
+    /// 主机内部的**隔离网段**（可多个，彼此不许重叠）。
+    ///
+    /// 声明的意义不是"多一个网段前缀"，而是把「谁是网关的前门」写死在配置里：
+    ///
+    /// ```toml
+    /// [[segment]]
+    /// name = "edge"
+    /// cidr = "127.213.0.0/16"
+    ///
+    /// [[route]]
+    /// name = "panel"; listen = "127.213.0.1:18801"; upstream = "127.0.0.1:18788"
+    /// segment = "edge"
+    /// ```
+    ///
+    /// 一旦某条路由声明了 `segment`，网关就强制三件事（见
+    /// [`check_segment_rules`]）：listen 必须是网段内的**具体地址**（不许
+    /// `0.0.0.0`）、upstream 必须是本机回环、网段内的监听不许"不声明归属"。
+    /// 于是拓扑变成「外部 → TLS 终结 → 隔离网段 → 认证 → 回环」，那条
+    /// "直连网关端口绕过 TLS"的旁路在结构上就不存在了。
+    ///
+    /// 语义与实现细节见 [`crate::segment`]。
+    #[serde(default)]
+    pub segment: Vec<SegmentConfig>,
 
     /// 用户表。至少一个，且每个都必须有 `hash`。
     #[serde(default)]
@@ -187,6 +212,19 @@ pub struct RouteConfig {
     /// 同一端口上最多只能有**一条**不带 `host` 的路由（它就是兜底）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// 这条路由归属的隔离网段名（见 [`GatewayConfig::segment`]）。
+    ///
+    /// 写了它就等于承诺三件事，网关在启动与热应用时都会校验：
+    ///
+    /// * `listen` 落在该网段里，且必须是**具体地址**（`0.0.0.0` 会被拒——
+    ///   那等于把前门又铺回所有接口上）；
+    /// * `upstream` 是本机回环地址（"认证后落到本机"是这条拓扑的语义）；
+    /// * 反过来说，`listen` 落在网段内却没写 `segment` 也是错的——网段里的
+    ///   监听必须显式归属，否则"谁在这个网段里"就没人管。
+    ///
+    /// 不写 = 不加这层约束，行为与加网段功能之前完全一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<String>,
     /// 额外的来源白名单（和用户认证是**与**关系）。空 = 不限。
     #[serde(default)]
     pub allowed_cidrs: Vec<String>,
@@ -277,6 +315,13 @@ impl RouteConfig {
             listen: addr,
             upstream: up,
             host,
+            // 空串当没写：面板输入框清空后发上来的是 ""，那不是"名为空的网段"。
+            segment: self
+                .segment
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             allow,
             allowed_cidrs_raw: self.allowed_cidrs.clone(),
             strip_prefix: self.strip_prefix.clone(),
@@ -383,7 +428,14 @@ pub fn routes_overlap(a: &RouteRuntime, b: &RouteRuntime) -> bool {
 }
 
 /// 校验一组路由（可能是"配置文件 ∪ 路由库"的合并结果）。
-pub fn validate_route_list(routes: &[RouteConfig]) -> Result<Vec<RouteRuntime>, String> {
+///
+/// `segments` 是配置里声明的隔离网段。归属规则在
+/// [`check_segment_rules`] 里，和启动、面板热应用共用同一套判据——
+/// 两处各写一份的话，面板改出来的东西可能过不了下一次重启。
+pub fn validate_route_list(
+    routes: &[RouteConfig],
+    segments: &SegmentSet,
+) -> Result<Vec<RouteRuntime>, String> {
     let mut names = HashSet::new();
     let mut out: Vec<RouteRuntime> = Vec::with_capacity(routes.len());
     for r in routes {
@@ -391,6 +443,7 @@ pub fn validate_route_list(routes: &[RouteConfig]) -> Result<Vec<RouteRuntime>, 
         if !names.insert(rt.name.clone()) {
             return Err(format!("route 名 {:?} 重复", rt.name));
         }
+        check_segment_rules(&rt, segments)?;
         if let Some(other) = out.iter().find(|o| routes_overlap(o, &rt)) {
             let why = match (&other.host, &rt.host) {
                 (None, None) => format!(
@@ -412,6 +465,86 @@ pub fn validate_route_list(routes: &[RouteConfig]) -> Result<Vec<RouteRuntime>, 
     Ok(out)
 }
 
+/// 测试用包装：不声明任何网段，等价于加这个特性之前的行为。
+#[cfg(test)]
+pub(crate) fn validate_route_list_ns(
+    routes: &[RouteConfig],
+) -> Result<Vec<RouteRuntime>, String> {
+    validate_route_list(routes, &SegmentSet::empty())
+}
+
+/// 一条路由与隔离网段的归属规则。
+///
+/// 三条都是**结构**约束，不是风格建议——每一条被绕过，都意味着有人可以
+/// 不经 TLS 终结就摸到认证后的上游：
+///
+/// 1. 声明了 `segment` 就必须落在网段里，且不能是 `0.0.0.0`
+///    （`0.0.0.0` 会把同一个端口同时铺在公网口上，网段白建）；
+/// 2. 声明了 `segment` 的 upstream 必须是本机回环
+///    （"认证后落到本机"是这条拓扑的语义，上游跑到别的机器上这跳就白隔离了）；
+/// 3. 反过来，`listen` 落在网段里却没声明 `segment` 也算错
+///    （否则"这个网段里都有谁在听"没人管得住）。
+pub fn check_segment_rules(rt: &RouteRuntime, segments: &SegmentSet) -> Result<(), String> {
+    match &rt.segment {
+        Some(name) => {
+            let Some(seg) = segments.get(name) else {
+                return Err(format!(
+                    "route {:?} 引用了不存在的 segment {name:?}（已定义: {:?}）",
+                    rt.name,
+                    segments.names()
+                ));
+            };
+            if rt.listen.ip().is_unspecified() {
+                return Err(format!(
+                    "route {:?} 归属网段 {name}，listen 必须写网段内的具体地址（如 {}:{}），\
+                     不能写 {}——那样同一个端口会同时铺在公网口上，绕过 TLS 的旁路又回来了",
+                    rt.name,
+                    seg.probe_addr(),
+                    rt.listen.port(),
+                    rt.listen.ip()
+                ));
+            }
+            if !seg.contains(rt.listen.ip()) {
+                return Err(format!(
+                    "route {:?} 的 listen {} 不在 segment {name}（{}）里",
+                    rt.name,
+                    rt.listen,
+                    seg.cidr()
+                ));
+            }
+            if !is_loopback(rt.upstream.ip()) {
+                return Err(format!(
+                    "route {:?} 归属网段 {name}，upstream 必须是本机回环地址（127.0.0.0/8 或 ::1），\
+                     现在是 {}。网段路由的语义是「认证后落到本机回环」",
+                    rt.name, rt.upstream
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            if let Some(seg) = segments.find_for_ip(rt.listen.ip()) {
+                return Err(format!(
+                    "route {:?} 的 listen {} 落在 segment {}（{}）的网段里，但没写 segment。\
+                     网段内的监听必须显式归属，否则「谁在这个网段里」就没人管了",
+                    rt.name,
+                    rt.listen,
+                    seg.name,
+                    seg.cidr()
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 本机回环：`127.0.0.0/8` 或 `::1`。
+fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -424,6 +557,7 @@ impl Default for GatewayConfig {
             rate_limit: RateLimitConfig::default(),
             user: Vec::new(),
             route: Vec::new(),
+            segment: Vec::new(),
             users_file: None,
             routes_file: None,
             admin_listen: None,
@@ -579,40 +713,17 @@ impl GatewayConfig {
             }
         }
 
-        // ── 路由 ──
-        let mut rnames = HashSet::new();
-        for r in &self.route {
-            r.to_runtime()?;
-            if !rnames.insert(r.name.as_str()) {
-                return Err(format!("route 名 {:?} 重复", r.name));
-            }
-        }
-        // 冲突判定与 `validate_route_list` 共用同一套判据：**同端口并不算冲突**，
-        // 除非两条路由会命中的 Host 集合有交集（那才是真抢同一个请求）。
+        // ── 隔离网段 ──
+        // ── 隔离网段 ──
+        let segments = SegmentSet::parse(&self.segment)?;
+
+        // ── 路由（含网段归属）──
         //
-        // 从前这里是 `listeners_conflict` 单判端口，于是「一个监听地址服务多个
-        // 上游」这种配置在启动时就被拒了 —— 而那正是省掉多余监听地址的办法。
-        let mut seen: Vec<RouteRuntime> = Vec::new();
-        for r in &self.route {
-            let rt = r.to_runtime()?;
-            if let Some(other) = seen.iter().find(|o| routes_overlap(o, &rt)) {
-                let why = match (&other.host, &rt.host) {
-                    (None, None) => format!(
-                        "{} 与 {} 都监听 {} 且都没写 host —— 同一个端口只能有一个兜底",
-                        other.name, rt.name, rt.listen
-                    ),
-                    _ => format!(
-                        "{} 与 {} 都监听 {} 且都要接 Host = {} 的请求",
-                        other.name,
-                        rt.name,
-                        rt.listen,
-                        rt.host.as_deref().unwrap_or("?")
-                    ),
-                };
-                return Err(format!("{why}。给其中一条换 host，或换一个端口。"));
-            }
-            seen.push(rt);
-        }
+        // 判据全部收在 `validate_route_list` 里：启动、`check`、面板热应用三处
+        // 共用一份。各写一套的下场是「面板改得动、重启起不来」，而且顺序不同
+        // 还会给出两种不同的错误信息。
+        let runtimes = validate_route_list(&self.route, &segments)?;
+        let rnames: HashSet<&str> = runtimes.iter().map(|r| r.name.as_str()).collect();
 
         // ── 用户引用的 route 必须存在 ──
         for u in &self.user {
@@ -637,11 +748,10 @@ impl GatewayConfig {
         }
         Ok(())
     }
-
-    /// 预先解析好的运行时视图（避免每请求都 parse 字符串）。
     pub fn build(&self) -> Result<RuntimeConfig, String> {
         self.validate()?;
-        let runtimes = validate_route_list(&self.route)?;
+        let segments = SegmentSet::parse(&self.segment)?;
+        let runtimes = validate_route_list(&self.route, &segments)?;
         let mut routes = HashMap::new();
         let mut listens = Vec::new();
         for rt in runtimes {
@@ -676,6 +786,7 @@ impl GatewayConfig {
             users,
             routes,
             listens,
+            segments,
             users_file: self.users_file.clone(),
             routes_file: self.routes_file.clone(),
             admin_listen: self.admin_listen.as_deref().and_then(|s| s.parse().ok()),
@@ -713,6 +824,8 @@ pub struct RouteRuntime {
     pub upstream: SocketAddr,
     /// 归一化后的 host 条件（小写、无端口）。`None` = 这个端口的默认路由。
     pub host: Option<String>,
+    /// 归属的隔离网段名（`None` = 不受网段约束）。
+    pub segment: Option<String>,
     pub allow: Vec<AllowRule>,
     /// 解析后的 `allow` 对应的原文。面板要显示、要回填编辑框，靠结构体反推
     /// 字符串既不可靠（规范化之后和用户写的不一样），也没必要。
@@ -768,6 +881,8 @@ pub struct RuntimeConfig {
     pub users: HashMap<String, UserRuntime>,
     pub routes: HashMap<String, RouteRuntime>,
     pub listens: Vec<SocketAddr>,
+    /// 隔离网段（空集合 = 没用这个特性，行为与从前一致）。
+    pub segments: SegmentSet,
     /// 账号库路径。`None` = 面板只读（只用配置文件里的账号）。
     pub users_file: Option<PathBuf>,
     /// 路由库路径。`None` = 端口只能在配置文件里改。
@@ -895,6 +1010,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:2223".into(), // 同端口
             upstream: "127.0.0.1:18788".into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -910,6 +1026,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:2224".into(),
             upstream: "127.0.0.1:18788".into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -945,7 +1062,6 @@ upstream = "127.0.0.1:18787"
         assert!(c.validate().unwrap_err().contains("route"));
     }
 
-    #[test]
     /// 同一个端口上「两条兜底」必须被拒 —— 那等于两条路由抢同一个请求。
     #[test]
     fn two_default_routes_on_one_port_are_rejected() {
@@ -954,11 +1070,12 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9000".into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
         };
-        let err = validate_route_list(&[mk("a"), mk("b")]).unwrap_err();
+        let err = validate_route_list_ns(&[mk("a"), mk("b")]).unwrap_err();
         assert!(err.contains("兜底"), "{err}");
     }
 
@@ -970,11 +1087,12 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9000".into(),
             host: Some(host.into()),
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
         };
-        let err = validate_route_list(&[mk("a", "x.example.com"), mk("b", "X.Example.com")])
+        let err = validate_route_list_ns(&[mk("a", "x.example.com"), mk("b", "X.Example.com")])
             .unwrap_err();
         assert!(err.contains("Host"), "{err}");
     }
@@ -987,6 +1105,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9001".into(),
             host: Some("panel.example.com".into()),
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -996,11 +1115,12 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9002".into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
         };
-        let out = validate_route_list(&[a, b]).expect("一条 host + 一条兜底应当允许");
+        let out = validate_route_list_ns(&[a, b]).expect("一条 host + 一条兜底应当允许");
         assert_eq!(out.len(), 2);
         // 两条都指向同一个端口，但只有一条是兜底
         assert!(out.iter().filter(|r| r.is_default()).count() == 1);
@@ -1014,11 +1134,12 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9000".into(),
             host: Some(host.into()),
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
         };
-        let out = validate_route_list(&[
+        let out = validate_route_list_ns(&[
             mk("panel", "panel.example.com"),
             mk("cad", "cad.example.com"),
             mk("shop", "shop.example.com"),
@@ -1035,6 +1156,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9000".into(),
             host: Some(raw.into()),
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -1055,6 +1177,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:8080".into(),
             upstream: "127.0.0.1:9000".into(),
             host: Some(raw.into()),
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -1069,6 +1192,115 @@ upstream = "127.0.0.1:18787"
         }
     }
 
+    // ───────────────────────── 隔离网段 ─────────────────────────
+
+    fn seg_cfg(name: &str, cidr: &str) -> crate::segment::SegmentConfig {
+        crate::segment::SegmentConfig {
+            name: name.into(),
+            cidr: cidr.into(),
+            note: None,
+        }
+    }
+
+    fn route_in(name: &str, listen: &str, upstream: &str, segment: Option<&str>) -> RouteConfig {
+        RouteConfig {
+            name: name.into(),
+            listen: listen.into(),
+            upstream: upstream.into(),
+            host: None,
+            segment: segment.map(str::to_string),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        }
+    }
+
+    /// 网段里的一条路由 + TLS 指向它 —— 这是目标拓扑，必须能过。
+    #[test]
+    fn segment_route_is_accepted() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let rts = validate_route_list(
+            &[route_in("panel", "127.213.0.1:18801", "127.0.0.1:18788", Some("edge"))],
+            &segs,
+        )
+        .expect("网段内的具体地址 + 回环上游应当通过");
+        assert_eq!(rts[0].segment.as_deref(), Some("edge"));
+    }
+
+    /// `0.0.0.0` 会把同一个端口又铺回公网口上——网段白建，必须拒。
+    #[test]
+    fn segment_route_must_not_bind_all_interfaces() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("panel", "0.0.0.0:18801", "127.0.0.1:18788", Some("edge"))],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("具体地址"), "{err}");
+    }
+
+    /// 归属了网段却把 listen 写在网段外：自欺欺人，拒。
+    #[test]
+    fn segment_route_outside_cidr_is_rejected() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("panel", "127.214.0.1:18801", "127.0.0.1:18788", Some("edge"))],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("不在 segment"), "{err}");
+    }
+
+    /// 归属网段但上游不是本机回环：这一跳白隔离了。
+    #[test]
+    fn segment_route_upstream_must_be_loopback() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("panel", "127.213.0.1:18801", "10.1.0.9:18788", Some("edge"))],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("回环"), "{err}");
+    }
+
+    /// 网段内地址却没声明归属：网段里有什么就没人管了，拒。
+    #[test]
+    fn unowned_listener_inside_a_segment_is_rejected() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("sneaky", "127.213.0.9:18802", "127.0.0.1:18788", None)],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("没写 segment"), "{err}");
+    }
+
+    /// 引用了不存在的网段：错误信息要列出已定义的名字。
+    #[test]
+    fn unknown_segment_reference_lists_the_available_ones() {
+        let segs = SegmentSet::parse(&[seg_cfg("edge", "127.213.0.0/16")]).unwrap();
+        let err = validate_route_list(
+            &[route_in("panel", "127.213.0.1:18801", "127.0.0.1:18788", Some("nope"))],
+            &segs,
+        )
+        .unwrap_err();
+        assert!(err.contains("nope") && err.contains("edge"), "{err}");
+    }
+
+    /// 不写 segment 的部署完全不受影响（兼容性红线）。
+    #[test]
+    fn deployments_without_segments_are_untouched() {
+        let segs = SegmentSet::empty();
+        let rts = validate_route_list(
+            &[route_in("panel", "0.0.0.0:2224", "127.0.0.1:18788", None)],
+            &segs,
+        )
+        .expect("没有网段时 0.0.0.0 依然合法");
+        assert!(rts[0].segment.is_none());
+    }
+
+    /// 非法 CIDR 与相对前缀都要在启动时就被拦住。
+    #[test]
     fn bad_cidr_and_relative_strip_prefix_are_rejected() {
         let mut c = minimal();
         c.route[0].allowed_cidrs = vec!["10.0.0.0/33".into()];
@@ -1087,6 +1319,7 @@ upstream = "127.0.0.1:18787"
             listen: "0.0.0.0:2224".into(),
             upstream: "127.0.0.1:18788".into(),
             host: None,
+            segment: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,

@@ -15,11 +15,14 @@ fn usage() -> String {
     esc-gateway [-c|--config <路径>]
     esc-gateway hash-password [口令]
     esc-gateway check [-c|--config <路径>]
+    esc-gateway segment [-c|--config <路径>]
     esc-gateway health [-c|--config <路径>]
 
 子命令:
     hash-password   生成 argon2id 哈希（不传口令则从标准输入读，避免进 shell 历史）
     check           只校验配置并打印将要监听的端口，不绑定任何东西
+    segment         打印隔离网段的拓扑：网段地址能不能用、里面有哪几条路由、
+                    TLS 终结该把上游指向哪（改网段配置之后先跑这个）
     health          探活：向配置里第一个 route 的端口发一个 /__auth/healthz
                     （容器健康检查用——镜像里没有 shell，不能用 curl）
 
@@ -38,6 +41,7 @@ fn usage() -> String {
 enum Invocation {
     Run(PathBuf),
     Check(PathBuf),
+    Segment(PathBuf),
     Health(PathBuf),
     HashPassword(Option<String>),
     Help,
@@ -95,9 +99,64 @@ where
     match sub.as_deref() {
         None => Ok(Invocation::Run(cfg_path())),
         Some("check") => Ok(Invocation::Check(cfg_path())),
+        Some("segment") => Ok(Invocation::Segment(cfg_path())),
         Some("health") => Ok(Invocation::Health(cfg_path())),
         Some("hash-password") => Ok(Invocation::HashPassword(rest.into_iter().next())),
         Some(other) => Err(format!("未知子命令 {other:?}\n\n{}", usage())),
+    }
+}
+
+/// 打印隔离网段：声明、地址自检、里面有哪些路由、TLS 该指哪。
+///
+/// 输出顺序照着「怎么看」排，而不是照着数据结构排：先「这个网段还活着吗」，
+/// 再「谁在里面」，最后「外面那一跳该指向哪」。
+fn print_segments(rt: &esc_gateway::RuntimeConfig) {
+    if rt.segments.is_empty() {
+        println!("隔离网段     : 未配置（listen 直接对外，没有 TLS 与认证之间的那一跳）");
+        return;
+    }
+    for seg in rt.segments.all() {
+        let probe = match seg.probe() {
+            Ok(()) => format!("可用 {}", seg.probe_addr()),
+            Err(_) => format!("不可用 {}（地址不在本机）", seg.probe_addr()),
+        };
+        println!(
+            "隔离网段     : {}  {}  [{}]  {probe}",
+            seg.name,
+            seg.cidr(),
+            seg.kind.label()
+        );
+        if let Some(note) = &seg.note {
+            println!("               {note}");
+        }
+        let mut rts: Vec<&esc_gateway::config::RouteRuntime> = rt
+            .routes
+            .values()
+            .filter(|r| r.segment.as_deref() == Some(seg.name.as_str()))
+            .collect();
+        rts.sort_by_key(|r| r.listen.port());
+        if rts.is_empty() {
+            println!("               （网段里还没有路由 —— 声明了没用上）");
+        }
+        for r in rts {
+            println!(
+                "               {:<16} {} → {}   ← TLS 上游指向 {}",
+                r.name, r.listen, r.upstream, r.listen
+            );
+        }
+    }
+    let loose: Vec<&esc_gateway::config::RouteRuntime> = rt
+        .routes
+        .values()
+        .filter(|r| r.segment.is_none())
+        .collect();
+    if !loose.is_empty() {
+        let mut names: Vec<String> = loose.iter().map(|r| format!("{}@{}", r.name, r.listen)).collect();
+        names.sort();
+        println!(
+            "网段之外的监听: {}（这些地址仍按原样对外暴露，绕过 TLS 的那条路还在）",
+            names.join(", ")
+        );
     }
 }
 
@@ -240,6 +299,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             println!();
+            print_segments(&rt);
+
+            println!();
             match rt.admin_listen {
                 Some(a) => {
                     println!("管理面板：独立端口 {a}（/__admin/，含登录页）");
@@ -256,6 +318,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("  口令与 session cookie 在链路上可被读取。生产环境请在前面加 TLS");
                 println!("  （nginx/Caddy），或等网关自己支持 TLS 后打开 secure_cookie。");
             }
+            Ok(())
+        }
+        // 网段拓扑单列一个子命令：改完 `[[segment]]` / `segment = "..."` 之后，
+        // 想知道「地址还在不在、TLS 该指哪」时不用把整个网关重启一遍。
+        Invocation::Segment(path) => {
+            let cfg = esc_gateway::GatewayConfig::load(&path)?;
+            let rt = cfg.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+            print_segments(&rt);
             Ok(())
         }
         Invocation::Health(path) => {

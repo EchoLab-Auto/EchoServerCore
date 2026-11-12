@@ -253,6 +253,10 @@ pub struct RouteFormView {
     pub upstream: String,
     /// 只在 `Host` 命中时走这条。空串 = 这个端口的兜底。
     pub host: String,
+    /// 归属的隔离网段名（空串 = 不受网段约束）。
+    pub segment: String,
+    /// 配置里声明的网段名，供表单下拉框用。
+    pub segments: Vec<String>,
     pub strip_prefix: String,
     pub max_body_bytes: String,
     pub allowed_cidrs: String,

@@ -447,6 +447,7 @@ mod tests {
             users: HashMap::new(),
             routes: HashMap::new(),
             listens: vec![],
+            segments: crate::segment::SegmentSet::empty(),
             users_file: None,
             routes_file: None,
             admin_listen: None,

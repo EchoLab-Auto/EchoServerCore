@@ -187,6 +187,9 @@ pub async fn handle(
         (true, ["users", name, "adopt"]) => ctx.user_adopt(name),
         (true, ["users", name, "revoke"]) => ctx.user_revoke_sessions(name),
 
+        // 隔离网段：谁在这个网段里、地址能不能用、TLS 该指向哪
+        (false, ["segments"]) => ctx.segments_page(),
+
         // 代理（端口 → 上游）
         (false, ["routes"]) => ctx.routes_page(),
         (true, ["routes"]) => ctx.route_create(req).await,
@@ -263,6 +266,7 @@ impl Ctx<'_> {
                 json!({
                     "name": r.spec.name,
                     "listen": r.spec.listen,
+                    "segment": r.spec.segment,
                     "disabled": r.disabled,
                     "listening": r.disabled == false,
                 })
@@ -295,6 +299,54 @@ impl Ctx<'_> {
             .find(|(sid, _)| sid == &self.sid)
             .map(|(_, s)| s.can_access(route))
             .unwrap_or(false)
+    }
+
+    /// 隔离网段的状态：声明了什么、里面有哪些路由、地址在本机能不能用。
+    ///
+    /// 只读端点。网段是**拓扑承诺**（listen 只能在网段里、上游只能是回环），
+    /// 改它必须重启——这种改动不该有一个"点一下就生效"的入口。
+    fn segments_page(&self) -> HyperResponse<ProxyBody> {
+        let gw = self.gw;
+        let routes = gw.effective_routes();
+        let rows: Vec<serde_json::Value> = gw
+            .cfg
+            .segments
+            .all()
+            .iter()
+            .map(|seg| {
+                let mine: Vec<serde_json::Value> = routes
+                    .iter()
+                    .filter(|r| r.spec.segment.as_deref() == Some(seg.name.as_str()))
+                    .map(|r| {
+                        json!({
+                            "name": r.spec.name,
+                            "listen": r.spec.listen,
+                            "upstream": r.spec.upstream,
+                            "disabled": r.disabled,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "name": seg.name,
+                    "cidr": seg.cidr(),
+                    "kind": seg.kind.label(),
+                    "note": seg.note,
+                    // 探一下地址还在不在：容器重启过、设备被删掉，
+                    // 这里会立刻从 ready 变成 false。
+                    "probe_addr": seg.probe_addr().to_string(),
+                    "ready": seg.probe().is_ok(),
+                    "routes": mine,
+                })
+            })
+            .collect();
+        json_with(
+            StatusCode::OK,
+            json!({
+                "segments": rows,
+                "//": "网段地址只在本机可达。TLS 终结的上游要指向上面的 listen；\
+                       从公网直连这些地址不可能成功——这正是它存在的意义。",
+            }),
+        )
     }
 
     fn users_page(&self) -> HyperResponse<ProxyBody> {
@@ -790,6 +842,7 @@ impl Ctx<'_> {
             listen: e.spec.listen.clone(),
             upstream: e.spec.upstream.clone(),
             host: e.spec.host.clone().unwrap_or_default(),
+            segment: e.spec.segment.clone().unwrap_or_default(),
             strip_prefix: e.spec.strip_prefix.clone().unwrap_or_default(),
             max_body_bytes: e
                 .spec
@@ -1069,6 +1122,7 @@ impl Ctx<'_> {
                     listen: spec.listen,
                     upstream: spec.upstream,
                     host: spec.host.unwrap_or_default(),
+                    segment: spec.segment.unwrap_or_default(),
                     strip_prefix: spec.strip_prefix.unwrap_or_default(),
                     max_body_bytes: spec
                         .max_body_bytes
@@ -1300,6 +1354,8 @@ impl Ctx<'_> {
             listen: st.listen,
             upstream: st.upstream,
             host: st.host,
+            segment: st.segment,
+            segments: self.gw.segment_names(),
             strip_prefix: st.strip_prefix,
             max_body_bytes: st.max_body_bytes,
             allowed_cidrs: st.allowed_cidrs,
@@ -1402,6 +1458,7 @@ struct RouteFormState {
     listen: String,
     upstream: String,
     host: String,
+    segment: String,
     strip_prefix: String,
     max_body_bytes: String,
     allowed_cidrs: String,
@@ -1414,6 +1471,7 @@ struct RouteInput {
     listen: String,
     upstream: String,
     host: String,
+    segment: String,
     strip_prefix: String,
     max_body_bytes: String,
     allowed_cidrs: String,
@@ -1426,6 +1484,7 @@ impl RouteInput {
             listen: f.get("listen").unwrap_or("").trim().to_string(),
             upstream: f.get("upstream").unwrap_or("").trim().to_string(),
             host: f.get("host").unwrap_or("").trim().to_string(),
+            segment: f.get("segment").unwrap_or("").trim().to_string(),
             strip_prefix: f.get("strip_prefix").unwrap_or("").trim().to_string(),
             max_body_bytes: f.get("max_body_bytes").unwrap_or("").trim().to_string(),
             allowed_cidrs: f.get("allowed_cidrs").unwrap_or("").trim().to_string(),
@@ -1440,6 +1499,7 @@ impl RouteInput {
             listen: self.listen.clone(),
             upstream: self.upstream.clone(),
             host: self.host.clone(),
+            segment: self.segment.clone(),
             strip_prefix: self.strip_prefix.clone(),
             max_body_bytes: self.max_body_bytes.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
@@ -1508,6 +1568,23 @@ impl RouteInput {
             }
         }
 
+        // 网段归属：表单里填了就听表单的，没填就继承原来的值。
+        //
+        // 继承是必须的：面板的表单只显示它认识的字段，而一条路由一旦归属某个
+        // 网段，listen 就只能在那个网段里。如果编辑时把 segment 丢了，保存出去的
+        // 那条路由会变成「网段内地址却没声明归属」——被校验拦下，用户会以为是
+        // 面板坏了。要么传上来，要么保留，没有第三种正确做法。
+        let inherited_segment = if is_new {
+            None
+        } else {
+            existing
+                .and_then(|n| gw.effective_routes().into_iter().find(|r| r.spec.name == n))
+                .and_then(|r| r.spec.segment)
+        };
+        let segment = Some(self.segment.clone())
+            .filter(|s| !s.is_empty())
+            .or(inherited_segment);
+
         Ok(crate::config::RouteConfig {
             name,
             listen: self.listen.clone(),
@@ -1515,6 +1592,7 @@ impl RouteInput {
             // 空串 = 不限定 Host（这个端口的兜底）。后端会做归一化与校验：
             // 带路径、带通配符、有空格的都在那里报错，这里不重复一套规则。
             host: Some(self.host.clone()).filter(|h| !h.is_empty()),
+            segment,
             allowed_cidrs,
             strip_prefix: if self.strip_prefix.is_empty() {
                 None
@@ -1531,6 +1609,9 @@ fn route_detail(spec: &crate::config::RouteConfig) -> String {
     let mut parts = Vec::new();
     if let Some(h) = &spec.host {
         parts.push(format!("Host = {h}"));
+    }
+    if let Some(s) = &spec.segment {
+        parts.push(format!("网段 {s}"));
     }
     if let Some(p) = &spec.strip_prefix {
         parts.push(format!("剥前缀 {p}"));
