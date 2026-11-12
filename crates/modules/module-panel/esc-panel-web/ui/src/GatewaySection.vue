@@ -366,7 +366,22 @@ onMounted(loadAll)
     </main>
 
     <!-- ── 账号弹窗 ─────────────────────────────────────────────────────── -->
-    <NeumorphismModal v-if="editingUser" :model-value="true" title="账号" @close="editingUser = null">
+    <!--
+      绑定方式必须是「`:model-value="!!x"` + `@update:model-value`」，不能用
+      `:model-value="true"` + `@close`：
+      弹窗组件关闭时走的是 `emit('update:modelValue', false)`，父组件不接这条的话
+      prop 永远是 true，于是对话框**关不掉** —— X、遮罩、ESC、以及组件自带的那个
+      「取消」全部失效，只有下面 `.esc-actions` 里自己写的「取消」有用（它直接改 ref）。
+      这正是「取消无法退出」的来源。
+
+      `:footer="false"`：这个表单自己有保存/取消，组件默认页脚会再渲染一对
+      「取消/确定」—— 其中「确定」没有接任何保存逻辑，点了像是保存成功、实际丢改动。 -->
+    <NeumorphismModal
+      :model-value="!!editingUser"
+      title="账号"
+      :footer="false"
+      @update:model-value="editingUser = null"
+    >
       <div class="esc-form">
         <NeumorphismInput v-model="editingUser.name" label="账号名" :disabled="!editingUser.is_new" />
         <NeumorphismInput v-model="editingUser.pass" label="口令（留空 = 不改）" type="password" />
@@ -386,7 +401,12 @@ onMounted(loadAll)
     </NeumorphismModal>
 
     <!-- ── 端口弹窗 ─────────────────────────────────────────────────────── -->
-    <NeumorphismModal v-if="editingRoute" :model-value="true" title="端口" @close="editingRoute = null">
+    <NeumorphismModal
+      :model-value="!!editingRoute"
+      title="端口"
+      :footer="false"
+      @update:model-value="editingRoute = null"
+    >
       <div class="esc-form">
         <NeumorphismInput v-model="editingRoute.name" label="端口名" :disabled="!editingRoute.is_new" />
         <NeumorphismInput v-model="editingRoute.listen" label="监听地址（host:port）" />

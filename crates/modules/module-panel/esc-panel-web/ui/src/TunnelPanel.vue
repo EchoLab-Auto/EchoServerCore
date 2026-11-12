@@ -12,6 +12,8 @@ const error = ref('')
 const editing = ref(false)
 const saving = ref(false)
 const exporting = ref(false)
+/** 导出配置正在取（与弹窗开关是两件事，见 loadExport 的注释）。 */
+const exportLoading = ref(false)
 const exportRole = ref('hub')
 const exportData = ref<any>(null)
 const editingEdge = ref(false)
@@ -33,7 +35,21 @@ async function loadEdge() {
 }
 async function refresh() { await Promise.all([loadTunnel(), loadEdge()]) }
 function openMapping(m: any = null) {
-  form.value = m ? { ...m.mapping } : { name: '', listen: '0.0.0.0:', local: '127.0.0.1:', spoke: '', enabled: true, note: '' }
+  // 列表里拿到的行是 `MappingView`：持久化字段被 `#[serde(flatten)]` 摊平在顶层，
+  // 没有 `m.mapping` 这一层。写成 `{ ...m.mapping }` 会得到 `{}` —— 于是点「编辑」
+  // 弹出的是**空的新建表单**（标题还写「新建映射」），保存时要么报重名、要么多出一条。
+  // 只取要提交的那些字段，别把 state / stats / providers 这些只读字段带回去。
+  form.value = m
+    ? {
+        id: m.id,
+        name: m.name ?? '',
+        listen: m.listen ?? '',
+        local: m.local ?? '',
+        spoke: m.spoke ?? '',
+        enabled: m.enabled !== false,
+        note: m.note ?? '',
+      }
+    : { name: '', listen: '0.0.0.0:', local: '127.0.0.1:', spoke: '', enabled: true, note: '' }
   editing.value = true
 }
 async function saveMapping() {
@@ -54,6 +70,15 @@ async function removeMapping(m: any) {
   catch (e) { flash((e as Error).message, 'error') }
 }
 async function reload() {
+  // 「重新加载」= **用磁盘上的 mappings.toml 覆盖内存**。这台机器上如果映射是写在
+  // `engine.toml` 的 `[[mapping]]` 里（首次启动播种进 store），那么磁盘上那份就是
+  // 唯一事实来源 —— 它一旦是空的，点一下这个按钮就会把内存里的映射全清掉，
+  // 所有隧道当场断线（2026-11-12 实际发生过一次，映射表被清成 `mapping = []`）。
+  // 所以有映射时先问一句，别让人手滑。
+  if (mappings.value.length && !confirm(
+    `重新加载会用磁盘上的映射表覆盖当前内存里的 ${mappings.value.length} 条映射。\n` +
+    '如果磁盘上那份是空的，隧道会立刻全部断开。继续？'
+  )) return
   try { await json('POST', '/api/reload'); flash('已从磁盘重新加载映射表'); await loadTunnel() }
   catch (e) { flash((e as Error).message, 'error') }
 }
@@ -63,9 +88,18 @@ async function kick(id?: string) {
   catch (e) { flash((e as Error).message, 'error') }
 }
 async function loadExport() {
-  exporting.value = true
-  try { exportData.value = await api(`/api/export?role=${exportRole.value}`) }
-  catch (e) { flash((e as Error).message, 'error') } finally { exporting.value = false }
+  // **不要在这里碰 `exporting`**。这个函数同时是「打开导出弹窗」和「换角色后重新拉」
+  // 的处理器，而它是异步的 —— 末尾再把 `exporting` 设回 false，"打开"那一刻就被
+  // 自己关掉了：弹窗闪一下消失，看起来像按钮没反应（实测 masks:1 / modals:0）。
+  // 弹窗的开关只由按钮和「关闭」按钮管，这里只负责取数据。
+  exportLoading.value = true
+  try {
+    exportData.value = await api(`/api/export?role=${exportRole.value}`)
+  } catch (e) {
+    flash((e as Error).message, 'error')
+  } finally {
+    exportLoading.value = false
+  }
 }
 function downloadExport() {
   if (!exportData.value) return
@@ -172,7 +206,7 @@ onBeforeUnmount(() => clearInterval(timer))
       <div class="esc-form"><NeumorphismInput v-model="form.name" label="服务名" placeholder="hub 与 spoke 两侧一致" required /><div class="esc-form-row"><NeumorphismInput v-model="form.listen" label="公网监听（Hub）" placeholder="0.0.0.0:2222" /><NeumorphismInput v-model="form.local" label="本地目标（Spoke）" placeholder="127.0.0.1:8080" /></div><NeumorphismInput v-model="form.spoke" label="固定 Spoke（可选）" /><NeumorphismInput v-model="form.note" label="备注" /><div class="esc-check"><NeumorphismSwitch v-model="form.enabled" />启用此映射</div><div class="esc-actions"><NeumorphismButton variant="primary" :loading="saving" @click="saveMapping">保存</NeumorphismButton><NeumorphismButton @click="editing = false">取消</NeumorphismButton></div></div>
     </NeumorphismModal>
     <NeumorphismModal v-model="editingEdge" :title="edgeOriginalPrefix ? '编辑边缘路由' : '新建边缘路由'" :footer="false"><div class="esc-form"><NeumorphismInput v-model="edgeForm.prefix" label="域名前缀或完整域名" placeholder="cad 或 cad.example.com" required /><p class="esc-hint">前缀 <code>cad</code> 匹配 <code>cad.任意域名</code>；完整域名 <code>cad.example.com</code> 只匹配该域名，优先于前缀。不要填写协议、端口或路径。</p><NeumorphismInputNumber v-model="edgeForm.port" label="转发到本机端口" :min="1" :max="65535" /><div class="esc-actions"><NeumorphismButton variant="primary" :loading="savingEdge" @click="saveEdge">保存</NeumorphismButton><NeumorphismButton :disabled="savingEdge" @click="editingEdge = false">取消</NeumorphismButton></div></div></NeumorphismModal>
-    <NeumorphismModal v-model="exporting" title="导出静态配置" :footer="false"><div class="esc-form"><NeumorphismSelect v-model="exportRole" label="角色" :options="[{label:'Hub',value:'hub'},{label:'Spoke',value:'spoke'}]" /><pre class="esc-code">{{ exportData?.toml || '读取中…' }}</pre><div class="esc-actions"><NeumorphismButton :disabled="!exportData" @click="downloadExport">下载 TOML</NeumorphismButton><NeumorphismButton @click="exporting = false">关闭</NeumorphismButton></div></div></NeumorphismModal>
+    <NeumorphismModal v-model="exporting" title="导出静态配置" :footer="false"><div class="esc-form"><NeumorphismSelect v-model="exportRole" label="角色" :options="[{label:'Hub',value:'hub'},{label:'Spoke',value:'spoke'}]" /><pre class="esc-code">{{ exportLoading ? '读取中…' : (exportData?.toml || '（没有内容）') }}</pre><div class="esc-actions"><NeumorphismButton :disabled="!exportData" @click="downloadExport">下载 TOML</NeumorphismButton><NeumorphismButton @click="exporting = false">关闭</NeumorphismButton></div></div></NeumorphismModal>
     <NeumorphismAlert v-if="flashText" class="esc-flash" :type="flashKind" :message="flashText" />
   </div>
 </template>
