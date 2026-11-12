@@ -93,7 +93,7 @@ function openNewRoute() {
   formError.value = ''
   editingRoute.value = {
     is_new: true, name: '', listen: '0.0.0.0:', upstream: '127.0.0.1:',
-    strip_prefix: '', max_body_bytes: '', allowed_cidrs: '',
+    host: '', segment: '', strip_prefix: '', max_body_bytes: '', allowed_cidrs: '',
   }
 }
 function openEditRoute(row: any) {
@@ -141,6 +141,9 @@ async function saveRoute() {
     // 空串 = 这个端口的兜底（不限 Host）。后端把它归一化并校验；
     // 带路径/通配符的写法在那里报错，前端不重复一套规则。
     host: form.host || '',
+    // 空串 = 不归属任何网段（行为与加网段功能之前一致）。归属之后 listen 必须
+    // 落在网段里、upstream 必须是本机回环——那三条由网关校验，前端不复制规则。
+    segment: form.segment || '',
     strip_prefix: form.strip_prefix || '', max_body_bytes: String(form.max_body_bytes ?? ''),
     allowed_cidrs: form.allowed_cidrs || '',
   }
@@ -292,7 +295,17 @@ onMounted(loadAll)
                 <template v-if="row.host">{{ row.host }}</template>
                 <span v-else class="esc-hint">（兜底：任意 Host）</span>
               </td>
-              <td class="mono">{{ row.listen }}</td>
+              <td class="mono">
+                {{ row.listen }}
+                <!--
+                  网段标记必须和地址贴在一起看：同一个端口号，在网段里和在公网口上
+                  是两件完全不同的事 —— 前者绕不过 TLS，后者能。分两列显示反而
+                  容易看漏（多一列就少一分注意力）。
+                -->
+                <div v-if="row.segment" style="margin-top: 4px">
+                  <NeumorphismTag size="small" variant="primary">网段 {{ row.segment }}</NeumorphismTag>
+                </div>
+              </td>
               <td class="mono">{{ row.upstream }}</td>
               <td>
                 <NeumorphismTag :variant="row.disabled ? 'default' : row.live ? 'success' : 'error'">
@@ -423,6 +436,21 @@ onMounted(loadAll)
         <NeumorphismInput v-model="editingRoute.name" label="端口名" :disabled="!editingRoute.is_new" />
         <NeumorphismInput v-model="editingRoute.listen" label="监听地址（host:port）" />
         <NeumorphismInput v-model="editingRoute.upstream" label="上游（host:port）" />
+        <!--
+          网段只在 gateway.toml 里声明，这里只做归属（不可创建）。改网段本身是
+          改拓扑，必须重启 —— 所以没有"新建网段"的入口。
+        -->
+        <NeumorphismSelect
+          v-if="(overview?.segments || []).length"
+          v-model="editingRoute.segment"
+          label="隔离网段（可选）"
+          placeholder="不归属（这个地址直接对外）"
+          clearable
+          :options="(overview?.segments || []).map((s: string) => ({ value: s, label: s }))"
+        />
+        <span v-if="(overview?.segments || []).length" class="esc-hint">
+          归属网段后：监听必须是网段内的具体地址（不能 0.0.0.0），上游必须是本机回环。
+        </span>
         <NeumorphismInput v-model="editingRoute.strip_prefix" label="剥离前缀（可选）" />
         <NeumorphismInput v-model="editingRoute.max_body_bytes" label="请求体上限（字节，留空 = 10 MB）" />
         <NeumorphismInput v-model="editingRoute.allowed_cidrs" label="来源白名单（一行一个或逗号分隔）" />

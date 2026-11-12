@@ -211,6 +211,8 @@ pub struct RouteRow {
     pub name: String,
     /// `Host` 条件。`None` = 这个端口的兜底。
     pub host: Option<String>,
+    /// 归属的隔离网段名。`None` = 网段之外（这个地址照原样对外暴露）。
+    pub segment: Option<String>,
     pub source_label: String,
     /// 已下架：不监听，只列出来供恢复。
     pub disabled: bool,

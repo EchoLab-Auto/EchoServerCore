@@ -279,6 +279,8 @@ impl Ctx<'_> {
                 "user": self.actor,
                 "admin": self.admin,
                 "routes": routes,
+                // 声明过的隔离网段名：路由表单的下拉框用它，不用再多拉一次。
+                "segments": self.gw.segment_names(),
                 "//": "当前请求从哪个监听端口进来——删端口时要靠它认出「我自己」",
                 "current_addr": self.local.to_string(),
                 "admin_port": self.gw.cfg.admin_listen.map(|a| a.to_string()),
@@ -734,6 +736,7 @@ impl Ctx<'_> {
                 web::RouteRow {
                     name: e.spec.name.clone(),
                     host: e.spec.host.clone(),
+                    segment: e.spec.segment.clone(),
                     source_label: e.source.label().to_string(),
                     disabled: e.disabled,
                     // 只有路由库拥有、且配置文件里没有同名条目的才能真删除
