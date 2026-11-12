@@ -46,6 +46,7 @@ use esc_control_api::{
     TunnelControl, CONTROL_SERVICE, EDGE_ROUTE_SERVICE, PLUGIN_TREE_SERVICE,
 };
 use esc_plugin_edge_router::EdgeRouterPlugin;
+use esc_plugin_tls::TlsPlugin;
 use esc_plugin_tunnel::TunnelPlugin;
 
 pub mod caller;
@@ -61,6 +62,9 @@ pub const EDGE_ROUTER_PLUGIN_ID: &str = esc_plugin_edge_router::PLUGIN_ID;
 /// 名字对齐 crate：`esc-plugin-tunnel-panel` ↔ `esc.tunnel-panel`。
 pub const TUNNEL_PANEL_PLUGIN_ID: &str = "esc.tunnel-panel";
 
+/// TLS 终结插件。取代原来那个 `esc-tls` nginx 容器（见 `esc-plugin-tls` 的模块注释）。
+pub const TLS_PLUGIN_ID: &str = "esc.tls";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 配置
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +79,33 @@ pub struct HostConfig {
     /// 边缘路由（域名前缀 → 本机端口）。默认关闭：它要监听端口，不能"默认打开"。
     #[serde(default)]
     pub edge_router: EdgeRouterSection,
+    /// TLS 终结（SNI 选证书 → 本机端口）。同样默认关闭 —— 它要绑 443 这类端口，
+    /// 而"默认打开"意味着一次升级就可能撞上别人的 80/443。
+    #[serde(default)]
+    pub tls: TlsSection,
+}
+
+/// `[tls]` 段。
+///
+/// 与 `[edge_router]` 同一个形状：宿主只认识「开关 + 透传」，证书表与站点的
+/// schema 全由插件定义（`esc-plugin-tls` 的 `config.rs`）。加字段不用改这里。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsSection {
+    /// 关掉它（默认）就完全不挂载该插件，也不占用任何端口。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 原样透传给插件（`cert` / `site` / `defaults`）。
+    #[serde(default = "empty_table")]
+    pub config: toml::Value,
+}
+
+impl Default for TlsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            config: empty_table(),
+        }
+    }
 }
 
 /// `[edge_router]` 段。
@@ -160,6 +191,10 @@ impl HostConfig {
 
     fn edge_router_json(&self) -> Value {
         toml_to_json(&self.edge_router.config)
+    }
+
+    fn tls_json(&self) -> Value {
+        toml_to_json(&self.tls.config)
     }
 }
 
@@ -293,6 +328,16 @@ impl Host {
                 .register(router)
                 .map_err(|e| anyhow::anyhow!("无法注册边缘路由插件: {e}"))?;
             registry.set_config(EDGE_ROUTER_PLUGIN_ID, cfg.edge_router_json());
+        }
+
+        // TLS 终结同理按需注册。它比边缘路由更"重"：要读证书私钥、要绑可能是
+        // 特权端口的 443，所以更不能默认开。
+        if cfg.tls.enabled {
+            let tls: Arc<dyn Plugin> = Arc::new(TlsPlugin::new());
+            registry
+                .register(tls)
+                .map_err(|e| anyhow::anyhow!("无法注册 TLS 终结插件: {e}"))?;
+            registry.set_config(TLS_PLUGIN_ID, cfg.tls_json());
         }
 
         let errors = registry.mount_all(

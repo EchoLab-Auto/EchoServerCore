@@ -1,0 +1,33 @@
+[package]
+name = "esc-plugin-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TLS termination as an in-process plugin (SNI cert selection -> local upstream)"
+
+[dependencies]
+esc-common = { workspace = true }
+echo-context = { workspace = true }
+echo-plugin = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+rustls = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# esc-gateway 也是直接声明这两个：它们只在这里用，进 workspace 反而多一层间接。
+bytes = "1"
+http-body-util = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+# 测试里现生成自签证书，不依赖仓库里有没有 /etc/ssl/esc —— 那些文件只在部署机上。
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls = { workspace = true }

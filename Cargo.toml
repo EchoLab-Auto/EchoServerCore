@@ -17,6 +17,7 @@ members = [
 
     # ── 模块：一个模块一个目录，目录里放属于它的 crate ──────────────────
     "crates/modules/module-tunnel/esc-plugin-tunnel",
+    "crates/modules/module-tls/esc-plugin-tls",
     "crates/modules/module-edge-router/esc-plugin-edge-router",
     "crates/modules/module-gateway/esc-gateway",
     # 两个 Web 面板同属「panel」这一族：一个子进程插件 + 一个独立进程 +
@@ -90,6 +91,7 @@ base64 = "0.22"
 esc-common = { path = "crates/modules/module-core/esc-common" }
 esc-control-api = { path = "crates/modules/module-core/esc-control-api" }
 esc-panel-auth = { path = "crates/modules/module-core/esc-panel-auth" }
+esc-plugin-tls = { path = "crates/modules/module-tls/esc-plugin-tls" }
 esc-server-panel = { path = "crates/modules/module-panel/esc-server-panel" }
 esc-gateway = { path = "crates/modules/module-gateway/esc-gateway" }
 esc-engine = { path = "crates/modules/module-core/esc-engine" }

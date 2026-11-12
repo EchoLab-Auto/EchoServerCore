@@ -649,6 +649,7 @@ dependencies = [
  "esc-common",
  "esc-control-api",
  "esc-plugin-edge-router",
+ "esc-plugin-tls",
  "esc-plugin-tunnel",
  "serde",
  "serde_json",
@@ -700,6 +701,29 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "esc-plugin-tls"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes 1.12.1",
+ "echo-context",
+ "echo-plugin",
+ "esc-common",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
  "tracing",
 ]
 
