@@ -311,6 +311,7 @@ impl Gateway {
                     name: rt.name.clone(),
                     listen: rt.listen.to_string(),
                     upstream: rt.upstream.to_string(),
+                    host: rt.host.clone(),
                     allowed_cidrs: rt.allowed_cidrs_raw.clone(),
                     strip_prefix: rt.strip_prefix.clone(),
                     max_body_bytes: Some(rt.max_body_bytes),
@@ -349,6 +350,7 @@ impl Gateway {
                 name: rt.name.clone(),
                 listen: rt.listen.to_string(),
                 upstream: rt.upstream.to_string(),
+                host: rt.host.clone(),
                 allowed_cidrs: rt.allowed_cidrs_raw.clone(),
                 strip_prefix: rt.strip_prefix.clone(),
                 max_body_bytes: Some(rt.max_body_bytes),
@@ -548,9 +550,41 @@ async fn handle(
 ) -> HyperResponse<ProxyBody> {
     // 每个请求重读一次路由定义：改上游 / 前缀 / 白名单不用重启、不用重连。
     // 按 `local_addr` 查而不是按名字：路由改名之后老连接也能立刻用上新定义。
-    let Some(route) = gw.routes.at(local) else {
-        // 这个端口已经被删掉了。连接可能还没被 cancel 打断，所以自己收尾。
-        return text(StatusCode::SERVICE_UNAVAILABLE, "这个端口已被移除");
+    //
+    // 同一个端口可能挂着多条路由（按 `Host` 分流），所以查表要带 Host。
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let Some(route) = gw.routes.at_host(local, host) else {
+        // 两种可能，都要说清楚：
+        //   ① 这个端口上一条路由都没有（刚被删/下架，连接还没被 cancel 打断）；
+        //   ② 端口有多条按 Host 分流的路由，但这个 Host 一个都没命中。
+        //
+        // 回 421（Misdirected Request）而不是 404/502：语义就是「这个 Host 不该
+        // 到这个端口来」，客户端与排障的人都能立刻分辨。**绝不**随手挑一条转发
+        // ——那样配错了不报错，只会把请求送给错误的服务。
+        let known = gw.routes.hosts_on(local);
+        if known.is_empty() {
+            return text(StatusCode::SERVICE_UNAVAILABLE, "这个端口已被移除");
+        }
+        let want = host.unwrap_or("(没有 Host 头)");
+        let list = known
+            .iter()
+            .map(|h| match h {
+                Some(h) => h.clone(),
+                None => "（未限定 Host 的兜底路由）".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        tracing::warn!(%local, want, ?known, "no route matches this Host");
+        return text(
+            StatusCode::MISDIRECTED_REQUEST,
+            &format!(
+                "这个端口上没有配置接 {want} 的端口定义。它当前接的是：{list}。\n\
+                 要新增，在网关管理页「端口」里加一条，host 填 {want}。"
+            ),
+        );
     };
     let _ = &snapshot;
     let source = resolve_source(&gw, &req, peer);

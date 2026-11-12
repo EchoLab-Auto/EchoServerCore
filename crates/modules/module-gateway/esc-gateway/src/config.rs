@@ -153,6 +153,35 @@ pub struct RouteConfig {
     pub listen: String,
     /// 上游地址，如 `127.0.0.1:18787`。
     pub upstream: String,
+    /// 只在 `Host` 命中这个域名时把请求转给本路由。`None` = 这个端口上的默认路由。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 没有它时**端口就是路由的身份**（`RouteRegistry::at` 按 `local_addr` 查），
+    /// 于是每接一个服务就要多占一个监听端口。cloud2 上就是这样堆出
+    /// 18784（网关门）→ 18788（面板本尊）两份地址，而 18784 的全部作用只是
+    /// 「在这里拦一道认证」。
+    ///
+    /// 有了它，一个监听地址可以服务多个上游：
+    ///
+    /// ```toml
+    /// [[route]]
+    /// name = "panel"; host = "panel.example.com"; listen = "0.0.0.0:8080"
+    /// upstream = "127.0.0.1:18788"
+    /// [[route]]
+    /// name = "cad";   host = "cad.example.com";   listen = "0.0.0.0:8080"
+    /// upstream = "127.0.0.1:2228"
+    /// ```
+    ///
+    /// # 匹配规则
+    ///
+    /// 大小写不敏感的全等，**端口被剥掉**（`Host: a.com:8080` 与 `a.com` 同一条），
+    /// 不做通配。理由与 TLS 的 SNI 选择一样：通配会让「哪个请求去了哪个上游」
+    /// 变成一件要推理的事，而这里通常只有两三个名字。
+    ///
+    /// 同一端口上最多只能有**一条**不带 `host` 的路由（它就是兜底）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// 额外的来源白名单（和用户认证是**与**关系）。空 = 不限。
     #[serde(default)]
     pub allowed_cidrs: Vec<String>,
@@ -192,6 +221,17 @@ impl RouteConfig {
                 self.name
             ));
         }
+        // `host` 是「只在 Host 命中时才走本路由」的条件。空串当没写——面板的输入框
+        // 清空之后发上来的是 `""`，那不是「匹配空域名」，而是「不限定」。
+        let host = self
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(|h| normalize_host(h))
+            .transpose()
+            .map_err(|e| format!("route {:?} 的 host: {e}", self.name))?;
+
         if let Some(p) = &self.strip_prefix {
             if !p.starts_with('/') {
                 return Err(format!(
@@ -231,6 +271,7 @@ impl RouteConfig {
             name: self.name.clone(),
             listen: addr,
             upstream: up,
+            host,
             allow,
             allowed_cidrs_raw: self.allowed_cidrs.clone(),
             strip_prefix: self.strip_prefix.clone(),
@@ -239,12 +280,101 @@ impl RouteConfig {
     }
 }
 
+/// `Host: a.com:8080` → `a.com`。`[::1]:8080` → `[::1]`。
+fn strip_port(host: &str) -> String {
+    if let Some(rest) = host.strip_prefix('[') {
+        // IPv6 字面量：端口在 `]` 之后。
+        return match rest.split_once(']') {
+            Some((inner, _)) => format!("[{inner}]"),
+            None => host.to_string(),
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) => head.to_string(),
+        _ => host.to_string(),
+    }
+}
+
+/// 把配置里的 host 归一化，顺便校验。
+///
+/// 归一化到「小写 + 无端口」：`Example.COM:8080` 与 `example.com` 是同一条路由。
+/// 不做通配（`*.example.com`）——理由见 [`RouteConfig::host`]。
+fn normalize_host(raw: &str) -> Result<String, String> {
+    let h = raw.trim().to_ascii_lowercase();
+    // 允许顺手写成 host:port（从浏览器地址栏复制来的就是那样），端口直接丢掉。
+    let h = match h.rsplit_once(':') {
+        // 方括号形式 `[::1]:8080` 先放过——IPv6 字面量当 Host 匹配没有实际用途，
+        // 但也不该因为一个冒号就报错。
+        Some((head, tail)) if !head.ends_with(']') || tail.chars().all(|c| c.is_ascii_digit()) => {
+            if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+                head.to_string()
+            } else {
+                h.clone()
+            }
+        }
+        _ => h.clone(),
+    };
+    if h.is_empty() {
+        return Err("不能是空串（要去掉这一项就整行删掉 host）".into());
+    }
+    if h.len() > 253 {
+        return Err(format!("{raw:?} 太长（域名上限 253 字符）"));
+    }
+    if h.contains('/') || h.contains('?') || h.contains('#') || h.contains(' ') {
+        return Err(format!(
+            "{raw:?} 里有 / ? # 或空格——这里只填域名（如 panel.example.com），不要带路径"
+        ));
+    }
+    if h.contains('*') {
+        return Err(format!(
+            "{raw:?} 里有通配符。这里只做**精确匹配**：真要泛域名，在 DNS 里加 \
+             *.example.com，路由这边仍然写具体的名字"
+        ));
+    }
+    if !h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == ':')
+    {
+        return Err(format!(
+            "{raw:?} 含非法字符：只允许字母、数字、`.` `-` `_`（值必须是 ASCII/IDN 的 punycode 形式）"
+        ));
+    }
+    Ok(h)
+}
+
 /// 两个监听地址会不会抢同一个端口。
 ///
 /// 只看 `SocketAddr` 是否相等是不够的：`0.0.0.0:2224` 和 `127.0.0.1:2224`
 /// 在 bind 的时候是实打实的冲突（后者会 EADDRINUSE），但在结构体上不相等。
 pub fn listeners_conflict(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// 两条路由会不会抢同一个请求。
+///
+/// 抢同一个**端口**本身不算冲突——那正是 host 分流的意义。真正冲突的是
+/// 「同一个端口 + 会命中的 Host 集合有交集」：
+///
+/// * 两条都没有 host → 冲突（一个端口只能有一个兜底）；
+/// * 一条有 host、一条没有 → 冲突吗？**不冲突**：带 host 的先命中，剩下落兜底。
+///   等等——这也不对。兜底会吃掉所有 host，等于把"按域名分流"变得不可预测。
+///   （见下面 `validate_route_list` 的实际判定，这里只放判据。）
+pub fn routes_overlap(a: &RouteRuntime, b: &RouteRuntime) -> bool {
+    if !listeners_conflict(a.listen, b.listen) {
+        return false;
+    }
+    match (&a.host, &b.host) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x == y,
+        // 一条兜底 + 一条带 host：**允许**。兜底是显式写下来的意图（"其余的给我"），
+        // 而带 host 的那条在查表时优先命中。所以这不是"抢占"，是分层：
+        //
+        //     panel.example.com → panel 这条（精确命中优先）
+        //     其它任何 Host      → 兜底那条
+        //
+        // 反过来禁掉会让人没法配「按域名分流 + 留一个默认站」这种最常见的形态。
+        _ => false,
+    }
 }
 
 /// 校验一组路由（可能是"配置文件 ∪ 路由库"的合并结果）。
@@ -256,13 +386,21 @@ pub fn validate_route_list(routes: &[RouteConfig]) -> Result<Vec<RouteRuntime>, 
         if !names.insert(rt.name.clone()) {
             return Err(format!("route 名 {:?} 重复", rt.name));
         }
-        if let Some(other) = out.iter().find(|o| listeners_conflict(o.listen, rt.listen)) {
-            return Err(format!(
-                "{} 与 {} 想监听同一个端口 {}，请改成不同端口",
-                other.name,
-                rt.name,
-                rt.listen.port()
-            ));
+        if let Some(other) = out.iter().find(|o| routes_overlap(o, &rt)) {
+            let why = match (&other.host, &rt.host) {
+                (None, None) => format!(
+                    "{} 与 {} 都监听 {} 且都没写 host——同一个端口只能有一个兜底",
+                    other.name, rt.name, rt.listen
+                ),
+                _ => format!(
+                    "{} 与 {} 都监听 {} 且都要接 Host = {} 的请求",
+                    other.name,
+                    rt.name,
+                    rt.listen,
+                    rt.host.as_deref().unwrap_or("?")
+                ),
+            };
+            return Err(format!("{why}。给其中一条换 host，或换一个端口。"));
         }
         out.push(rt);
     }
@@ -444,17 +582,31 @@ impl GatewayConfig {
                 return Err(format!("route 名 {:?} 重复", r.name));
             }
         }
-        // 端口冲突要按"全部生效的路由"判，所以走单独一遍。
-        let mut seen: Vec<SocketAddr> = Vec::new();
+        // 冲突判定与 `validate_route_list` 共用同一套判据：**同端口并不算冲突**，
+        // 除非两条路由会命中的 Host 集合有交集（那才是真抢同一个请求）。
+        //
+        // 从前这里是 `listeners_conflict` 单判端口，于是「一个监听地址服务多个
+        // 上游」这种配置在启动时就被拒了 —— 而那正是省掉多余监听地址的办法。
+        let mut seen: Vec<RouteRuntime> = Vec::new();
         for r in &self.route {
             let rt = r.to_runtime()?;
-            if seen.iter().any(|a| listeners_conflict(*a, rt.listen)) {
-                return Err(format!(
-                    "有多个 route 监听同一个端口 {}，请改成不同端口",
-                    rt.listen.port()
-                ));
+            if let Some(other) = seen.iter().find(|o| routes_overlap(o, &rt)) {
+                let why = match (&other.host, &rt.host) {
+                    (None, None) => format!(
+                        "{} 与 {} 都监听 {} 且都没写 host —— 同一个端口只能有一个兜底",
+                        other.name, rt.name, rt.listen
+                    ),
+                    _ => format!(
+                        "{} 与 {} 都监听 {} 且都要接 Host = {} 的请求",
+                        other.name,
+                        rt.name,
+                        rt.listen,
+                        rt.host.as_deref().unwrap_or("?")
+                    ),
+                };
+                return Err(format!("{why}。给其中一条换 host，或换一个端口。"));
             }
-            seen.push(rt.listen);
+            seen.push(rt);
         }
 
         // ── 用户引用的 route 必须存在 ──
@@ -554,6 +706,8 @@ pub struct RouteRuntime {
     pub name: String,
     pub listen: SocketAddr,
     pub upstream: SocketAddr,
+    /// 归一化后的 host 条件（小写、无端口）。`None` = 这个端口的默认路由。
+    pub host: Option<String>,
     pub allow: Vec<AllowRule>,
     /// 解析后的 `allow` 对应的原文。面板要显示、要回填编辑框，靠结构体反推
     /// 字符串既不可靠（规范化之后和用户写的不一样），也没必要。
@@ -563,6 +717,24 @@ pub struct RouteRuntime {
 }
 
 impl RouteRuntime {
+    /// 这个路由是不是这个端口上的兜底（没有 host 条件）。
+    pub fn is_default(&self) -> bool {
+        self.host.is_none()
+    }
+
+    /// `Host` 头是否命中本路由。
+    ///
+    /// `None`（请求里没有 Host 头，HTTP/1.0 才可能）**不命中**任何带 host 条件的
+    /// 路由，但命中兜底路由。不给它一个特例：没有 Host 就没法判断它想去哪，
+    /// 猜一个比拒绝更糟。
+    pub fn host_matches(&self, host: Option<&str>) -> bool {
+        match (&self.host, host) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(want), Some(got)) => strip_port(&got.to_ascii_lowercase()) == *want,
+        }
+    }
+
     /// 来源是否被 route 级白名单放行。
     ///
     /// `peer` 为 `None` 时视为**不放行**（fail-closed）：拿不到来源地址就无法
@@ -717,6 +889,7 @@ upstream = "127.0.0.1:18787"
             name: "p2".into(),
             listen: "0.0.0.0:2223".into(), // 同端口
             upstream: "127.0.0.1:18788".into(),
+            host: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -731,6 +904,7 @@ upstream = "127.0.0.1:18787"
             name: "p1".into(), // 同名
             listen: "0.0.0.0:2224".into(),
             upstream: "127.0.0.1:18788".into(),
+            host: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
@@ -767,6 +941,129 @@ upstream = "127.0.0.1:18787"
     }
 
     #[test]
+    /// 同一个端口上「两条兜底」必须被拒 —— 那等于两条路由抢同一个请求。
+    #[test]
+    fn two_default_routes_on_one_port_are_rejected() {
+        let mk = |name: &str| RouteConfig {
+            name: name.into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9000".into(),
+            host: None,
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        let err = validate_route_list(&[mk("a"), mk("b")]).unwrap_err();
+        assert!(err.contains("兜底"), "{err}");
+    }
+
+    /// 同一端口 + 同一 host 也不行：两条路由抢同一批请求。
+    #[test]
+    fn same_host_on_one_port_is_rejected() {
+        let mk = |name: &str, host: &str| RouteConfig {
+            name: name.into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9000".into(),
+            host: Some(host.into()),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        let err = validate_route_list(&[mk("a", "x.example.com"), mk("b", "X.Example.com")])
+            .unwrap_err();
+        assert!(err.contains("Host"), "{err}");
+    }
+
+    /// 同一端口：一条带 host、一条兜底 —— 这是最常见的形态，必须允许。
+    #[test]
+    fn host_plus_default_on_one_port_is_allowed() {
+        let a = RouteConfig {
+            name: "panel".into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9001".into(),
+            host: Some("panel.example.com".into()),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        let b = RouteConfig {
+            name: "rest".into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9002".into(),
+            host: None,
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        let out = validate_route_list(&[a, b]).expect("一条 host + 一条兜底应当允许");
+        assert_eq!(out.len(), 2);
+        // 两条都指向同一个端口，但只有一条是兜底
+        assert!(out.iter().filter(|r| r.is_default()).count() == 1);
+    }
+
+    /// 三条同一端口、三个不同 host：全都要能起来。
+    #[test]
+    fn many_hosts_on_one_port_are_allowed() {
+        let mk = |name: &str, host: &str| RouteConfig {
+            name: name.into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9000".into(),
+            host: Some(host.into()),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        let out = validate_route_list(&[
+            mk("panel", "panel.example.com"),
+            mk("cad", "cad.example.com"),
+            mk("shop", "shop.example.com"),
+        ])
+        .expect("三个不同 host 应当允许");
+        assert_eq!(out.len(), 3);
+    }
+
+    /// host 归一化：大小写、端口、空白。
+    #[test]
+    fn host_is_normalized() {
+        let mk = |raw: &str| RouteConfig {
+            name: "a".into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9000".into(),
+            host: Some(raw.into()),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        assert_eq!(mk("Panel.Example.COM").to_runtime().unwrap().host.as_deref(), Some("panel.example.com"));
+        assert_eq!(mk(" panel.example.com ").to_runtime().unwrap().host.as_deref(), Some("panel.example.com"));
+        // 从浏览器地址栏复制来的那种带端口
+        assert_eq!(mk("panel.example.com:8080").to_runtime().unwrap().host.as_deref(), Some("panel.example.com"));
+        // 空串 = 不限定（面板清空输入框发上来的就是它）
+        assert_eq!(mk("").to_runtime().unwrap().host, None);
+    }
+
+    /// host 里写路径 / 通配符要报错，并说清楚为什么不支持。
+    #[test]
+    fn bad_host_syntax_is_rejected() {
+        let mk = |raw: &str| RouteConfig {
+            name: "a".into(),
+            listen: "0.0.0.0:8080".into(),
+            upstream: "127.0.0.1:9000".into(),
+            host: Some(raw.into()),
+            allowed_cidrs: vec![],
+            strip_prefix: None,
+            max_body_bytes: None,
+        };
+        for (raw, want) in [
+            ("panel.example.com/api", "路径"),
+            ("*.example.com", "通配"),
+            ("a b.com", "空格"),
+        ] {
+            let err = mk(raw).to_runtime().unwrap_err();
+            assert!(err.contains(want), "{raw} → {err}");
+        }
+    }
+
     fn bad_cidr_and_relative_strip_prefix_are_rejected() {
         let mut c = minimal();
         c.route[0].allowed_cidrs = vec!["10.0.0.0/33".into()];
@@ -784,6 +1081,7 @@ upstream = "127.0.0.1:18787"
             name: "p2".into(),
             listen: "0.0.0.0:2224".into(),
             upstream: "127.0.0.1:18788".into(),
+            host: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,

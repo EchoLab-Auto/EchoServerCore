@@ -209,6 +209,8 @@ pub fn error_page(title: &str, heading: &str, detail_html: &str) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteRow {
     pub name: String,
+    /// `Host` 条件。`None` = 这个端口的兜底。
+    pub host: Option<String>,
     pub source_label: String,
     /// 已下架：不监听，只列出来供恢复。
     pub disabled: bool,
@@ -249,6 +251,8 @@ pub struct RouteFormView {
     pub name_locked: bool,
     pub listen: String,
     pub upstream: String,
+    /// 只在 `Host` 命中时走这条。空串 = 这个端口的兜底。
+    pub host: String,
     pub strip_prefix: String,
     pub max_body_bytes: String,
     pub allowed_cidrs: String,

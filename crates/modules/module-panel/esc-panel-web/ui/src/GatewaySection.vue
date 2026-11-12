@@ -138,6 +138,9 @@ async function saveRoute() {
   formError.value = ''
   const body = {
     name: form.name, listen: form.listen, upstream: form.upstream,
+    // 空串 = 这个端口的兜底（不限 Host）。后端把它归一化并校验；
+    // 带路径/通配符的写法在那里报错，前端不重复一套规则。
+    host: form.host || '',
     strip_prefix: form.strip_prefix || '', max_body_bytes: String(form.max_body_bytes ?? ''),
     allowed_cidrs: form.allowed_cidrs || '',
   }
@@ -276,10 +279,19 @@ onMounted(loadAll)
       />
       <div class="esc-table-wrap">
         <table class="esc-table">
-          <thead><tr><th>名字</th><th>监听</th><th>上游</th><th>状态</th><th>来源</th><th>操作</th></tr></thead>
+          <thead><tr><th>名字</th><th>Host</th><th>监听</th><th>上游</th><th>状态</th><th>来源</th><th>操作</th></tr></thead>
           <tbody>
             <tr v-for="row in routes.rows" :key="row.name">
               <td class="mono">{{ row.name }}<NeumorphismTag v-if="row.here" size="small" variant="primary">当前</NeumorphismTag></td>
+              <!--
+                一个监听地址现在可以挂多条路由，靠 Host 区分。空 = 兜底：
+                没命中任何显式 Host 的请求都归它。必须显示出来，否则同一端口
+                出现两三行会看着像配错了。
+              -->
+              <td class="mono">
+                <template v-if="row.host">{{ row.host }}</template>
+                <span v-else class="esc-hint">（兜底：任意 Host）</span>
+              </td>
               <td class="mono">{{ row.listen }}</td>
               <td class="mono">{{ row.upstream }}</td>
               <td>

@@ -59,10 +59,14 @@ async fn http(
     let has_conn = headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("connection"));
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    // 调用方自己给了 Host 就用它的：按 Host 分流的测试必须能指定 Host，
+    // 而默认的 `Host: {addr}` 是 `127.0.0.1:port`，任何显式 host 都不会命中。
+    let has_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    if !has_host {
+        req.push_str(&format!("Host: {addr}\r\n"));
+    }
+    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     if !has_conn {
         req.push_str("Connection: close\r\n");
     }
@@ -2810,4 +2814,292 @@ async fn admin_accepts_json_bodies_for_routes_too() {
 
     gw.token.cancel();
     _u.cancel();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 一个监听地址服务多个上游（按 Host 分流）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 从前端口就是路由的身份，于是每接一个服务就要多占一个监听地址 —— cloud2 上
+// 就是那样堆出 18784（网关的门）→ 18788（面板本尊）两份地址，而前者的全部作用
+// 只是"在这里拦一道认证"。下面几条证明一件事：**一个端口就够**。
+
+/// 直接在某个地址上登录，返回 `cookie=...`。
+///
+/// `login_at` 要一个 `&Gw`（那是 `start_gateway` 的返回类型），而按 host 分流的
+/// 测试自己拼 `Gateway`，拿不到它。这里的逻辑与 `login_at` 一致，只是不要那个参数
+/// —— 它本来也是 `_gw`。
+async fn login_raw(addr: SocketAddr, user: &str, pass: &str, host: &str) -> Option<String> {
+    let body = format!("user={user}&pass={pass}&next=/");
+    let r = http(
+        addr,
+        "POST",
+        "/__auth/login",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("host", host),
+        ],
+        Some(&body),
+    )
+    .await;
+    if r.status != 303 {
+        return None;
+    }
+    r.set_cookie()
+        .and_then(|c| c.split(';').next())
+        .map(str::to_string)
+}
+
+/// 从一份**已解析**的配置起一个网关：按 listen 去重绑端口、登记进 ListenerSet、
+/// 起 accept 循环。
+///
+/// 与 `start_gateway` 的区别只是"配置由调用方给"，其余做法一致（e2e 不走 `run()`）。
+/// 返回 `(网关, 真实监听地址, 取消令牌)`。
+///
+/// **按 listen 去重**是这个辅助的要点：一个端口现在可能挂多条按 Host 分流的路由，
+/// 逐条 bind 会第二次撞 EADDRINUSE —— 那是 `ListenerSet::prepare` 内部已经处理过
+/// 的情况，测试里也得处理一遍，否则测出来的"失败"跟被测代码无关。
+async fn spawn_from_config(
+    cfg: GatewayConfig,
+) -> (Arc<Gateway>, std::collections::HashMap<SocketAddr, SocketAddr>, CancellationToken) {
+    let rt = cfg.build().expect("测试配置应合法");
+    let gw = Arc::new(Gateway::new(Arc::new(rt)));
+    let token = CancellationToken::new();
+    let mut real: std::collections::HashMap<SocketAddr, SocketAddr> = Default::default();
+    let mut bound: std::collections::HashSet<SocketAddr> = Default::default();
+
+    let mut routes: Vec<_> = gw.cfg.routes.values().cloned().collect();
+    routes.sort_by(|a, b| (a.listen, &a.name).cmp(&(b.listen, &b.name)));
+
+    for r in routes {
+        if !bound.insert(r.listen) {
+            // 这个地址前一条已经绑过了。请求按 (addr, Host) 从注册表重查，
+            // 所以一条监听足以服务多条路由。
+            continue;
+        }
+        let l = tokio::net::TcpListener::bind(r.listen)
+            .await
+            .unwrap_or_else(|e| panic!("绑定 {} 失败: {e}", r.listen));
+        let addr = l.local_addr().unwrap();
+        real.insert(r.listen, addr);
+        // 注册表里的 listen 要换成真实端口（:0 时配置值不可用）
+        for other in gw.cfg.routes.values().filter(|o| o.listen == r.listen) {
+            let mut o2 = (*other).clone();
+            o2.listen = addr;
+            gw.routes.replace_route(o2);
+        }
+        let mut r2 = r.clone();
+        r2.listen = addr;
+        let tok = gw.listeners.adopt(addr);
+        let gw2 = gw.clone();
+        let shut = token.clone();
+        tokio::spawn(async move {
+            let t = tok.clone();
+            tokio::spawn(async move {
+                shut.cancelled().await;
+                t.cancel();
+            });
+            esc_gateway::proxy::serve_route(gw2, Arc::new(r2), l, tok).await;
+        });
+    }
+    (gw, real, token)
+}
+
+/// 只回固定字符串的上游，用来判断"这次请求落到了哪个后端"。
+async fn start_tagged_upstream(tag: &'static str) -> (SocketAddr, CancellationToken) {
+    let app = Router::new().fallback(any(move || async move { tag }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let t = token.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app)
+            .with_graceful_shutdown(async move { t.cancelled().await })
+            .await;
+    });
+    (addr, token)
+}
+
+/// 一个端口挂三条路由（两条带 host + 一条兜底），请求按 Host 落到不同上游。
+///
+/// 这是这次改动的全部意义：**省掉一个监听地址**。
+#[tokio::test]
+async fn one_listen_serves_several_upstreams_by_host() {
+    let (up_panel, _p) = start_tagged_upstream("PANEL").await;
+    let (up_cad, _c) = start_tagged_upstream("CAD").await;
+    let (up_rest, _r) = start_tagged_upstream("REST").await;
+
+    let shared = pick_port();
+    let other = pick_port();
+
+    let hash = esc_gateway::config::hash_password("pw-123").unwrap();
+    let raw = format!(
+        r#"
+title = "host 分流"
+session_ttl_hours = 1
+cookie_name = "esc_gw"
+
+[rate_limit]
+max_failures = 3
+fail_window_secs = 60
+max_failures_global = 1000
+global_window_secs = 60
+
+[[user]]
+name = "admin"
+hash = "{hash}"
+routes = ["*"]
+admin = true
+
+# 同一个 listen，三个上游 —— 靠 host 区分
+[[route]]
+name = "panel"
+listen = "127.0.0.1:{shared}"
+upstream = "{up_panel}"
+host = "panel.example.com"
+
+[[route]]
+name = "cad"
+listen = "127.0.0.1:{shared}"
+upstream = "{up_cad}"
+host = "cad.example.com"
+
+[[route]]
+name = "rest"
+listen = "127.0.0.1:{shared}"
+upstream = "{up_rest}"
+
+# 另一条独立的端口，用来证明"老用法照旧"
+[[route]]
+name = "solo"
+listen = "127.0.0.1:{other}"
+upstream = "{up_rest}"
+"#
+    );
+    let cfg: GatewayConfig = toml::from_str(&raw).expect("配置应能解析");
+    let (_gw, addrs, _token) = spawn_from_config(cfg).await;
+
+    let strict = addrs[&format!("127.0.0.1:{shared}").parse().unwrap()];
+
+    // ── 按 Host 落到不同上游 ──
+    let r = http(strict, "GET", "/", &[("host", "panel.example.com")], None).await;
+    assert_eq!(r.status, 401, "带 host 的路由同样要认证，先拿 401");
+
+    // 登录后就能看出落到了哪个后端
+    let c = login_raw(strict, "admin", "pw-123", "panel.example.com")
+        .await
+        .expect("登录应成功");
+    let r = http(
+        strict,
+        "GET",
+        "/",
+        &[("cookie", &c), ("host", "panel.example.com")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, "PANEL", "panel.example.com 应当落到 panel 的上游");
+
+    let r = http(
+        strict,
+        "GET",
+        "/",
+        &[("cookie", &c), ("host", "cad.example.com")],
+        None,
+    )
+    .await;
+    assert_eq!(r.body, "CAD", "cad.example.com 应当落到 cad 的上游");
+
+    // 兜底那条：没命中任何显式 host
+    let r = http(
+        strict,
+        "GET",
+        "/",
+        &[("cookie", &c), ("host", "whatever.example.com")],
+        None,
+    )
+    .await;
+    assert_eq!(r.body, "REST", "没命中的 Host 应当落到兜底那条");
+
+    // 大小写不敏感
+    let r = http(
+        strict,
+        "GET",
+        "/",
+        &[("cookie", &c), ("host", "PANEL.Example.COM")],
+        None,
+    )
+    .await;
+    assert_eq!(r.body, "PANEL");
+}
+
+/// 没有兜底时，不认识的 Host 要回 **421**，并且把配了哪些 Host 说出来。
+///
+/// 绝不能"随便挑一条转发"：那样配错了不报错，只会把请求送给错误的服务。
+#[tokio::test]
+async fn an_unknown_host_gets_421_naming_the_configured_ones() {
+    let (up_a, _a) = start_tagged_upstream("A").await;
+    let (up_b, _b) = start_tagged_upstream("B").await;
+    let port = pick_port();
+    let hash = esc_gateway::config::hash_password("pw-123").unwrap();
+
+    let raw = format!(
+        r#"
+title = "只有 host 路由"
+session_ttl_hours = 1
+cookie_name = "esc_gw"
+
+[rate_limit]
+max_failures = 3
+fail_window_secs = 60
+max_failures_global = 1000
+global_window_secs = 60
+
+[[user]]
+name = "admin"
+hash = "{hash}"
+routes = ["*"]
+admin = true
+
+[[route]]
+name = "aaa"
+listen = "127.0.0.1:{port}"
+upstream = "{up_a}"
+host = "a.example.com"
+
+[[route]]
+name = "bbb"
+listen = "127.0.0.1:{port}"
+upstream = "{up_b}"
+host = "b.example.com"
+"#
+    );
+    let cfg: GatewayConfig = toml::from_str(&raw).expect("配置应能解析");
+    let (_gw, addrs, _token) = spawn_from_config(cfg).await;
+    let addr = *addrs
+        .values()
+        .next()
+        .expect("应有且只有一个监听地址（两条 host 路由共用它）");
+    assert_eq!(addrs.len(), 1, "两条 host 路由应当只占一个监听地址");
+
+    // 不认识的 Host：连登录页都不给，直接 421 点名
+    let r = http(addr, "GET", "/", &[("host", "nope.example.com")], None).await;
+    assert_eq!(r.status, 421, "{}", r.body);
+    assert!(r.body.contains("a.example.com"), "要列出配了哪些: {}", r.body);
+    assert!(r.body.contains("b.example.com"), "要列出配了哪些: {}", r.body);
+
+    // 认识的那个照常走流程：没带 Accept: text/html，所以是 401 JSON 而不是跳登录
+    let r = http(addr, "GET", "/", &[("host", "a.example.com")], None).await;
+    assert_eq!(r.status, 401, "命中的 host 应当走正常认证流程，而不是 421");
+
+    // 带了 Accept: text/html 的浏览器导航 → 跳登录页
+    let r = http(
+        addr,
+        "GET",
+        "/",
+        &[("host", "b.example.com"), ("accept", "text/html")],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 302, "浏览器访问命中的 host 应当跳登录页");
 }

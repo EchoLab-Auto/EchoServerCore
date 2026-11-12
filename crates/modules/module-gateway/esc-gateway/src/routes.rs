@@ -485,10 +485,68 @@ impl RouteRegistry {
         self.read().get(name).cloned()
     }
 
-    /// 按监听地址找。accept 之后拿到的 `local_addr` 是稳定的，
+    /// 按「监听地址 + Host」找。accept 之后拿到的 `local_addr` 是稳定的，
     /// 所以**请求里用它查**而不是用路由名：改名之后老连接也能立刻用上新定义。
+    ///
+    /// # 为什么还要 Host
+    ///
+    /// 从前端口就是路由的身份，于是每接一个服务就要多占一个监听地址。现在一个
+    /// 端口可以服务多个上游，靠 `Host` 区分（见 [`RouteConfig::host`]）。
+    ///
+    /// 查表顺序是**精确命中优先，兜底最后**：
+    ///
+    /// 1. `Host` 与某条路由的 `host` 全等 → 那条；
+    /// 2. 否则用这个端口上不带 `host` 的那条（如果配了）；
+    /// 3. 都没有 → `None`（调用方回 421，并报出这个端口上到底配了哪些 Host）。
+    ///
+    /// 第 2 步不是"猜"，是配置里显式写下的意图。但**绝不能**在第 3 步随手挑一条
+    /// 转发——那正是「按域名分流」最怕的失败形态：配错了不报错，只是把请求送给
+    /// 了错误的服务，看起来像"页面打不开"或者"登录了但没权限"。
+    pub fn at_host(&self, addr: SocketAddr, host: Option<&str>) -> Option<Arc<RouteRuntime>> {
+        let guard = self.read();
+        let mut fallback: Option<&Arc<RouteRuntime>> = None;
+        for r in guard.values() {
+            if r.listen != addr {
+                continue;
+            }
+            match &r.host {
+                None => {
+                    if fallback.is_none() {
+                        fallback = Some(r);
+                    }
+                }
+                Some(_) => {
+                    if r.host_matches(host) {
+                        return Some(Arc::clone(r));
+                    }
+                }
+            }
+        }
+        fallback.cloned()
+    }
+
+    /// 这个端口上配了哪些 host（按字母序，`None` 元素表示兜底那条）。
+    ///
+    /// 查不到路由时用来报错：一句「没配这个 Host」不如直接列出**配了什么**。
+    pub fn hosts_on(&self, addr: SocketAddr) -> Vec<Option<String>> {
+        let mut v: Vec<Option<String>> = self
+            .read()
+            .values()
+            .filter(|r| r.listen == addr)
+            .map(|r| r.host.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// 按监听地址找**兜底那条**（不带 host 的路由）。
+    ///
+    /// 只给「这个端口是不是有人在管」这类判断用。请求路由一律走 [`at_host`]。
     pub fn at(&self, addr: SocketAddr) -> Option<Arc<RouteRuntime>> {
-        self.read().values().find(|r| r.listen == addr).cloned()
+        self.read()
+            .values()
+            .find(|r| r.listen == addr && r.is_default())
+            .cloned()
     }
 
     pub fn all(&self) -> Vec<Arc<RouteRuntime>> {
@@ -573,9 +631,19 @@ impl ListenerSet {
         let want_set: HashSet<SocketAddr> = wanted.iter().map(|r| r.listen).collect();
 
         let mut start = Vec::new();
+        // 一个端口可能挂多条路由（按 Host 分流），但**套接字只有一个**。
+        // 不去重的话第二条会再 bind 一次同一个地址，必然 EADDRINUSE —— 而错误
+        // 信息会指向"端口被占"，把「配置写重复了」误报成「别的进程占着」。
+        let mut bound_this_round: HashSet<SocketAddr> = HashSet::new();
         for r in wanted {
             if running.contains(&r.listen) {
                 // 这个端口已经在听：内容更新走注册表，不必重新绑定
+                continue;
+            }
+            if !bound_this_round.insert(r.listen) {
+                // 同一轮里前一条已经绑过这个地址了。`start` 里的那条会被
+                // `serve_route` 用来起 accept 循环，而每个请求都从注册表按
+                // (addr, host) 重查路由 —— 所以一条监听服务多条路由是成立的。
                 continue;
             }
             match tokio::net::TcpListener::bind(r.listen).await {
@@ -654,10 +722,70 @@ mod tests {
             name: name.into(),
             listen: listen.into(),
             upstream: upstream.into(),
+            host: None,
             allowed_cidrs: vec![],
             strip_prefix: None,
             max_body_bytes: None,
         }
+    }
+
+    fn spec_host(name: &str, listen: &str, upstream: &str, host: Option<&str>) -> RouteConfig {
+        let mut s = spec(name, listen, upstream);
+        s.host = host.map(str::to_string);
+        s
+    }
+
+    /// 一个端口挂三条路由：两条带 host、一条兜底。查表要按 Host 命中。
+    ///
+    /// 这条是「一个监听地址服务多个上游」的核心：从前端口就是路由的身份，
+    /// 于是每接一个服务就要多占一个地址。
+    #[test]
+    fn host_routing_picks_the_right_route() {
+        let rts = crate::config::validate_route_list(&[
+            spec_host("panel", "0.0.0.0:8080", "127.0.0.1:9001", Some("panel.example.com")),
+            spec_host("cad", "0.0.0.0:8080", "127.0.0.1:9002", Some("cad.example.com")),
+            spec_host("rest", "0.0.0.0:8080", "127.0.0.1:9003", None),
+        ])
+        .expect("一端口多 host 应当合法");
+        let reg = RouteRegistry::new(rts);
+        let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+        // 精确命中，且大小写与端口都不影响
+        assert_eq!(reg.at_host(addr, Some("panel.example.com")).unwrap().name, "panel");
+        assert_eq!(reg.at_host(addr, Some("PANEL.example.com")).unwrap().name, "panel");
+        assert_eq!(reg.at_host(addr, Some("panel.example.com:8080")).unwrap().name, "panel");
+        assert_eq!(reg.at_host(addr, Some("cad.example.com")).unwrap().name, "cad");
+
+        // 没命中任何显式 host → 落到兜底
+        assert_eq!(reg.at_host(addr, Some("other.example.com")).unwrap().name, "rest");
+        // 没有 Host 头 → 也只有兜底能接
+        assert_eq!(reg.at_host(addr, None).unwrap().name, "rest");
+
+        // 别的端口上什么都没有
+        assert!(reg.at_host("0.0.0.0:9999".parse().unwrap(), Some("panel.example.com")).is_none());
+    }
+
+    /// **没有兜底**时，不认识的 Host 必须返回 None（调用方据此回 421）。
+    ///
+    /// 绝不能"随便挑一条转发"：那样配错了不报错，只会把请求送给错误的服务，
+    /// 表现为「页面打不开」或「登录了但没权限」——最难查的那种。
+    #[test]
+    fn an_unknown_host_without_fallback_matches_nothing() {
+        let rts = crate::config::validate_route_list(&[
+            spec_host("panel", "0.0.0.0:8080", "127.0.0.1:9001", Some("panel.example.com")),
+            spec_host("cad", "0.0.0.0:8080", "127.0.0.1:9002", Some("cad.example.com")),
+        ])
+        .unwrap();
+        let reg = RouteRegistry::new(rts);
+        let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+        assert_eq!(reg.at_host(addr, Some("panel.example.com")).unwrap().name, "panel");
+        assert!(reg.at_host(addr, Some("nope.example.com")).is_none());
+        assert!(reg.at_host(addr, None).is_none());
+
+        // 报错时要把"配了哪些"列出来，不然只说了个"没有"
+        let known = reg.hosts_on(addr);
+        assert_eq!(known, vec![Some("cad.example.com".into()), Some("panel.example.com".into())]);
     }
 
     #[test]

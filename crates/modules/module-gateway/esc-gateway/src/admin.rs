@@ -146,6 +146,11 @@ pub async fn handle(
         sid,
         source,
         local,
+        host: req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
         flash,
     };
 
@@ -213,6 +218,9 @@ struct Ctx<'a> {
     source: Option<IpAddr>,
     /// 这个请求是从哪个监听端口进来的。删路由时要靠它认出"我自己"。
     local: SocketAddr,
+    /// 这个请求的 `Host`（归一化前）。同一个端口可能挂多条按 Host 分流的路由，
+    /// 光凭 `local` 认不出"走的是哪一条"——列表里那个「当前」标记要靠它。
+    host: Option<String>,
     flash: Flash,
 }
 
@@ -638,9 +646,42 @@ impl Ctx<'_> {
             .into_iter()
             .map(|e| {
                 let port = e.spec.listen.rsplit(':').next().unwrap_or("").to_string();
-                let here = e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local);
+                // 「当前」= 既在这个端口上，又是**这次请求真正走的那一条**。
+                // 只看端口不够了：一个端口现在可能挂多条按 Host 分流的路由，
+                // 那样每一条都会自称"当前"，而下面那些「删它会把连接断掉」的
+                // 提示就全错了。
+                let here = e.spec.listen.parse::<SocketAddr>().ok() == Some(self.local)
+                    && e.spec
+                        .host
+                        .as_deref()
+                        .map(|want| {
+                            let got = self
+                                .host
+                                .as_deref()
+                                .map(|h| h.to_ascii_lowercase())
+                                .unwrap_or_default();
+                            let got = got.split(':').next().unwrap_or("").to_string();
+                            got == want
+                        })
+                        // 兜底那条：只要这次请求没被别的路由精确命中，走的就是它。
+                        // 判断「有没有被精确命中」要重查一次表，成本不值当 —— 直接把
+                        // 「这个端口上有没有别的精确 host 路由」当作条件。
+                        .unwrap_or_else(|| {
+                            let cur = self
+                                .host
+                                .as_deref()
+                                .map(|h| h.to_ascii_lowercase())
+                                .unwrap_or_default();
+                            let cur = cur.split(':').next().unwrap_or("").to_string();
+                            !gw.routes
+                                .hosts_on(e.spec.listen.parse().unwrap_or(self.local))
+                                .iter()
+                                .flatten()
+                                .any(|h| *h == cur)
+                        });
                 web::RouteRow {
                     name: e.spec.name.clone(),
+                    host: e.spec.host.clone(),
                     source_label: e.source.label().to_string(),
                     disabled: e.disabled,
                     // 只有路由库拥有、且配置文件里没有同名条目的才能真删除
@@ -748,6 +789,7 @@ impl Ctx<'_> {
             name: e.spec.name.clone(),
             listen: e.spec.listen.clone(),
             upstream: e.spec.upstream.clone(),
+            host: e.spec.host.clone().unwrap_or_default(),
             strip_prefix: e.spec.strip_prefix.clone().unwrap_or_default(),
             max_body_bytes: e
                 .spec
@@ -1026,6 +1068,7 @@ impl Ctx<'_> {
                     name: spec.name,
                     listen: spec.listen,
                     upstream: spec.upstream,
+                    host: spec.host.unwrap_or_default(),
                     strip_prefix: spec.strip_prefix.unwrap_or_default(),
                     max_body_bytes: spec
                         .max_body_bytes
@@ -1256,6 +1299,7 @@ impl Ctx<'_> {
             name_locked: st.name_locked,
             listen: st.listen,
             upstream: st.upstream,
+            host: st.host,
             strip_prefix: st.strip_prefix,
             max_body_bytes: st.max_body_bytes,
             allowed_cidrs: st.allowed_cidrs,
@@ -1357,6 +1401,7 @@ struct RouteFormState {
     name: String,
     listen: String,
     upstream: String,
+    host: String,
     strip_prefix: String,
     max_body_bytes: String,
     allowed_cidrs: String,
@@ -1368,6 +1413,7 @@ struct RouteInput {
     name: String,
     listen: String,
     upstream: String,
+    host: String,
     strip_prefix: String,
     max_body_bytes: String,
     allowed_cidrs: String,
@@ -1379,6 +1425,7 @@ impl RouteInput {
             name: f.get("name").unwrap_or("").trim().to_string(),
             listen: f.get("listen").unwrap_or("").trim().to_string(),
             upstream: f.get("upstream").unwrap_or("").trim().to_string(),
+            host: f.get("host").unwrap_or("").trim().to_string(),
             strip_prefix: f.get("strip_prefix").unwrap_or("").trim().to_string(),
             max_body_bytes: f.get("max_body_bytes").unwrap_or("").trim().to_string(),
             allowed_cidrs: f.get("allowed_cidrs").unwrap_or("").trim().to_string(),
@@ -1392,6 +1439,7 @@ impl RouteInput {
             name: self.name.clone(),
             listen: self.listen.clone(),
             upstream: self.upstream.clone(),
+            host: self.host.clone(),
             strip_prefix: self.strip_prefix.clone(),
             max_body_bytes: self.max_body_bytes.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
@@ -1464,6 +1512,9 @@ impl RouteInput {
             name,
             listen: self.listen.clone(),
             upstream: self.upstream.clone(),
+            // 空串 = 不限定 Host（这个端口的兜底）。后端会做归一化与校验：
+            // 带路径、带通配符、有空格的都在那里报错，这里不重复一套规则。
+            host: Some(self.host.clone()).filter(|h| !h.is_empty()),
             allowed_cidrs,
             strip_prefix: if self.strip_prefix.is_empty() {
                 None
@@ -1478,6 +1529,9 @@ impl RouteInput {
 /// 一条路由的附加说明（前缀 / 白名单 / 体积上限），列表里显示成一列。
 fn route_detail(spec: &crate::config::RouteConfig) -> String {
     let mut parts = Vec::new();
+    if let Some(h) = &spec.host {
+        parts.push(format!("Host = {h}"));
+    }
     if let Some(p) = &spec.strip_prefix {
         parts.push(format!("剥前缀 {p}"));
     }
