@@ -139,9 +139,15 @@ fn print_segments(rt: &esc_gateway::RuntimeConfig) {
             println!("               （网段里还没有路由 —— 声明了没用上）");
         }
         for r in rts {
+            // 端口一一对应是硬约束，所以这里直接把「同一端口号」写出来：
+            // 读的人不必自己比对两边的数字，也不用怀疑是不是配错了。
             println!(
-                "               {:<16} {} → {}   ← TLS 上游指向 {}",
-                r.name, r.listen, r.upstream, r.listen
+                "               {:<16} 端口 {:<5} {} → {}   ← TLS 上游指向 {}",
+                r.name,
+                r.listen.port(),
+                r.listen,
+                r.upstream,
+                r.listen
             );
         }
     }
