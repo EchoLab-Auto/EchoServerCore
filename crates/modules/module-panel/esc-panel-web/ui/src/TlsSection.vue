@@ -413,22 +413,27 @@ function outcomeText(out: any): string {
 // 机制，仍然读 `status.config` → 改一处 → **整份** POST。逐条 upsert 会让中间
 // 态非法（端口重复、上游自环），那正是后端不接受逐条的原因。
 
-/** 链路表的一行在 config 里的位置。一行 = 一个监听地址 = `site[si].listen[li]`。 */
+/** 链路表的一行在表单里的位置。一行 = 一个监听地址 = `site[si].listen[li]`。 */
 type RowRef = { si: number; li: number }
 
 /** 靠**地址字符串相等**定位，不靠顺序。
  *
  *  顺序（先按 site、再按 listen 展开）是后端的实现细节。把 UI 绑到它上面，
  *  后端哪天调一下顺序，就地编辑就会静默改到别的站点上 —— 那种 bug 不报错，
- *  只是「我改的是 2222」变成了改掉 443。 */
-function locateRow(cfg: any, listen: string): RowRef | null {
+ *  只是「我改的是 2222」变成了改掉 443。
+ *
+ *  ⚠️ 入参是**表单形态**（`formFromConfig` 的产物），不是 `status.config`：
+ *  那里的 `listen` 是数组，这里已经被合并成逗号分隔的一行。第一版按数组写，
+ *  `ls[li]` 于是取到单个字符，任何地址都匹配不上 —— 表现是每一行点「编辑」都
+ *  弹"这一行在配置里找不到"。浏览器里点一下才看得见，类型检查抓不到。 */
+function locateRow(form: any, listen: string): RowRef | null {
   const want = String(listen || '').trim()
   if (!want) return null
-  const sites = cfg?.site || []
+  const sites = form?.sites || []
   for (let si = 0; si < sites.length; si++) {
-    const ls = sites[si]?.listen || []
-    for (let li = 0; li < ls.length; li++) {
-      if (String(ls[li] || '').trim() === want) return { si, li }
+    const ports = splitList(sites[si]?.listen || '')
+    for (let li = 0; li < ports.length; li++) {
+      if (ports[li] === want) return { si, li }
     }
   }
   return null
