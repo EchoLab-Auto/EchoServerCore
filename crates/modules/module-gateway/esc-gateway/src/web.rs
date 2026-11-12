@@ -27,8 +27,12 @@
 //! 双向阴影、8/24px 圆角），而不是自己另起一套配色。
 //!
 //! 手写而不是引 Vue 组件库，是因为这一刻前端还没跑起来（见上一段）。
-//! **代价是这份 CSS 会漂移**：改 `tokens.scss` 的暗色值时要回来同步这几个变量。
-//! 判断标准很简单——登录页与面板并排放，两者之间不该有可见的色差。
+//! 代价是这份 CSS 会漂移——所以有 [`tests::theme_tokens_match_the_panel`] 守着：
+//! 它读面板**实际发布**的 `panel.css`（编译期嵌在 `esc-panel-web` 里），逐个比对
+//! `STYLE` 声明的 14 个 `--nm-*` 令牌。值不对、或写了面板里没有的名字，`cargo test` 就红。
+//!
+//! 换句话说：改 ui-frame 的 `tokens.scss` 之后忘了同步这里，构建会失败，
+//! 而不是等某个肉眼在两种深灰之间挑错。
 
 use serde::Serialize;
 
@@ -57,8 +61,8 @@ const STYLE: &str = r#"
   --nm-shadow-light:rgba(255,255,255,.14);
   --nm-shadow-dark-strong:rgba(0,0,0,.6);
   --nm-shadow-light-strong:rgba(255,255,255,.18);
-  --nm-radius-sm:8px;
-  --nm-radius-lg:24px;
+  --nm-border-radius-sm:8px;
+  --nm-border-radius-lg:24px;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
@@ -73,7 +77,7 @@ body{
 /* 新拟态靠双向阴影表达层次 —— 所以卡片**不描边**，描边会把它打回普通卡片 */
 .card{
   width:100%;max-width:392px;background:var(--nm-bg-color);
-  border-radius:var(--nm-radius-lg);padding:30px 30px 26px;
+  border-radius:var(--nm-border-radius-lg);padding:30px 30px 26px;
   box-shadow:10px 10px 22px var(--nm-shadow-dark),-10px -10px 22px var(--nm-shadow-light);
 }
 h1{font-size:17px;margin:0 0 5px;font-weight:600;letter-spacing:.2px}
@@ -85,7 +89,7 @@ h1{font-size:17px;margin:0 0 5px;font-weight:600;letter-spacing:.2px}
 label{display:block;font-size:12px;color:var(--nm-text-secondary);margin:0 0 6px}
 input{
   width:100%;font:inherit;color:var(--nm-text-primary);
-  background:var(--nm-bg-color);border:0;border-radius:var(--nm-radius-sm);
+  background:var(--nm-bg-color);border:0;border-radius:var(--nm-border-radius-sm);
   padding:11px 13px;margin-bottom:16px;
   box-shadow:inset 4px 4px 9px var(--nm-shadow-dark),inset -4px -4px 9px var(--nm-shadow-light);
   transition:box-shadow .18s ease;
@@ -100,7 +104,7 @@ input:focus{
 button{
   width:100%;font:inherit;font-weight:600;cursor:pointer;
   color:var(--nm-text-on-primary);background:var(--nm-primary-color);
-  border:0;border-radius:var(--nm-radius-sm);padding:11px 14px;
+  border:0;border-radius:var(--nm-border-radius-sm);padding:11px 14px;
   box-shadow:5px 5px 12px var(--nm-shadow-dark-strong),-5px -5px 12px var(--nm-shadow-light-strong);
   transition:transform .12s ease,box-shadow .12s ease,filter .12s ease;
 }
@@ -114,7 +118,7 @@ button:focus-visible{outline:2px solid var(--nm-primary-color);outline-offset:3p
 .err{
   display:flex;gap:9px;align-items:flex-start;
   color:var(--nm-color-error);font-size:12.5px;line-height:1.6;
-  border-radius:var(--nm-radius-sm);border-left:3px solid var(--nm-color-error);
+  border-radius:var(--nm-border-radius-sm);border-left:3px solid var(--nm-color-error);
   padding:10px 13px;margin:0 0 16px;background:rgba(248,81,73,.08);
 }
 .err svg{flex:none;margin-top:2px}
@@ -377,6 +381,7 @@ pub struct MeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn login_page_escapes_every_injected_value() {
@@ -431,5 +436,137 @@ mod tests {
         assert!(!html.contains("<link"), "不能引用外部样式表");
         assert!(!html.contains("http://"), "不能引用外部资源");
         assert!(!html.contains("https://"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 主题令牌的防漂移
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 把一段 CSS 里的自定义属性读成 `名字 → 值`。
+    ///
+    /// 只认 `--nm-*`：`STYLE` 里还有 `--mono` 这种与主题无关的，它们不该被
+    /// 拿去和面板比。
+    fn declarations(block: &str) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for decl in block.split(';') {
+            let Some((name, value)) = decl.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.starts_with("--nm-") {
+                continue;
+            }
+            out.insert(name.to_string(), normalize(value));
+        }
+        out
+    }
+
+    /// 比对用的规范形：去空白 + 小写。
+    ///
+    /// `rgba(0, 0, 0, .5)`（Vite 产物）与 `rgba(0,0,0,.5)`（手写）是同一个颜色，
+    /// 差异只在空格上。比字符串而不比语义，就得先抹掉这种无关差异。
+    fn normalize(value: &str) -> String {
+        value
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+
+    /// 拼错变量名时，"你可能想写的是哪个"比"不存在"有用得多。
+    ///
+    /// 按公共前缀长度排前 3 个即可 —— 比编辑距离便宜，而这类错误的性质就是
+    /// 少/多打一个字符。面板里 `--nm-color-error-50…900` 有一整族，全列出来
+    /// 反而看不到重点。
+    fn nearest<'a>(names: impl Iterator<Item = &'a String>, want: &str) -> String {
+        let metric = |k: &str| k.chars().zip(want.chars()).take_while(|(x, y)| x == y).count();
+        let mut best: Vec<(&str, usize)> = names
+            .map(|k| (k.as_str(), metric(k)))
+            .filter(|(_, n)| *n >= 10)
+            .collect();
+        best.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        best.dedup_by_key(|(k, _)| *k);
+        let picked: Vec<&str> = best.into_iter().take(3).map(|(k, _)| k).collect();
+        if picked.is_empty() {
+            return "（没有相近的，可能是新增的变量）".to_string();
+        }
+        picked.join("、")
+    }
+
+    /// 取出 `selector{...}` 花括号里的内容。CSS 变量块是平的，取到第一个 `}` 即可。
+    fn block_after(css: &str, selector: &str) -> Option<String> {
+        let start = css.find(selector)? + selector.len();
+        let open = css[start..].find('{')? + start + 1;
+        let close = css[open..].find('}')? + open;
+        Some(css[open..close].to_string())
+    }
+
+    /// 登录页的令牌必须等于面板主题的令牌。
+    ///
+    /// 登录页的 `STYLE` 是**手写**的（那一刻 Vue 还没跑起来，见模块注释），所以它
+    /// 与 `vendor/ui-frame` 的暗色主题之间天然会漂移——改了 ui-frame 的 `tokens.scss`
+    /// 而忘了回来同步，只有肉眼看才发现得了。
+    ///
+    /// 这条测试把两边钉在一起。比对的基准是**面板实际发布的那份 `panel.css`**：
+    /// 它在编译期被 `esc-panel-web` 用 `include_str!` 嵌进 crate，所以这里读到的字节
+    /// 与浏览器收到的完全一致，不受"某个目录有没有检出"影响。
+    ///
+    /// 于是整条链是闭合的：
+    ///
+    /// ```text
+    /// ui-frame/tokens.scss ──[npm run build]──▶ panel.css ──[include_str!]──▶ 本测试
+    ///        ▲                    ▲                                          │
+    ///        └── artifacts_are_fresh┘                                     STYLE 必须相等
+    /// ```
+    ///
+    /// 守两个方向：**值变了没跟过去**（比如主色换了）和 **`STYLE` 写了面板里
+    /// 不存在的变量名**（拼错一个字符，颜色静默回落，界面悄悄崩掉）。
+    #[test]
+    fn theme_tokens_match_the_panel() {
+        let css = esc_panel_web::asset("panel.css")
+            .expect("面板的 panel.css 应当存在")
+            .body();
+
+        let dark = declarations(
+            &block_after(css, "[data-theme=dark]").expect("panel.css 里应有暗色主题块"),
+        );
+        // 圆角之类与主题无关的令牌只在 `:root` 里出现一次
+        let root = declarations(&block_after(css, ":root").expect("panel.css 里应有 :root"));
+
+        assert!(
+            dark.len() > 20,
+            "暗色块的解析结果只有 {} 个令牌，解析器多半坏了：{:?}",
+            dark.len(),
+            dark.keys().take(5).collect::<Vec<_>>()
+        );
+
+        let ours = declarations(&block_after(STYLE, ":root").expect("STYLE 里应有 :root"));
+        assert!(
+            !ours.is_empty(),
+            "STYLE 里一个 --nm-* 都没解析到，测试会是空转"
+        );
+
+        let mut problems = Vec::new();
+        for (name, want) in &ours {
+            // 暗色块优先，`:root` 兜底（与主题无关的那些）
+            let got = dark.get(name).or_else(|| root.get(name));
+            match got {
+                None => problems.push(format!(
+                    "{name}: 面板里没有这个变量（拼错了？）。相近的：{}",
+                    nearest(dark.keys().chain(root.keys()), name)
+                )),
+                Some(got) if got != want => problems.push(format!(
+                    "{name}: 登录页 {want} ≠ 面板 {got}"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "登录页的配色与面板对不上了——改 ui-frame 的 tokens.scss 之后要回来同步 \
+             web.rs 的 STYLE，否则从登录页跳到面板会看出色差：\n  {}",
+            problems.join("\n  ")
+        );
     }
 }

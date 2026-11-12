@@ -45,3 +45,8 @@ tokio-util = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# 只为 `theme_tokens_match_the_panel` 那条测试：把面板实际发布的 panel.css 拿进来
+# 比对登录页的令牌。它在编译期被 `include_str!` 嵌进那个 crate，所以测试读到的
+# 字节与浏览器收到的**是同一份** —— 而不是"某个可能没检出的目录下的文件"。
+# esc-panel-web 是零依赖 crate，加这条边不会把网关的依赖图撑大。
+esc-panel-web = { workspace = true }

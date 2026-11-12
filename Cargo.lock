@@ -624,6 +624,7 @@ dependencies = [
  "bytes 1.12.1",
  "cookie",
  "esc-panel-auth",
+ "esc-panel-web",
  "http-body-util",
  "hyper",
  "hyper-util",

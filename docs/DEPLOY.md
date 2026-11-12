@@ -833,3 +833,22 @@ docker logs --tail 5 esc-gateway                                    # gateway st
 
 浏览器侧至少走一遍登录 → 面板首页，确认新二进制真的生效（版本号看不出来，
 行为能看出来）。
+
+### 改 ui-frame 主题时的一处连带
+
+网关的**登录页**（`:2223`/`:2224`/`:2226` 未登录时那一屏）是服务端渲染的
+单文件 HTML，样式手写在 `esc-gateway/src/web.rs` 的 `STYLE` 里——那一刻 Vue 还没
+跑起来，不能用组件库。它的 14 个 `--nm-*` 令牌与面板的暗色主题逐值对齐。
+
+`esc-gateway` 有一条测试 `theme_tokens_match_the_panel` 拿**面板实际发布的
+`panel.css`** 比对它们，所以顺序是：
+
+```bash
+# 1. 改 ui-frame 的 tokens.scss 之后，先重建前端产物
+cd crates/modules/module-panel/esc-panel-web/ui && npm run build
+# 2. 再跑网关测试 —— 它会告诉你登录页哪几个令牌没跟上
+cargo test -p esc-gateway --lib theme_tokens
+# 3. 按报的差异改 web.rs 的 STYLE，再重新出二进制
+```
+
+第 2 步失败是**预期**的，不是环境坏了。
