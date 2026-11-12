@@ -114,7 +114,10 @@ async function saveUser() {
     name: form.name,
     pass: form.pass || '',
     pass2: form.pass2 || '',
-    all_routes: picked.includes('*') || picked.length === 0,
+    // 端口框留空 = **留空**，不是"全部"。以前这里写 `|| picked.length === 0`，
+    // 于是清空输入框就静默拿到全部端口 —— 一个手滑就是越权账号。
+    // 空的正确结局是后端那条「至少要勾一个端口（或勾「全部端口」）」。
+    all_routes: picked.includes('*'),
     routes: picked.filter((r: string) => r !== '*'),
     admin: !!form.admin,
   }

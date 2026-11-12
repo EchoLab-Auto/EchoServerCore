@@ -2672,3 +2672,142 @@ async fn a_store_route_deleted_from_the_disabled_section_is_gone_for_good() {
     gw.token.cancel();
     _u.cancel();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 请求编码：面板发 JSON，命令行发表单，两条路都得通
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 合并三个面板那次，前端改成 `fetch(..., {content-type: application/json})`，
+/// 而 `read_form` 只会拆 `a=1&b=2`。结果 JSON 体被当成**一个没有 `=` 的键**，
+/// 每个字段都读成空串 —— 界面上「新建账号」永远回
+/// 「账号名不合法：只能用字母、数字……」且回填的名字是空的。
+///
+/// 只测表单编码漏掉了这条，因为测试一直用 `post_form` 建账号。
+#[tokio::test]
+async fn admin_accepts_json_bodies_from_the_panel() {
+    let (up, _u) = start_upstream().await;
+    let (gw, path) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+
+    let body = serde_json::json!({
+        "name": "carol",
+        "pass": "carol-pass-123",
+        "pass2": "carol-pass-123",
+        "all_routes": false,
+        // 面板发的是数组；老表单发的是 `route=panel`。两者等价。
+        "routes": ["panel"],
+        "admin": false,
+    })
+    .to_string();
+    let r = http(
+        gw.addr(),
+        "POST",
+        "/__admin/api/users",
+        &[("cookie", &c), ("content-type", "application/json")],
+        Some(&body),
+    )
+    .await;
+    assert!(
+        done_ok(&r).contains("已创建"),
+        "JSON 体的账号名应能被读出：{}",
+        r.body
+    );
+
+    // 数组里的端口得真的落到账号上，而不是被忽略后连同 `all_routes=false`
+    // 一起变成「什么也访问不了」
+    let listed = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/users",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let page = view(&listed);
+    assert_eq!(row(&page, "carol")["routes_label"], "panel", "{page}");
+
+    // 建出来的账号确实能用（口令也是从 JSON 里读出来的）
+    let carol = login(&gw, "carol", "carol-pass-123").await;
+    assert!(carol.is_some(), "JSON 建出的账号应能登录");
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("name = \"carol\""), "{raw}");
+    assert!(!raw.contains("carol-pass-123"), "账号库不能出现明文口令");
+
+    // 空端口列表 + 没勾「全部端口」→ 必须被拒，不能悄悄放大成 `*`
+    let body = serde_json::json!({
+        "name": "dave",
+        "pass": "dave-pass-123",
+        "pass2": "dave-pass-123",
+        "all_routes": false,
+        "routes": [],
+        "admin": false,
+    })
+    .to_string();
+    let r = http(
+        gw.addr(),
+        "POST",
+        "/__admin/api/users",
+        &[("cookie", &c), ("content-type", "application/json")],
+        Some(&body),
+    )
+    .await;
+    assert_eq!(r.status, 400, "空端口应被拒：{}", r.body);
+    assert!(
+        json(&r)["error"].as_str().unwrap().contains("端口"),
+        "要说清缺的是端口：{}",
+        r.body
+    );
+
+    gw.token.cancel();
+    _u.cancel();
+}
+
+/// `routes` 之外的扁平字段（Listen/Upstream/白名单）也得能从 JSON 读出来。
+#[tokio::test]
+async fn admin_accepts_json_bodies_for_routes_too() {
+    let (up, _u) = start_upstream().await;
+    let (gw, _dir) = start_admin_gateway(up).await;
+    let c = login(&gw, "admin", "pw-123").await.unwrap();
+    let port = free_port().await;
+
+    let body = serde_json::json!({
+        "name": "jsonroute",
+        "listen": format!("127.0.0.1:{port}"),
+        "upstream": up.to_string(),
+        "strip_prefix": "/api",
+        "max_body_bytes": 2048,
+        "allowed_cidrs": "10.0.0.0/8",
+    })
+    .to_string();
+    let r = http(
+        gw.addr(),
+        "POST",
+        "/__admin/api/routes",
+        &[("cookie", &c), ("content-type", "application/json")],
+        Some(&body),
+    )
+    .await;
+    assert!(
+        done_ok(&r).contains("新建端口 jsonroute"),
+        "JSON 体应能建端口：{}",
+        r.body
+    );
+
+    let detail = http(
+        gw.addr(),
+        "GET",
+        "/__admin/api/routes/jsonroute",
+        &[("cookie", &c)],
+        None,
+    )
+    .await;
+    let v = view(&detail);
+    assert_eq!(v["strip_prefix"], "/api", "{v}");
+    // 数字 2048 要变成能 `.parse()` 的文本，不是 `2048.0` 或空
+    assert_eq!(v["max_body_bytes"], "2048", "{v}");
+    assert_eq!(v["allowed_cidrs"], "10.0.0.0/8", "{v}");
+
+    gw.token.cancel();
+    _u.cancel();
+}

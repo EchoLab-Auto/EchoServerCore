@@ -369,7 +369,7 @@ impl Ctx<'_> {
     /// 画一个空表单；留着是因为创建失败时要回填同一份结构，走 `render_form`）。
     #[allow(dead_code)]
     fn user_form_new(&self) -> HyperResponse<ProxyBody> {
-        self.render_form(FormState {
+        self.user_form_ok(FormState {
             name: String::new(),
             is_new: true,
             name_locked: false,
@@ -442,7 +442,7 @@ impl Ctx<'_> {
                 acct.user.name
             )));
         }
-        self.render_form(FormState {
+        self.user_form_ok(FormState {
             name: acct.user.name.clone(),
             is_new: false,
             name_locked: true,
@@ -723,7 +723,7 @@ impl Ctx<'_> {
     }
 
     fn route_form_new(&self) -> HyperResponse<ProxyBody> {
-        self.render_route_form(RouteFormState {
+        self.route_form_ok(RouteFormState {
             is_new: true,
             name_locked: false,
             banners: self.flash.banners(),
@@ -742,7 +742,7 @@ impl Ctx<'_> {
                  保存时会自动在路由库生成一条同名条目接管它——不用多点一步。"
             )));
         }
-        self.render_route_form(RouteFormState {
+        self.route_form_ok(RouteFormState {
             is_new: false,
             name_locked: true,
             name: e.spec.name.clone(),
@@ -1246,14 +1246,8 @@ impl Ctx<'_> {
         )
     }
 
-    fn render_route_form(&self, st: RouteFormState) -> HyperResponse<ProxyBody> {
-        let error = st
-            .banners
-            .iter()
-            .find(|b| b.kind == "err")
-            .map(|b| b.text.clone())
-            .unwrap_or_else(|| "提交的内容没有通过校验".into());
-        let view = web::RouteFormView {
+    fn route_form_view(&self, st: RouteFormState) -> web::RouteFormView {
+        web::RouteFormView {
             title: self.gw.title().to_string(),
             actor: self.actor.clone(),
             is_admin: self.admin,
@@ -1267,11 +1261,31 @@ impl Ctx<'_> {
             allowed_cidrs: st.allowed_cidrs,
             writable: self.gw.rt_store.writable(),
             banners: st.banners,
-        };
+        }
+    }
+
+    /// **提交失败**：400 + `{error, form}`。
+    fn render_route_form(&self, st: RouteFormState) -> HyperResponse<ProxyBody> {
+        let error = st
+            .banners
+            .iter()
+            .find(|b| b.kind == "err")
+            .map(|b| b.text.clone())
+            .unwrap_or_else(|| "提交的内容没有通过校验".into());
+        let view = self.route_form_view(st);
         json_with(
             StatusCode::BAD_REQUEST,
             json!({ "error": error, "form": view }),
         )
+    }
+
+    /// **打开表单**（GET 详情）：200 + 表单本身。
+    ///
+    /// 状态码必须是 200。前端的 `api()` 把非 2xx 一律当失败抛出，早先这里复用
+    /// 了 400 那条路径，于是点「编辑」只会在控制台留下一句
+    /// 「提交的内容没有通过校验」，弹窗根本不出现。
+    fn route_form_ok(&self, st: RouteFormState) -> HyperResponse<ProxyBody> {
+        json_ok(&self.route_form_view(st))
     }
 
     fn account(&self, name: &str) -> Option<Account> {
@@ -1301,14 +1315,8 @@ impl Ctx<'_> {
     ///
     /// 状态码 400 而不是 200：这不是"成功返回了一个表单"，是"你提交的东西
     /// 没被接受"。前端的 `api()` 据此抛错，错误信息照样能取到。
-    fn render_form(&self, st: FormState) -> HyperResponse<ProxyBody> {
-        let error = st
-            .banners
-            .iter()
-            .find(|b| b.kind == "err")
-            .map(|b| b.text.clone())
-            .unwrap_or_else(|| "提交的内容没有通过校验".into());
-        let view = UserFormView {
+    fn user_form_view(&self, st: FormState) -> UserFormView {
+        UserFormView {
             title: self.gw.title().to_string(),
             actor: self.actor.clone(),
             is_admin: self.admin,
@@ -1320,8 +1328,24 @@ impl Ctx<'_> {
             available: self.gw.route_names(),
             writable: self.gw.store.writable(),
             banners: st.banners,
-        };
+        }
+    }
+
+    /// **提交失败**：400 + `{error, form}`。前端据此在弹窗里显示错误、保留已填内容。
+    fn render_form(&self, st: FormState) -> HyperResponse<ProxyBody> {
+        let error = st
+            .banners
+            .iter()
+            .find(|b| b.kind == "err")
+            .map(|b| b.text.clone())
+            .unwrap_or_else(|| "提交的内容没有通过校验".into());
+        let view = self.user_form_view(st);
         json_with(StatusCode::BAD_REQUEST, json!({ "error": error, "form": view }))
+    }
+
+    /// **打开表单**（GET 详情）：200 + 表单本身。理由同 `route_form_ok`。
+    fn user_form_ok(&self, st: FormState) -> HyperResponse<ProxyBody> {
+        json_ok(&self.user_form_view(st))
     }
 }
 
@@ -1529,8 +1553,15 @@ impl UserInput {
             pass: f.get("pass").unwrap_or("").to_string(),
             pass2: f.get("pass2").unwrap_or("").to_string(),
             all_routes: f.flag("all_routes"),
-            // 多个同名 `route` 字段：这就是为什么不能复用 parse_form
-            routes: f.values("route"),
+            // 多个同名 `route` 字段：这就是为什么不能复用 parse_form。
+            //
+            // 两种来源都认：老汉堡表单提交 `route=a&route=b`，面板前端提交
+            // `{"routes":["a","b"]}`。只认前者的话，用户在界面上勾了端口也等于没勾。
+            routes: {
+                let mut picked = f.values("route");
+                picked.extend(f.values("routes"));
+                picked
+            },
             admin: f.flag("admin"),
         }
     }
@@ -1632,6 +1663,28 @@ impl Form {
         Self(v)
     }
 
+    /// JSON 体 → 同一套键值对。
+    ///
+    /// 面板前端发的是 `application/json`，而校验逻辑全长在 `Form` 上。与其把
+    /// 十几个 `from_form` 各写两遍，不如在入口就把两种编码抹平：
+    ///
+    /// * 字符串原样；布尔 → `"true"` / `"false"`（`flag()` 认这两个）；数字 → 十进制文本
+    ///   （`get()` 拿到的仍是能 `.parse()` 的字符串）
+    /// * 数组 → 同名多值：`{"routes":["a","b"]}` 与 `route=a&route=b` 等价
+    /// * `null` 与嵌套对象跳过 —— 前者本来就是"没填"，后者在这套扁平表单里没有对应
+    fn parse_json(body: &str) -> Result<Self, &'static str> {
+        let value: serde_json::Value =
+            serde_json::from_str(body).map_err(|_| "请求体不是合法 JSON")?;
+        let serde_json::Value::Object(map) = value else {
+            return Err("请求体必须是 JSON 对象");
+        };
+        let mut v = Vec::new();
+        for (k, val) in map {
+            push_json_field(&mut v, k, val);
+        }
+        Ok(Self(v))
+    }
+
     fn get(&self, key: &str) -> Option<&str> {
         self.0
             .iter()
@@ -1652,17 +1705,52 @@ impl Form {
     }
 }
 
-/// 读表单体。错误只回一条文案，由调用方决定怎么渲染——把整个 `Response`
-/// 塞进 `Err` 会让每条 `Result` 都被撑大好几百字节。
+/// 把一个 JSON 值摊成 `(键, 文本)`，数组摊成同名多值。
+fn push_json_field(out: &mut Vec<(String, String)>, key: String, value: serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => out.push((key, s)),
+        serde_json::Value::Bool(b) => out.push((key, b.to_string())),
+        serde_json::Value::Number(n) => out.push((key, n.to_string())),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_json_field(out, key.clone(), item);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => {}
+    }
+}
+
+/// 读请求体并解析成 `Form`。
+///
+/// **两种编码都认**：前端（合并后的面板）发 `application/json`，命令行与老表单
+/// 发 `application/x-www-form-urlencoded`。只看 content-type，不看内容猜测——
+/// 一个以 `{` 开头的表单值不该被误当成 JSON。
+///
+/// 错误只回一条文案，由调用方决定怎么渲染——把整个 `Response` 塞进 `Err`
+/// 会让每条 `Result` 都被撑大好几百字节。
 async fn read_form(req: HyperRequest<Incoming>) -> Result<Form, &'static str> {
+    let is_json = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+        })
+        .unwrap_or(false);
     let body = Limited::new(req.into_body(), MAX_FORM_BYTES)
         .collect()
         .await
         .map_err(|_| "请求体过大或读取失败")?
         .to_bytes();
     let s = std::str::from_utf8(&body).map_err(|_| "请求体不是合法 UTF-8")?;
+    if is_json {
+        return Form::parse_json(s);
+    }
     Ok(Form::parse(s))
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 渲染与路径小工具
