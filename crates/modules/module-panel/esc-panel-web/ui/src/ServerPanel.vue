@@ -1,9 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import GatewaySection from './GatewaySection.vue'
 import NavGrid from './NavGrid.vue'
-import TunnelSection from './TunnelSection.vue'
-import Networks from './Networks.vue'
+import NetworkSection from './NetworkSection.vue'
 import PluginTree from './PluginTree.vue'
 import { api, bytes, duration, flash, flashKind, flashText, json, stateVariant, tabItems } from './ui'
 
@@ -20,7 +18,7 @@ const networks = ref<string[]>([])
 const filter = ref('')
 const error = ref('')
 const plugins = ref<InstanceType<typeof PluginTree>>()
-const networksPanel = ref<InstanceType<typeof Networks>>()
+const networksPanel = ref<InstanceType<typeof NetworkSection>>()
 const creating = ref(false)
 const pulling = ref(false)
 const pullImage = ref('')
@@ -49,16 +47,17 @@ const groupedContainers = computed(() => {
   }
   return [...groups.entries()]
 })
-// 三个 section 的可用性各自独立判断：没配隧道就没有「隧道」页，网关不可达
-// 就没有「网关」页。**不显示比显示一个必然报错的入口好**——后者每次点进去
+// 隧道与网关不再是顶层标签页——它们和 Docker 网络一起放进「网络」，
+// 因为三者回答的是同一个问题：流量从哪进、到哪去、谁能进（见 NetworkSection）。
+//
+// 可用性仍然各自探测：没配隧道就没有「端口映射」子页，网关不可达就没有
+// 「网关」子页。**不显示比显示一个必然报错的入口好**——后者每次点进去
 // 都要读一遍错误信息才能确认"这台机器没有这个功能"。
 const tunnelReady = ref(false)
 const gatewayReady = ref(false)
 const navTabs = computed<[string, string][]>(() => {
   const tabs: [string, string][] = []
   if (navGroups.value.length) tabs.push(['nav', '导航'])
-  if (tunnelReady.value) tabs.push(['tunnel', '隧道'])
-  if (gatewayReady.value) tabs.push(['gateway', '网关'])
   return tabs
 })
 const allowActions = computed(() => !!overview.value?.allow_actions)
@@ -175,17 +174,16 @@ onBeforeUnmount(() => { clearInterval(timer); clearInterval(jobTimer); clearInte
     <header class="esc-header"><h1>服务器面板</h1><NeumorphismTag v-if="overview" :variant="overview.docker?.state === 'ok' ? 'success' : 'warning'">Docker {{ overview.docker?.state }}</NeumorphismTag><NeumorphismTag v-if="overview && !allowActions && !allowCreate && !allowDelete">只读</NeumorphismTag><span class="esc-spacer" /><NeumorphismButton size="small" @click="loadOverview">刷新</NeumorphismButton><span class="subtitle">主机指标与 Docker 管理 · ui-frame</span></header>
     <NeumorphismTabs v-model="tab" class="esc-tabs" :tabs="tabItems([...navTabs, ['overview','主机概览'],['containers','容器'],['images','镜像'],['networks','网络'],['plugins','插件树']])" />
     <NeumorphismAlert v-if="error" type="error" title="面板连接失败" :message="error" />
-    <Networks
+    <NetworkSection
       v-show="tab === 'networks'"
       ref="networksPanel"
       :allow-create="allowCreate"
       :allow-actions="allowActions"
       :allow-delete="allowDelete"
+      :tunnel-ready="tunnelReady"
+      :gateway-ready="gatewayReady"
     />
     <PluginTree v-show="tab === 'plugins'" ref="plugins" />
-
-    <TunnelSection v-if="tunnelReady" v-show="tab === 'tunnel'" />
-    <GatewaySection v-if="gatewayReady" v-show="tab === 'gateway'" />
 
     <main v-if="navGroups.length" v-show="tab === 'nav'">
       <NavGrid :groups="navGroups" :stale="navStale" />

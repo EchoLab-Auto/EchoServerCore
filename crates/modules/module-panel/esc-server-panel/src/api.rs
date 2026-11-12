@@ -43,7 +43,7 @@ pub struct AppState {
     /// 是否把 Docker 已发布端口自动列进导航页。
     pub nav_auto_docker: bool,
     /// 隧道面板的上游（`/api/tunnel/*` 转发到它）。`None` = 未配置，
-    /// 「隧道」标签页会明确说明怎么配。
+    /// 「网络」页里的「端口映射」子页会明确说明怎么配。
     pub tunnel: Option<crate::tunnel_proxy::TunnelClient>,
 }
 

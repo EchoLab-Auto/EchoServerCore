@@ -11,6 +11,9 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .esc-header .subtitle { width: 100%; color: var(--nm-color-text-secondary); font-size: 13px; }
 .esc-spacer { flex: 1; }
 .esc-tabs { margin-bottom: 20px; }
+/* 二级标签栏（网络 › Docker 网络 / 端口映射 / 网关）。缩进 + 浅一档，
+   让人一眼看出它属于上面那个标签页而不是与之平级。 */
+.esc-subtabs { margin: -4px 0 16px; padding-left: 2px; }
 .esc-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
 .esc-section-title { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 22px 0 12px; }
 .esc-section-title h2 { font-size: 17px; margin: 0; }
